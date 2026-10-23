@@ -50,6 +50,7 @@ pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
+pub(crate) use pypi::routes_at as pypi_routes_at;
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
 pub use raw::routes as raw_routes;

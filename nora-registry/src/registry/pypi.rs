@@ -37,16 +37,38 @@ use std::time::Duration;
 /// PEP 691 JSON content type
 const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
 
+#[derive(Clone)]
+struct PypiMount(String);
+
 pub fn routes() -> Router<AppState> {
+    routes_at("/simple/", true)
+}
+
+/// The mounted prefix is request context, not part of the repository's stored identity.
+pub(crate) fn routes_at(prefix: &str, publish: bool) -> Router<AppState> {
+    let root = if publish {
+        get(list_packages)
+            .post(upload)
+            .fallback(|| async { method_not_allowed("GET, HEAD, POST") })
+    } else {
+        get(list_packages).fallback(|| async { method_not_allowed("GET, HEAD") })
+    };
     Router::new()
+        .route(prefix, root)
+        .route(&format!("{prefix}{{name}}/"), get(package_versions))
         .route(
-            "/simple/",
-            get(list_packages)
-                .post(upload)
-                .fallback(|| async { method_not_allowed("GET, POST") }),
+            &format!("{prefix}{{name}}/{{filename}}"),
+            get(download_file),
         )
-        .route("/simple/{name}/", get(package_versions))
-        .route("/simple/{name}/{filename}", get(download_file))
+        .layer(Extension(PypiMount(prefix.to_string())))
+}
+
+fn index_base_url(state: &AppState, mount: &PypiMount) -> String {
+    format!(
+        "{}{}",
+        nora_base_url(state).trim_end_matches('/'),
+        mount.0.trim_end_matches('/')
+    )
 }
 
 // ============================================================================
@@ -54,7 +76,11 @@ pub fn routes() -> Router<AppState> {
 // ============================================================================
 
 /// GET /simple/ — list all packages (PEP 503 HTML or PEP 691 JSON).
-async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn list_packages(
+    State(state): State<AppState>,
+    Extension(mount): Extension<PypiMount>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let keys = match state.storage.list("pypi/").await {
         Ok(k) => k,
         Err(e) => {
@@ -99,10 +125,12 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
         let mut html = String::from(
             "<!DOCTYPE html>\n<html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n",
         );
+        let base = html_escape(&index_base_url(&state, &mount));
         for pkg in pkg_list {
             let _ = writeln!(
                 html,
-                "<a href=\"/simple/{}/\">{}</a><br>",
+                "<a href=\"{}/{}/\">{}</a><br>",
+                base,
                 html_escape(&pkg),
                 html_escape(&pkg)
             );
@@ -129,6 +157,7 @@ async fn list_packages(State(state): State<AppState>, headers: HeaderMap) -> imp
 /// Falls back to local-only when upstream is unavailable.
 async fn package_versions(
     State(state): State<AppState>,
+    Extension(mount): Extension<PypiMount>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -137,7 +166,7 @@ async fn package_versions(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let prefix = format!("pypi/{}/", normalized);
-    let base_url = nora_base_url(&state);
+    let base_url = index_base_url(&state, &mount);
 
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
@@ -847,7 +876,7 @@ fn versions_json_response(
             let (size, upload_time) = pep700.get(&f.filename).cloned().unwrap_or((None, None));
             Pep691File {
                 filename: f.filename.clone(),
-                url: format!("{}/simple/{}/{}", base, normalized, f.filename),
+                url: format!("{}/{}/{}", base, normalized, f.filename),
                 hashes: Pep691Hashes {
                     sha256: f.sha256.clone(),
                 },
@@ -950,8 +979,8 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
             .unwrap_or_default();
         let _ = writeln!(
             html,
-            "<a href=\"{}/simple/{}/{}{}\">{}</a><br>",
-            base,
+            "<a href=\"{}/{}/{}{}\">{}</a><br>",
+            html_escape(base),
             normalized,
             html_escape(&f.filename),
             hash_fragment,
@@ -3233,8 +3262,12 @@ mod spec_conformance_tests {
                 sha256: Some("bbb".into()),
             },
         ];
-        let response =
-            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
+        let response = versions_json_response(
+            "pkg",
+            &files,
+            "http://nora:4000/simple",
+            &Default::default(),
+        );
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -3266,7 +3299,7 @@ mod spec_conformance_tests {
                 sha256: Some("bbb222".into()),
             },
         ];
-        let response = versions_html_response("requests", &files, "http://nora:4000");
+        let response = versions_html_response("requests", &files, "http://nora:4000/simple");
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -3346,8 +3379,12 @@ mod spec_conformance_tests {
             filename: "pkg-1.0.tar.gz".into(),
             sha256: Some("abc123".into()),
         }];
-        let response =
-            versions_json_response("pkg", &files, "http://nora:4000", &Default::default());
+        let response = versions_json_response(
+            "pkg",
+            &files,
+            "http://nora:4000/simple",
+            &Default::default(),
+        );
         let bytes =
             futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
                 .unwrap();
@@ -3752,6 +3789,8 @@ mod hash_marker_tests {
 
 #[cfg(test)]
 mod baseline_tests;
+#[cfg(test)]
+mod repositories_tests;
 
 #[cfg(test)]
 mod upstream_failure_cases {

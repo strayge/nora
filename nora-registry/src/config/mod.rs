@@ -980,6 +980,22 @@ impl Config {
             }
         }
 
+        for repository in self.repositories.values() {
+            if let repositories::RepositoryConfig::Proxy(proxy) = repository {
+                if let Some(host) = reqwest::Url::parse(&proxy.upstream)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .filter(|host| host != "localhost" && host != "127.0.0.1")
+                {
+                    let format = match proxy.format {
+                        repositories::RepositoryFormat::Npm => "npm",
+                        repositories::RepositoryFormat::Pypi => "pypi",
+                    };
+                    result.push((format.into(), host));
+                }
+            }
+        }
+
         // NuGet extra search/autocomplete URLs
         if let Some(host) = extract_host(&self.nuget.search_service) {
             result.push((

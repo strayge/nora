@@ -409,29 +409,7 @@ fn build_context_full(
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
     };
 
-    // Build router identical to run_server() but without TcpListener / rate-limiting
-    // Dynamic route merging based on enabled registries
-    // The server's own assembly of the registry routes (main.rs `registry_routes`).
-    let registry_routes = crate::registry_routes(&enabled_registries);
-
-    let public_routes = Router::new()
-        .merge(crate::health::routes())
-        .merge(crate::metrics::routes());
-
-    let app_routes = Router::new()
-        .merge(crate::auth::token_routes())
-        .merge(crate::ui::routes())
-        .merge(registry_routes);
-
-    let routes = Router::new()
-        .merge(public_routes)
-        .merge(app_routes)
-        .merge(crate::admin::routes())
-        .layer(DefaultBodyLimit::max(
-            state.config.server.body_limit_mb * 1024 * 1024,
-        ));
-    // The server's own request layers (auth, request id, audit, …), so tests run its order.
-    let app = crate::request_layers(routes, &state).with_state(state.clone());
+    let app = router_for_state(&state);
 
     TestContext {
         state,
@@ -439,6 +417,40 @@ fn build_context_full(
         _tempdir: tempdir,
         _signing_dir: signing_dir,
     }
+}
+
+/// Named namespaces are opened asynchronously, just as in the production startup path.
+pub async fn with_named_repositories(mut context: TestContext) -> TestContext {
+    context.state.repositories = Arc::new(
+        crate::repositories::RepositoryCatalogue::open(
+            &context.state.config,
+            &context.state.storage,
+        )
+        .await
+        .expect("named repository identities"),
+    );
+    context.app = router_for_state(&context.state);
+    context
+}
+
+fn router_for_state(state: &AppState) -> Router {
+    let registry_routes = crate::registry_routes(&state.enabled_registries, &state.config)
+        .merge(state.repositories.pypi_routes(state));
+    let public_routes = Router::new()
+        .merge(crate::health::routes())
+        .merge(crate::metrics::routes());
+    let app_routes = Router::new()
+        .merge(crate::auth::token_routes())
+        .merge(crate::ui::routes())
+        .merge(registry_routes);
+    let routes = Router::new()
+        .merge(public_routes)
+        .merge(app_routes)
+        .merge(crate::admin::routes())
+        .layer(DefaultBodyLimit::max(
+            state.config.server.body_limit_mb * 1024 * 1024,
+        ));
+    crate::request_layers(routes, state).with_state(state.clone())
 }
 
 // ---------------------------------------------------------------------------

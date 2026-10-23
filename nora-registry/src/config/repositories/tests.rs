@@ -399,6 +399,21 @@ fn credentials_resolve_and_never_enter_diagnostics() {
 }
 
 #[test]
+fn named_upstream_leak_patterns_use_the_host_without_url_credentials() {
+    for format in ["npm", "pypi"] {
+        let source = proxy("")
+            .replace("format='npm'", &format!("format='{format}'"))
+            .replace(
+                "https://registry.example",
+                "https://user:password@private.example:443/simple/",
+            );
+        assert!(parse(&source)
+            .upstream_hostnames()
+            .contains(&(format.into(), "private.example".into())));
+    }
+}
+
+#[test]
 fn invalid_catalogue_in_default_config_is_fatal_without_strict_mode() {
     let _lock = crate::test_env::env_lock();
     let file = tempfile::NamedTempFile::new().unwrap();

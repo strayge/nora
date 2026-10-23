@@ -531,6 +531,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Middleware to record request metrics
 pub async fn metrics_middleware(
+    State(state): State<AppState>,
     matched_path: Option<MatchedPath>,
     request: Request<Body>,
     next: Next,
@@ -541,8 +542,11 @@ pub async fn metrics_middleware(
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
 
-    // Determine registry from path
-    let registry = detect_registry(&path);
+    let registry = state
+        .repositories
+        .registry_for_path(&path, &state.enabled_registries)
+        .map(|registry| registry.as_str().to_string())
+        .unwrap_or_else(|| detect_registry(&path));
 
     // Process request
     let response = next.run(request).await;
@@ -754,7 +758,8 @@ fn decompress_gzip(data: &[u8]) -> Option<Vec<u8>> {
 /// it from this function explicitly — or its upstream-URL leaks will go unscanned.
 fn is_own_surface(path: &str) -> bool {
     path.starts_with("/api/")          // HTMX JSON backend: dashboard, stats, list, detail, search, tokens
-        || path.starts_with("/api-docs") // Swagger UI + /api-docs/openapi.json spec
+        || path == "/api-docs"
+        || path.starts_with("/api-docs/") // Swagger UI + OpenAPI spec
         || path == "/ui"
         || path.starts_with("/ui/")    // UI pages (HTML, scanned defensively)
         || path == "/health"
@@ -975,6 +980,7 @@ mod tests {
         // Boundary-aware: must not skip paths that merely start with the letters.
         assert!(!is_own_surface("/apiv2foo")); // not "/api/"
         assert!(!is_own_surface("/uikit/widget")); // not "/ui" or "/ui/"
+        assert!(!is_own_surface("/api-docs-packages/pkg/"));
         assert!(!is_own_surface("/metrics-export"));
         assert!(!is_own_surface("/healthcheck-proxy"));
     }
@@ -1086,6 +1092,30 @@ mod tests {
             skip_after > skip_before,
             "own-surface skip must be observable via LEAK_DETECTION_SKIPPED"
         );
+    }
+
+    #[tokio::test]
+    async fn api_docs_lookalike_proxy_json_is_scanned() {
+        use tower::ServiceExt;
+        let (app, _) = leak_test_app(
+            "/api-docs-packages/pkg/",
+            "named_alias",
+            "alias-leak.invalid",
+            r#"{"file":"https://alias-leak.invalid/pkg.whl"}"#,
+        );
+        let counter = UPSTREAM_URL_LEAK_TOTAL.with_label_values(&["named_alias"]);
+        let before = counter.get();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api-docs-packages/pkg/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(counter.get(), before + 1);
     }
 
     #[tokio::test]

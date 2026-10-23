@@ -160,6 +160,50 @@ impl RepositoryCatalogue {
         self.members.values()
     }
 
+    pub(crate) fn registry_for_path(
+        &self,
+        path: &str,
+        enabled: &std::collections::HashSet<crate::registry_type::RegistryType>,
+    ) -> Option<crate::registry_type::RegistryType> {
+        self.pypi_members(enabled)
+            .find(|member| {
+                member
+                    .definition
+                    .paths()
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            })
+            .map(|member| member.registry_type())
+    }
+
+    fn pypi_members<'a>(
+        &'a self,
+        enabled: &'a std::collections::HashSet<crate::registry_type::RegistryType>,
+    ) -> impl Iterator<Item = &'a Arc<Repository>> + 'a {
+        self.members().filter(move |member| {
+            enabled.contains(&crate::registry_type::RegistryType::PyPI)
+                && member.definition.format() == RepositoryFormat::Pypi
+        })
+    }
+
+    pub(crate) fn pypi_routes(&self, root: &AppState) -> axum::Router<AppState> {
+        let mut routes = axum::Router::new();
+        for member in self.pypi_members(&root.enabled_registries) {
+            let mut aliases = axum::Router::new();
+            for prefix in member.definition.paths() {
+                aliases = aliases.merge(crate::registry::pypi_routes_at(
+                    prefix,
+                    matches!(member.definition, RepositoryConfig::Local(_)),
+                ));
+            }
+            routes = routes.merge(aliases.with_state(member.state(root)));
+        }
+        routes.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("sandbox"),
+        ))
+    }
+
     async fn retained_namespaces(&self, root: &Storage) -> Result<Vec<String>, String> {
         let mut keys = root
             .list("repositories/")

@@ -2348,41 +2348,12 @@ async fn run_server(mut config: Config, storage: Storage) {
     // the enabled registries (matching the dashboard body). Set once, immutable.
     ui::components::set_enabled_registries(enabled_registries.clone());
 
-    // Registry routes — only merge enabled registries
-    let registry_routes = registry_routes(&enabled_registries);
-
     // Routes WITHOUT rate limiting (health, metrics, UI)
     let public_routes = Router::new()
         .merge(health::routes())
         .merge(metrics::routes())
         .merge(ui::routes())
         .merge(openapi::routes());
-
-    let app_routes = if rate_limit_enabled {
-        let (routes, enforced) = rate_limited_routes(
-            auth::token_routes(),
-            registry_routes,
-            &rate_limit::limiter_quotas(&config.rate_limit),
-            config.auth.trusted_proxies.clone(),
-        );
-        // What the built limiters enforce, read back from them: any narrowing between the
-        // configuration and the limiters shows here, next to "Rate limiting configured".
-        info!(
-            auth_rps = enforced.auth.per_second(),
-            auth_burst = enforced.auth.burst,
-            upload_rps = enforced.upload.per_second(),
-            upload_burst = enforced.upload.burst,
-            general_rps = enforced.general.per_second(),
-            general_burst = enforced.general.burst,
-            "Rate limits enforced"
-        );
-        routes
-    } else {
-        info!("Rate limiting DISABLED");
-        Router::new()
-            .merge(auth::token_routes())
-            .merge(registry_routes)
-    };
 
     let startup_duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -2463,6 +2434,32 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
+    };
+
+    let registry_routes = registry_routes(&state.enabled_registries, &state.config)
+        .merge(state.repositories.pypi_routes(&state));
+    let app_routes = if rate_limit_enabled {
+        let (routes, enforced) = rate_limited_routes(
+            auth::token_routes(),
+            registry_routes,
+            &rate_limit::limiter_quotas(&state.config.rate_limit),
+            state.config.auth.trusted_proxies.clone(),
+        );
+        info!(
+            auth_rps = enforced.auth.per_second(),
+            auth_burst = enforced.auth.burst,
+            upload_rps = enforced.upload.per_second(),
+            upload_burst = enforced.upload.burst,
+            general_rps = enforced.general.per_second(),
+            general_burst = enforced.general.burst,
+            "Rate limits enforced"
+        );
+        routes
+    } else {
+        info!("Rate limiting DISABLED");
+        Router::new()
+            .merge(auth::token_routes())
+            .merge(registry_routes)
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -2626,7 +2623,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     // The layers inside metrics are built by `request_layers`, which the test
     // router uses too, so the tests run the order the server runs.
     let app = request_layers(app, &state)
-        .layer(middleware::from_fn(metrics::metrics_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::metrics_middleware,
+        ))
         .layer(middleware::from_fn(
             validation::reject_null_bytes_middleware,
         ))
@@ -3017,7 +3017,23 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
 
 /// The routes of the enabled registries — one assembly for the server and the tests, so a test
 /// reaches every route a client does (the NuGet aliases included).
-fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
+fn registry_routes(enabled: &HashSet<RegistryType>, config: &Config) -> Router<AppState> {
+    let replaced = |mount: &str| {
+        enabled.contains(&RegistryType::PyPI)
+            && config
+                .repositories
+                .values()
+                .filter(|repository| {
+                    repository.format() == config::repositories::RepositoryFormat::Pypi
+                        && !matches!(repository, config::repositories::RepositoryConfig::Group(_))
+                })
+                .any(|repository| {
+                    repository
+                        .paths()
+                        .iter()
+                        .any(|prefix| prefix.starts_with(mount) || mount.starts_with(prefix))
+                })
+    };
     let mut registry_routes = Router::new();
     for reg in enabled {
         match reg {
@@ -3027,11 +3043,16 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
             RegistryType::Maven => {
                 registry_routes = registry_routes.merge(registry::maven_routes())
             }
-            RegistryType::Npm => registry_routes = registry_routes.merge(registry::npm_routes()),
+            RegistryType::Npm if !replaced("/npm/") => {
+                registry_routes = registry_routes.merge(registry::npm_routes())
+            }
             RegistryType::Cargo => {
                 registry_routes = registry_routes.merge(registry::cargo_routes())
             }
-            RegistryType::PyPI => registry_routes = registry_routes.merge(registry::pypi_routes()),
+            RegistryType::PyPI if !replaced("/simple/") => {
+                registry_routes = registry_routes.merge(registry::pypi_routes())
+            }
+            RegistryType::Npm | RegistryType::PyPI => {}
             RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
             RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
             RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),
@@ -3377,7 +3398,7 @@ mod middleware_stack_whitelist {
         let end = tail.find(".with_state(state.clone());").unwrap();
         let expected = [
             "letapp=request_layers(app,&state)",
-            ".layer(middleware::from_fn(metrics::metrics_middleware))",
+            ".layer(middleware::from_fn_with_state(state.clone(),metrics::metrics_middleware,))",
             ".layer(middleware::from_fn(validation::reject_null_bytes_middleware,))",
         ]
         .concat();
@@ -3387,7 +3408,7 @@ mod middleware_stack_whitelist {
     #[test]
     fn the_test_router_builds_its_layers_only_through_request_layers() {
         let code = squash(include_str!("test_helpers.rs"));
-        assert!(code.contains(&["crate::request_layers", "(routes,&state)"].concat()));
+        assert!(code.contains(&["crate::request_layers", "(routes,state)"].concat()));
         assert_eq!(code.matches(&["from_fn", ""].concat()).count(), 0);
         assert_eq!(
             code.matches(&[".layer", "("].concat()).count(),

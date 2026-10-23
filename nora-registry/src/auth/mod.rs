@@ -141,7 +141,12 @@ fn is_web_surface(path: &str) -> bool {
     if path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens") {
         return false;
     }
-    path.starts_with("/ui") || path.starts_with("/api/ui") || path.starts_with("/api-docs")
+    ["/ui", "/api/ui", "/api-docs"].iter().any(|prefix| {
+        path == *prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
 }
 
 /// Check if a path belongs to the Docker/OCI registry (`/v2`, `/v2/…`).
@@ -825,6 +830,9 @@ mod tests {
         // Docker /v2/ is neither.
         assert!(!is_public_path("/v2/"));
         assert!(!is_web_surface("/v2/"));
+        for path in ["/ui-packages/", "/api/ui-packages/", "/api-docs-packages/"] {
+            assert!(!is_web_surface(path), "{path}");
+        }
     }
 
     #[test]
