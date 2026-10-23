@@ -732,7 +732,7 @@ async fn fetch_pub_api(
     cb: &crate::circuit_breaker::CircuitBreakerRegistry,
 ) -> Result<Vec<u8>, ProxyError> {
     super::proxy_fetch_core(
-        &state.http_client,
+        super::transport::ProxyClient::Legacy(&state.http_client),
         url,
         Duration::from_secs(state.config.pub_dart.proxy_timeout),
         expose_opt(&state.config.pub_dart.proxy_auth).map(UpstreamAuth::Basic),

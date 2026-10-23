@@ -514,35 +514,41 @@ async fn malformed_version_metadata_never_advertises_a_direct_cdn_tarball() {
 }
 
 #[tokio::test]
-async fn authenticated_named_requests_never_follow_implicit_redirects() {
+async fn authenticated_named_requests_follow_only_explicit_origin_scoped_redirects() {
     let _lock = crate::test_env::env_lock();
     let upstream = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{NAME}")))
+    for (verb, from, target, status) in [
+        ("GET", format!("/{NAME}"), "/follow-metadata", 302),
+        ("GET", "/redirect.tgz".into(), "/follow-file", 302),
+        (
+            "POST",
+            "/-/npm/v1/security/advisories/bulk".into(),
+            "/follow-audit",
+            307,
+        ),
+    ] {
+        Mock::given(method(verb))
+            .and(path(from))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("location", format!("{}{target}", upstream.uri())),
+            )
+            .mount(&upstream)
+            .await;
+    }
+    Mock::given(path("/follow-metadata"))
         .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("location", format!("{}/follow", upstream.uri())),
+            ResponseTemplate::new(200)
+                .set_body_json(metadata(&format!("{}/redirect.tgz", upstream.uri()))),
         )
         .mount(&upstream)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/redirect.tgz"))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("location", format!("{}/follow", upstream.uri())),
-        )
+    Mock::given(path("/follow-file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"followed"))
         .mount(&upstream)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/-/npm/v1/security/advisories/bulk"))
-        .respond_with(
-            ResponseTemplate::new(307)
-                .insert_header("location", format!("{}/follow", upstream.uri())),
-        )
-        .mount(&upstream)
-        .await;
-    Mock::given(path("/follow"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"leaked":true})))
+    Mock::given(path("/follow-audit"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"real":true})))
         .mount(&upstream)
         .await;
     let context = with_named_repositories(create_test_context_with_config(|config| {
@@ -553,41 +559,35 @@ async fn authenticated_named_requests_never_follow_implicit_redirects() {
         send(&context.app, Method::GET, &format!("/packages/{NAME}"), "")
             .await
             .status(),
-        StatusCode::BAD_GATEWAY
+        StatusCode::OK
     );
-    let repository = context.state.repositories.get("remote").unwrap();
-    put_with_origin(
-        &repository.storage,
-        &upstream_packument_key(NAME),
-        &serde_json::to_vec(&metadata(&format!("{}/redirect.tgz", upstream.uri()))).unwrap(),
-        &origin_of(&upstream.uri()),
+    let response = send(
+        &context.app,
+        Method::GET,
+        &format!("/packages/{NAME}/-/pkg-1.0.0.tgz"),
+        "",
     )
-    .await
-    .unwrap();
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.as_ref(), b"followed");
     assert_eq!(
         send(
             &context.app,
-            Method::GET,
-            &format!("/packages/{NAME}/-/pkg-1.0.0.tgz"),
-            ""
+            Method::POST,
+            "/alias/-/npm/v1/security/advisories/bulk",
+            "{}"
         )
         .await
         .status(),
-        StatusCode::BAD_GATEWAY
+        StatusCode::OK
     );
-    assert!(!send(
-        &context.app,
-        Method::POST,
-        "/alias/-/npm/v1/security/advisories/bulk",
-        "{}"
-    )
-    .await
-    .status()
-    .is_success());
-    assert!(!upstream
-        .received_requests()
-        .await
-        .unwrap()
+    let requests = upstream.received_requests().await.unwrap();
+    let followed: Vec<_> = requests
         .iter()
-        .any(|request| request.url.path() == "/follow"));
+        .filter(|request| request.url.path().starts_with("/follow-"))
+        .collect();
+    assert!(followed.len() >= 3);
+    assert!(followed
+        .iter()
+        .all(|request| request.headers["authorization"] == "Basic YWxpY2U6c2VjcmV0"));
 }

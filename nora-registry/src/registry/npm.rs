@@ -9,10 +9,10 @@ use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority
 use crate::circuit_breaker::BreakerScope;
 use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
+use crate::registry::transport::{proxy_fetch, proxy_fetch_conditional, proxy_forward_post};
 use crate::registry::{
-    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
-    proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
-    Revalidation, Validators,
+    circuit_open_response, method_not_allowed, nora_base_url, read_validators, validators_key,
+    write_validators, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -202,7 +202,7 @@ async fn handle_npm_post(
 
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_forward_post(
-        &state.http_client,
+        &state,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -739,7 +739,7 @@ async fn handle_request(
             .is_some_and(|(configured, target)| configured.origin() == target.origin());
         let auth = if same_origin { upstream.auth } else { None };
         match proxy_fetch(
-            &state.http_client,
+            &state,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
             auth,
@@ -1135,7 +1135,7 @@ async fn refetch_metadata(
     let had_validators = validators.is_some();
 
     match proxy_fetch_conditional(
-        &state.http_client,
+        state,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -1651,7 +1651,7 @@ async fn uncached_upstream_metadata(
     };
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
-        &state.http_client,
+        state,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -1773,7 +1773,7 @@ async fn upstream_metadata(
     };
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
-        &state.http_client,
+        state,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -2435,7 +2435,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
     if let Ok(data) = proxy_fetch(
-        &state.http_client,
+        state,
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,

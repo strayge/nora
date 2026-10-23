@@ -28,6 +28,7 @@ pub(crate) struct Repository {
     pub definition: RepositoryConfig,
     pub source_id: String,
     pub storage: Storage,
+    pub transport: Option<crate::registry::transport::RepositoryTransport>,
     config: Arc<Config>,
     index: Arc<RepoIndex>,
     locks: PublishLocks,
@@ -134,6 +135,18 @@ impl RepositoryCatalogue {
             let storage = root
                 .scoped(&format!("{prefix}/sources/{source_id}"))
                 .map_err(|_| format!("repository {name}: invalid namespace"))?;
+            let transport = match definition {
+                RepositoryConfig::Proxy(policy) => {
+                    if !policy.tls_verify {
+                        tracing::warn!(repository = %name, "TLS certificate verification disabled for configured upstream origin");
+                    }
+                    Some(
+                        crate::registry::transport::RepositoryTransport::new(policy, &config.tls)
+                            .map_err(|error| format!("repository {name}: {error}"))?,
+                    )
+                }
+                _ => None,
+            };
             members.insert(
                 name.clone(),
                 Arc::new(Repository {
@@ -141,6 +154,7 @@ impl RepositoryCatalogue {
                     definition: definition.clone(),
                     source_id,
                     storage,
+                    transport,
                     config: Arc::new(protocol_config(config, definition)),
                     index: Arc::new(RepoIndex::new()),
                     locks: Arc::default(),

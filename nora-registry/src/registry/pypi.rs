@@ -14,10 +14,8 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
-use crate::registry::{
-    circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_text,
-    UpstreamMiss,
-};
+use crate::registry::transport::{proxy_fetch, proxy_fetch_text};
+use crate::registry::{circuit_open_response, method_not_allowed, nora_base_url, UpstreamMiss};
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
 use crate::validation::ends_with_ci;
@@ -285,7 +283,7 @@ async fn package_versions(
         for up in &upstreams {
             let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
             match proxy_fetch_text(
-                &state.http_client,
+                &state,
                 &url,
                 Duration::from_secs(state.config.pypi.proxy_timeout),
                 up.auth().map(UpstreamAuth::Basic),
@@ -536,7 +534,7 @@ async fn download_file(
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
         let html = match proxy_fetch_text(
-            &state.http_client,
+            &state,
             &page_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
             up.auth().map(UpstreamAuth::Basic),
@@ -572,7 +570,7 @@ async fn download_file(
             None
         };
         match proxy_fetch(
-            &state.http_client,
+            &state,
             &file_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
             file_auth,
@@ -1078,7 +1076,7 @@ async fn ensure_pypi_dates_cached(
     for up in &state.config.pypi.upstreams() {
         let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
         let Ok(text) = proxy_fetch_text(
-            &state.http_client,
+            state,
             &url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
             up.auth().map(UpstreamAuth::Basic),

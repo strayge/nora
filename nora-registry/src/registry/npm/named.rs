@@ -10,10 +10,6 @@ pub(super) struct Mount(pub(super) Arc<str>);
 
 pub(super) fn bind(state: &mut AppState, mount: Mount) {
     state.repository_mount = Some(mount.0);
-    if state.repository.is_some() {
-        // Until explicit origin-scoped hopping, a redirect must not carry credentials downhill.
-        state.http_client = state.http_client_no_redirect.clone();
-    }
 }
 
 pub(super) fn base(state: &AppState) -> String {
@@ -142,7 +138,7 @@ pub(super) async fn artifact_url(
         None => {
             let url = format!("{}/{}", upstream.url.trim_end_matches('/'), name);
             let data = proxy_fetch(
-                &state.http_client,
+                state,
                 &url,
                 Duration::from_secs(state.config.npm.proxy_timeout),
                 upstream.auth,

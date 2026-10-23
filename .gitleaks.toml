@@ -7,6 +7,8 @@ title = "NORA gitleaks rules"
   description = "Global allowlist for false positives"
   paths = [
     '''\.gitleaks\.toml$''',
+    # Synthetic test-server key, never loaded by production code.
+    '''nora-registry/src/registry/transport/fixtures/server-key\.pem$''',
   ]
   regexTarget = "match"
   # Test placeholder tokens (e.g. nra_00112233...)

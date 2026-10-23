@@ -22,6 +22,7 @@ pub(crate) mod range;
 pub(crate) mod raw;
 pub(crate) mod rpm;
 pub(crate) mod terraform;
+pub(crate) mod transport;
 
 // Cross-registry regression suite for namespace isolation on metadata paths (#732).
 #[cfg(test)]
@@ -67,6 +68,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use std::time::{Duration, Instant};
+use transport::ProxyClient;
 
 /// Remove the files directly in `dir` whose last write is at least `max_age` ago.
 ///
@@ -323,7 +325,7 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
 /// Core fetch logic with retry. Callers provide a response extractor.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
-    client: &reqwest::Client,
+    client: ProxyClient<'_>,
     url: &str,
     timeout: Duration,
     auth: Option<UpstreamAuth<'_>>,
@@ -352,7 +354,7 @@ where
         }
 
         let upstream_start = Instant::now();
-        match request.send().await {
+        match client.send(request).await {
             Ok(response) => {
                 let elapsed = upstream_start.elapsed().as_secs_f64();
                 if response.status().is_success() {
@@ -446,7 +448,7 @@ pub(crate) async fn proxy_fetch(
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Vec<u8>, ProxyError> {
     proxy_fetch_core(
-        client,
+        ProxyClient::Legacy(client),
         url,
         timeout,
         auth,
@@ -469,7 +471,7 @@ pub(crate) async fn proxy_fetch_text(
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<String, ProxyError> {
     proxy_fetch_core(
-        client,
+        ProxyClient::Legacy(client),
         url,
         timeout,
         auth,
@@ -667,6 +669,30 @@ pub(crate) async fn proxy_forward_post(
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
+    proxy_forward_post_client(
+        ProxyClient::Legacy(client),
+        url,
+        timeout,
+        auth,
+        fwd_headers,
+        body,
+        cb,
+        scope,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_forward_post_client(
+    client: ProxyClient<'_>,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    fwd_headers: &[(&str, &str)],
+    body: &[u8],
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<(u16, Vec<u8>, Option<String>), ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
@@ -683,7 +709,7 @@ pub(crate) async fn proxy_forward_post(
         }
 
         let upstream_start = Instant::now();
-        match request.send().await {
+        match client.send(request).await {
             Ok(response) => {
                 let elapsed = upstream_start.elapsed().as_secs_f64();
                 let code = response.status().as_u16();
@@ -956,6 +982,27 @@ pub(crate) async fn proxy_fetch_conditional(
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
+    proxy_fetch_conditional_client(
+        ProxyClient::Legacy(client),
+        url,
+        timeout,
+        auth,
+        validators,
+        cb,
+        scope,
+    )
+    .await
+}
+
+async fn proxy_fetch_conditional_client(
+    client: ProxyClient<'_>,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Revalidation, ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
     let cb_key = scope.into().key();
     let probe = cb.check(&cb_key)?;
@@ -971,7 +1018,7 @@ pub(crate) async fn proxy_fetch_conditional(
         request = request.header(header::IF_MODIFIED_SINCE, lm);
     }
 
-    match request.send().await {
+    match client.send(request).await {
         Ok(response) => {
             let status = response.status();
             if status == reqwest::StatusCode::NOT_MODIFIED {

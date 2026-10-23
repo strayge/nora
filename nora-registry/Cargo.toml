@@ -81,6 +81,8 @@ mimalloc = { version = "0.1", features = ["no_thp"], optional = true }
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
+# TLS fixtures exercise redirects across trust boundaries without external processes.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
 rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression"] }
 proptest = "1"
