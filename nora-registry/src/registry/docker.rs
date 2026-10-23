@@ -1134,10 +1134,9 @@ async fn catalog(State(state): State<AppState>) -> Response {
             // Find the first known directory separator (manifests/ or blobs/)
             let name = if let Some(idx) = rest.find("/manifests/") {
                 &rest[..idx]
-            } else if let Some(idx) = rest.find("/blobs/") {
-                &rest[..idx]
             } else {
-                return None;
+                let idx = rest.find("/blobs/")?;
+                &rest[..idx]
             };
             if name.is_empty() {
                 return None;

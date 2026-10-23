@@ -380,7 +380,7 @@ pub async fn api_search(
                     html_escape(&repo.name),
                     repo.versions,
                     format_size(repo.size),
-                    &repo.updated
+                    repo.updated
                 )
             })
             .collect::<Vec<_>>()

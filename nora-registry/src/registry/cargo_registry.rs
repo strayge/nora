@@ -953,7 +953,7 @@ async fn publish(
     // Decided before anything is written, so a refusal leaves the store as it was.
     let migrate_from = match migration_source(&state, &prefix, &name).await {
         Ok(source) => source,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
 
     if state.storage.put(&crate_key, crate_data).await.is_err() {
@@ -1334,13 +1334,15 @@ async fn migration_source(
     state: &AppState,
     prefix: &str,
     name: &str,
-) -> Result<Option<Bytes>, Response> {
+) -> Result<Option<Bytes>, Box<Response>> {
     match state.storage.list(&entries_prefix(prefix, name)).await {
         Ok(keys) if !keys.is_empty() => return Ok(None), // already migrated
         Ok(_) => {}
         Err(e) => {
             tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: listing published entries failed");
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "storage listing failed").into_response());
+            return Err(Box::new(
+                (StatusCode::SERVICE_UNAVAILABLE, "storage listing failed").into_response(),
+            ));
         }
     }
     match assembled_index(&state.storage, prefix, name).await {
@@ -1348,7 +1350,9 @@ async fn migration_source(
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(registry = "cargo", crate_name = %name, error = %e, "cargo publish: reading the assembled index failed");
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "storage read failed").into_response());
+            return Err(Box::new(
+                (StatusCode::SERVICE_UNAVAILABLE, "storage read failed").into_response(),
+            ));
         }
     }
     let index_key = format!("cargo/index/{prefix}/{name}");
@@ -1362,16 +1366,18 @@ async fn migration_source(
     let detail = format!(
         "{index_key} holds a sparse index with no record of where it came from: an upstream crate cached by an older NORA release, or a crate published to NORA before per-version entries. Publishing over it would import its versions as published ones. If it is a cache, delete {index_key} and publish again; if it is your own crate, set NORA_CARGO_IMPORT_EMBEDDED={name} and publish again."
     );
-    Err((
-        StatusCode::CONFLICT,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
-        serde_json::to_vec(&serde_json::json!({ "errors": [{ "detail": detail }] }))
-            .unwrap_or_default(),
-    )
-        .into_response())
+    Err(Box::new(
+        (
+            StatusCode::CONFLICT,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            serde_json::to_vec(&serde_json::json!({ "errors": [{ "detail": detail }] }))
+                .unwrap_or_default(),
+        )
+            .into_response(),
+    ))
 }
 
 /// Import a stored single-file index as per-version entries (see `migration_source`).
