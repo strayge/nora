@@ -2774,6 +2774,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
             OidcValidator::new(ctx.state.config.auth.oidc.clone(), reqwest::Client::new());
         // We need to rebuild the state with oidc set — use Arc::get_mut or rebuild
         let state = crate::AppState {
+            repositories: ctx.state.repositories.clone(),
+            repository: ctx.state.repository.clone(),
             storage: ctx.state.storage.clone(),
             config: ctx.state.config.clone(),
             enabled_registries: ctx.state.enabled_registries.clone(),

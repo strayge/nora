@@ -168,7 +168,7 @@ pub use self::go::GoConfig;
 pub use self::hf::HfConfig;
 #[allow(unused_imports)]
 pub use self::maven::{MavenConfig, MavenProxy, MavenProxyEntry};
-pub use self::npm::{npm_scope_of, NpmConfig, NpmProxyEntry};
+pub use self::npm::{npm_scope_of, NpmConfig, NpmProxy, NpmProxyEntry};
 pub use self::nuget::NugetConfig;
 pub use self::pub_dart::PubDartConfig;
 pub use self::pypi::PypiConfig;

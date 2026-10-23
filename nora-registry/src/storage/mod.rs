@@ -3,6 +3,7 @@
 
 mod local;
 mod object;
+mod scoped;
 
 pub use local::LocalStorage;
 pub(crate) use local::NameTaken;
@@ -79,6 +80,12 @@ fn registry_label(key: &str) -> &str {
     } else {
         "other"
     }
+}
+
+fn is_internal_record(key: &str) -> bool {
+    key.starts_with(".nora-")
+        || (key.starts_with("repositories/")
+            && key.split('/').any(|segment| segment.starts_with(".nora-")))
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -461,7 +468,7 @@ impl Storage {
         };
         Ok(keys
             .into_iter()
-            .filter(|k| !k.starts_with(".nora-"))
+            .filter(|k| !is_internal_record(k))
             .collect())
     }
 
@@ -482,10 +489,7 @@ impl Storage {
                 return Err(e);
             }
         };
-        Ok(keys
-            .into_iter()
-            .filter(|k| k.starts_with(".nora-"))
-            .collect())
+        Ok(keys.into_iter().filter(|k| is_internal_record(k)).collect())
     }
 
     /// List keys under `prefix` with their size/mtime, applying the same
@@ -511,7 +515,7 @@ impl Storage {
         };
         Ok(entries
             .into_iter()
-            .filter(|(k, _)| !k.starts_with(".nora-"))
+            .filter(|(k, _)| !is_internal_record(k))
             .collect())
     }
 

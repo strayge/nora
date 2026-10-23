@@ -66,6 +66,13 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         );
     }
 
+    keys.extend(
+        storage
+            .list_internal("repositories/")
+            .await
+            .map_err(|e| format!("repository metadata listing failed: {e}"))?,
+    );
+
     if keys.is_empty() {
         println!("No artifacts found in storage. Creating empty backup.");
     } else {

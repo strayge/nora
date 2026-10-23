@@ -58,6 +58,7 @@ mod rate_limit;
 mod registry;
 mod registry_type;
 mod repo_index;
+mod repositories;
 mod request_id;
 mod retention;
 mod secrets;
@@ -374,6 +375,8 @@ pub struct ReloadableConfig {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) repositories: Arc<repositories::RepositoryCatalogue>,
+    pub(crate) repository: Option<Arc<repositories::Repository>>,
     pub storage: Storage,
     pub config: Arc<Config>,
     pub enabled_registries: Arc<HashSet<RegistryType>>,
@@ -1081,11 +1084,12 @@ async fn main() {
             }
         }
         Some(Commands::Gc { apply }) => {
+            let catalogue = maintenance_catalogue(&config, &storage).await;
             let dry_run = !apply;
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Grace applies to manual GC too: `nora gc --apply` is often run while
             // traffic is live, when in-flight pushes are most likely (#584).
-            let result = gc::run_gc(
+            let mut result = gc::run_gc(
                 &storage,
                 &cli_publish_locks,
                 dry_run,
@@ -1094,6 +1098,7 @@ async fn main() {
                 config.gc.proxy_cache_max_bytes,
             )
             .await;
+            catalogue.extend_gc(&config, dry_run, &mut result).await;
             println!("GC Summary{}:", if dry_run { " (dry-run)" } else { "" });
             println!("  Candidates:       {}", result.total_candidates);
             println!("  Orphaned:          {}", result.orphaned);
@@ -1144,10 +1149,11 @@ async fn main() {
             }
         }
         Some(Commands::RetentionPlan) => {
+            let catalogue = maintenance_catalogue(&config, &storage).await;
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Dry-run: plans only, no deletions and no index regeneration —
             // no signer needed.
-            let result = retention::run_retention(
+            let mut result = retention::run_retention(
                 &storage,
                 &cli_publish_locks,
                 None,
@@ -1155,6 +1161,7 @@ async fn main() {
                 true,
             )
             .await;
+            catalogue.extend_retention(&config, true, &mut result).await;
             println!("Retention Plan (dry-run):");
             println!("  Versions to delete: {}", result.planned);
             println!("  Bytes to free:      {}", result.bytes_freed);
@@ -1174,10 +1181,11 @@ async fn main() {
             print_retention_coverage(&storage, &config.retention.rules).await;
         }
         Some(Commands::RetentionApply { yes }) => {
+            let catalogue = maintenance_catalogue(&config, &storage).await;
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             if !yes {
                 // Show plan first, require --yes to execute
-                let result = retention::run_retention(
+                let mut result = retention::run_retention(
                     &storage,
                     &cli_publish_locks,
                     None,
@@ -1185,6 +1193,7 @@ async fn main() {
                     true,
                 )
                 .await;
+                catalogue.extend_retention(&config, true, &mut result).await;
                 println!("Retention Plan:");
                 println!("  Versions to delete: {}", result.planned);
                 println!("  Bytes to free:      {}", result.bytes_freed);
@@ -1210,7 +1219,7 @@ async fn main() {
                 // same key the server would, or clients start failing
                 // verification after a CLI retention pass.
                 let signer = build_signer(&config, &config.enabled_registries());
-                let result = retention::run_retention(
+                let mut result = retention::run_retention(
                     &storage,
                     &cli_publish_locks,
                     signer.as_deref(),
@@ -1218,6 +1227,9 @@ async fn main() {
                     false,
                 )
                 .await;
+                catalogue
+                    .extend_retention(&config, false, &mut result)
+                    .await;
                 println!("Retention Applied:");
                 println!("  Versions deleted:   {}", result.planned);
                 println!("  Keys deleted:       {}", result.deleted_keys);
@@ -2413,7 +2425,16 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
+    let repositories = match repositories::RepositoryCatalogue::open(&config, &storage).await {
+        Ok(catalogue) => Arc::new(catalogue),
+        Err(message) => {
+            error!(error = %message, "Cannot open named repositories");
+            std::process::exit(config::EXIT_CONFIG);
+        }
+    };
     let state = AppState {
+        repositories,
+        repository: None,
         storage,
         config: Arc::new(config),
         enabled_registries,
@@ -2456,6 +2477,15 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let catalogue = state.repositories.clone();
+    let inventory_storage = state.storage.clone();
+    let inventory_cancel = state.cancel_token.clone();
+    scheduler_handles.push(tokio::spawn(async move {
+        tokio::select! {
+            _ = inventory_cancel.cancelled() => {},
+            _ = catalogue.warn_retained(&inventory_storage) => {},
+        }
+    }));
 
     // #1114: fold accumulated docker pull counts into their .stats.json sidecars
     // every PULL_STATS_FLUSH_INTERVAL and once more on shutdown. Pushed to the
@@ -2478,6 +2508,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let dry_run = state.config.retention.dry_run;
         let audit = state.audit.clone();
         let repo_index = state.repo_index.clone();
+        let repository_state = state.clone();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "retention",
             interval: std::time::Duration::from_secs(state.config.retention.interval),
@@ -2488,7 +2519,9 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let rules = rules.clone();
                 let audit = audit.clone();
                 let repo_index = repo_index.clone();
+                let repository_state = repository_state.clone();
                 async move {
+                    repository_state.repositories.retain(&repository_state).await;
                     info!(
                         dry_run = dry_run,
                         "Retention scheduler: starting periodic run"
@@ -2527,6 +2560,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         let repo_index = state.repo_index.clone();
+        let repository_state = state.clone();
         cleanup_passes.push(cleanup::CleanupPass {
             name: "gc",
             interval: std::time::Duration::from_secs(state.config.gc.interval),
@@ -2534,7 +2568,9 @@ async fn run_server(mut config: Config, storage: Storage) {
                 let storage = storage.clone();
                 let publish_locks = publish_locks.clone();
                 let repo_index = repo_index.clone();
+                let repository_state = repository_state.clone();
                 async move {
+                    repository_state.repositories.gc(&repository_state).await;
                     info!("GC scheduler: starting periodic run");
                     let result = gc_pass(
                         &storage,
@@ -3036,6 +3072,19 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
         axum::http::header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("sandbox"),
     ))
+}
+
+async fn maintenance_catalogue(
+    config: &Config,
+    storage: &Storage,
+) -> repositories::RepositoryCatalogue {
+    match repositories::RepositoryCatalogue::inspect(config, storage).await {
+        Ok(catalogue) => catalogue,
+        Err(message) => {
+            error!(error = %message, "Cannot inspect named repositories");
+            std::process::exit(config::EXIT_CONFIG);
+        }
+    }
 }
 
 /// Print note about registries that have data but no retention rules configured.

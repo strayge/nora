@@ -375,6 +375,8 @@ fn build_context_full(
         ),
     };
     let state = AppState {
+        repositories: Arc::default(),
+        repository: None,
         storage,
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),

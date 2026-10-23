@@ -108,6 +108,7 @@ async fn reindex(
         Some(rt) => state.repo_index.invalidate(rt.as_str()),
         None => state.repo_index.invalidate_all(),
     }
+    state.repositories.invalidate(target);
 
     state.audit.log(AuditEntry::new(
         "reindex",
@@ -128,6 +129,7 @@ async fn reindex(
     // it just rebuilds lazily on the next read after restart.
     let repo_index = state.repo_index.clone();
     let storage = state.storage.clone();
+    let repositories = state.repositories.clone();
     // `state` is unused past this point, so move the token instead of cloning.
     let cancel = state.cancel_token;
     let targets: Vec<RegistryType> = match target {
@@ -143,6 +145,7 @@ async fn reindex(
                 for rt in targets {
                     let _ = repo_index.get(rt.as_str(), &storage).await;
                 }
+                repositories.warm(target).await;
             } => {}
         }
     });

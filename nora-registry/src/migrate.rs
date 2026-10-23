@@ -65,6 +65,12 @@ pub async fn migrate(
         );
     }
 
+    keys.extend(
+        from.list_internal("repositories/")
+            .await
+            .map_err(|e| format!("repository metadata listing failed: {e}"))?,
+    );
+
     if keys.is_empty() {
         println!("No artifacts found in source storage.");
         return Ok(MigrateStats::default());
