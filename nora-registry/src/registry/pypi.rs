@@ -3515,7 +3515,7 @@ mod hash_marker_tests {
     ///
     /// Markers written by a background task appear some time after the response; the
     /// deadline only bounds a task that never finishes.
-    async fn wait_for_markers(ctx: &TestContext, project: &str, expected: &[String]) {
+    pub(super) async fn wait_for_markers(ctx: &TestContext, project: &str, expected: &[String]) {
         use std::time::{Duration, Instant};
 
         let prefix = format!("{HASH_MARKER_PREFIX}{project}/");
@@ -3715,6 +3715,7 @@ mod hash_marker_tests {
         let (backend, _ops) = op_counting_storage();
         let ctx = create_test_context_with_storage_and_config(backend, |cfg| {
             cfg.pypi.proxy = Some(upstream.uri());
+            cfg.server.trust_upstream_dates = false;
         });
 
         let resp = send(
@@ -3725,14 +3726,32 @@ mod hash_marker_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "proxied download served");
+        assert_eq!(body_bytes(resp).await.as_ref(), content);
         wait_for_markers(
             &ctx,
             "proxied",
             &[hash_marker_key("proxied", filename, &digest(content))],
         )
         .await;
+        let cold_requests = upstream.received_requests().await.unwrap().len();
+        let warm = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/proxied/{filename}"),
+            "",
+        )
+        .await;
+        assert_eq!(warm.status(), StatusCode::OK);
+        assert_eq!(body_bytes(warm).await.as_ref(), content);
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            cold_requests
+        );
     }
 }
+
+#[cfg(test)]
+mod baseline_tests;
 
 #[cfg(test)]
 mod upstream_failure_cases {

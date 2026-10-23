@@ -283,6 +283,7 @@ fn build_context_full(
         },
         registries: None,
         signing: crate::config::SigningConfig::default(),
+        ..Config::default()
     };
 
     // Apply any custom config tweaks

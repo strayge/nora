@@ -15,6 +15,7 @@ mod gc;
 mod rate_limit;
 mod registries;
 pub mod registry;
+pub mod repositories;
 mod retention;
 mod server;
 mod signing_cfg;
@@ -46,7 +47,7 @@ pub use crate::secrets::SecretsConfig;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 
@@ -100,10 +101,23 @@ fn config_strict_from_env() -> bool {
 /// such as `curation.mdoe` for a typo of `mode`.
 fn parse_config(content: &str) -> Result<(Config, Vec<String>), toml::de::Error> {
     let mut unknown = Vec::new();
+    let hide_input = content.contains("repositories");
+    let deserializer = toml::Deserializer::parse(content).map_err(|mut error| {
+        if hide_input {
+            error.set_input(None);
+        }
+        error
+    })?;
     let mut config: Config =
-        serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
-            unknown.push(key_path(&path))
-        })?;
+        serde_ignored::deserialize(deserializer, |path| unknown.push(key_path(&path))).map_err(
+            |mut error: toml::de::Error| {
+                // Repository tables can contain credentials on the same line as a bad field.
+                if hide_input {
+                    error.set_input(None);
+                }
+                error
+            },
+        )?;
     // serde fills a missing `mode` with its default; whether it was written down is read from
     // the file itself (#1135).
     config.curation.mode_explicit = content
@@ -186,6 +200,14 @@ fn surface_unknown_keys(
     keys: Vec<String>,
     strict: bool,
 ) -> Result<Vec<String>, ConfigLoadError> {
+    if keys
+        .iter()
+        .any(|key| key == "repository_defaults" || key.starts_with("repository_defaults."))
+    {
+        return Err(ConfigLoadError::Invalid(vec![
+            "repository_defaults is unsupported; configure each repository explicitly".into(),
+        ]));
+    }
     if keys.is_empty() {
         return Ok(keys);
     }
@@ -329,6 +351,8 @@ pub(crate) fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub repositories: BTreeMap<String, repositories::RepositoryConfig>,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -1429,6 +1453,10 @@ impl Config {
             errors.extend(e);
         }
 
+        let (repository_warnings, repository_errors) = repositories::problems(self);
+        warnings.extend(repository_warnings);
+        errors.extend(repository_errors);
+
         // 10. [registries].enable validation
         if let Some(ref section) = self.registries {
             if let Some(ref spec) = section.enable {
@@ -1494,6 +1522,12 @@ impl Config {
                         unknown_keys = surface_unknown_keys(fallback, unknown, strict)?;
                         tracing::info!(path = %fallback, "Loaded config");
                         cfg
+                    }
+                    Err(source) if content.contains("repositories") => {
+                        return Err(ConfigLoadError::InvalidToml {
+                            path: fallback.to_string(),
+                            source,
+                        });
                     }
                     Err(e) => {
                         tracing::warn!(path = %fallback, error = %e, "config exists but contains invalid TOML, using defaults");
@@ -1590,6 +1624,11 @@ impl Config {
         self.docker.apply_env_overrides();
         self.maven.apply_env_overrides();
         self.npm.apply_env_overrides();
+        for repository in self.repositories.values_mut() {
+            if let repositories::RepositoryConfig::Proxy(proxy) = repository {
+                proxy.resolve_credentials();
+            }
+        }
         self.pypi.apply_env_overrides();
         self.go.apply_env_overrides();
         self.cargo.apply_env_overrides();
@@ -2848,7 +2887,12 @@ proxies = [
         }
         assert_eq!(
             maps,
-            ["circuit_breaker.overrides", "deb.proxies", "rpm.proxies"],
+            [
+                "circuit_breaker.overrides",
+                "deb.proxies",
+                "repositories",
+                "rpm.proxies",
+            ],
             "only name-keyed maps may refuse a typo key; a struct here hides its typos"
         );
     }
@@ -2912,6 +2956,12 @@ proxies = [
             proxy_auth = "u:p"  # secret
             [rpm.proxies]
             fedora = { url = "https://rpm.example", auth = "u:p" }  # secret
+            [repositories.private]
+            format = "pypi"
+            kind = "proxy"
+            paths = ["/private/"]
+            upstream = "https://pypi.example/simple/"
+            auth = "u:p"  # secret
         "#;
         assert!(unknown_keys(SECRETS).is_empty());
 
