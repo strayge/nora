@@ -378,6 +378,7 @@ fn build_context_full(
         repositories: Arc::default(),
         repository: None,
         repository_mount: None,
+        metadata_deadline: None,
         storage,
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),

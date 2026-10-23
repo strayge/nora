@@ -2788,6 +2788,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             repositories: ctx.state.repositories.clone(),
             repository: ctx.state.repository.clone(),
             repository_mount: ctx.state.repository_mount.clone(),
+            metadata_deadline: ctx.state.metadata_deadline,
             storage: ctx.state.storage.clone(),
             config: ctx.state.config.clone(),
             enabled_registries: ctx.state.enabled_registries.clone(),

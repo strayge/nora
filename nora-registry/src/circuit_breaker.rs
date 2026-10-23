@@ -44,6 +44,11 @@ pub(crate) fn upstream_key(registry: &str, upstream_url: &str) -> String {
     format!("{registry}:{url}")
 }
 
+/// Only configured identities may create breaker/metric keys, never request URLs.
+pub(crate) fn repository_key(registry: RegistryType, name: &str, source: &str) -> String {
+    format!("{}:repository:{name}:{source}", registry.as_str())
+}
+
 /// The format part of a breaker key: `"pypi:https://…"` → `"pypi"`, `"npm"` → `"npm"`.
 fn registry_of(key: &str) -> &str {
     key.split_once(':').map_or(key, |(registry, _)| registry)
@@ -80,6 +85,21 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
                     .map(|url| upstream_key(rt.as_str(), url)),
             ),
             _ => keys.push(rt.as_str().to_string()),
+        }
+    }
+    for (name, repository) in &config.repositories {
+        if !matches!(
+            repository,
+            crate::config::repositories::RepositoryConfig::Proxy(_)
+        ) {
+            continue;
+        }
+        let registry = match repository.format() {
+            crate::config::repositories::RepositoryFormat::Npm => RegistryType::Npm,
+            crate::config::repositories::RepositoryFormat::Pypi => RegistryType::PyPI,
+        };
+        if let Ok(source) = crate::repositories::source_id(repository) {
+            keys.push(repository_key(registry, name, &source));
         }
     }
     keys
@@ -295,11 +315,12 @@ impl CircuitBreakerRegistry {
     /// renders as a healthy `closed` default. The `last_failure` `Instant` is a
     /// monotonic clock, so the snapshot reports *seconds ago* rather than a
     /// wall-clock timestamp.
+    /// A complete configured key inspects one source instead of the format aggregate.
     pub(crate) fn health_snapshot(&self, registry: &str) -> Option<UpstreamHealth> {
         let breakers = self.breakers.read();
         let breaker = breakers
             .iter()
-            .filter(|(key, _)| registry_of(key) == registry)
+            .filter(|(key, _)| key.as_str() == registry || registry_of(key) == registry)
             .map(|(_, b)| b)
             .max_by_key(|b| (b.state.severity(), b.failures))?;
         Some(UpstreamHealth {

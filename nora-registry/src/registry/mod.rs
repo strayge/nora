@@ -341,9 +341,10 @@ where
     let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
-    let cb_key = scope.key();
+    let cb_key = client.breaker_key(scope);
     let probe = cb.check(&cb_key)?;
 
+    client.run(cb, &cb_key, probe, async {
     for attempt in 0..2 {
         let mut request = client.get(url).timeout(timeout);
         if let Some(value) = &auth_header {
@@ -436,6 +437,7 @@ where
     }
     cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
+    }).await
 }
 
 /// Fetch binary content from upstream proxy with timeout and 1 retry.
@@ -696,9 +698,10 @@ async fn proxy_forward_post_client(
     let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
-    let cb_key = scope.key();
+    let cb_key = client.breaker_key(scope);
     let probe = cb.check(&cb_key)?;
 
+    client.run(cb, &cb_key, probe, async {
     for attempt in 0..2 {
         let mut request = client.post(url).timeout(timeout).body(body.to_vec());
         if let Some(value) = &auth_header {
@@ -739,12 +742,15 @@ async fn proxy_forward_post_client(
                         .observe(elapsed);
                     // Upstream is alive and answered — a 4xx audit response is a real
                     // answer, forward it verbatim (not an availability failure). #606.
+                    let b = match response.bytes().await {
+                        Ok(body) => body.to_vec(),
+                        Err(error) if matches!(client, ProxyClient::Named { .. }) => {
+                            cb.record_failure(&cb_key, probe);
+                            return Err(ProxyError::Network(error.to_string()));
+                        }
+                        Err(_) => Vec::new(),
+                    };
                     cb.record_alive(&cb_key, probe);
-                    let b = response
-                        .bytes()
-                        .await
-                        .map(|b| b.to_vec())
-                        .unwrap_or_default();
                     return Ok((code, b, content_type));
                 }
                 UPSTREAM_REQUEST_DURATION
@@ -776,6 +782,7 @@ async fn proxy_forward_post_client(
     }
     cb.record_failure(&cb_key, probe);
     Err(ProxyError::Network("max retries exceeded".into()))
+    }).await
 }
 
 // ============================================================================
@@ -1004,65 +1011,69 @@ async fn proxy_fetch_conditional_client(
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
-    let cb_key = scope.into().key();
+    let cb_key = client.breaker_key(scope.into());
     let probe = cb.check(&cb_key)?;
 
-    let mut request = client.get(url).timeout(timeout);
-    if let Some(value) = auth_header {
-        request = request.header(header::AUTHORIZATION, value);
-    }
-    if let Some(ref etag) = validators.etag {
-        request = request.header(header::IF_NONE_MATCH, etag);
-    }
-    if let Some(ref lm) = validators.last_modified {
-        request = request.header(header::IF_MODIFIED_SINCE, lm);
-    }
+    client
+        .run(cb, &cb_key, probe, async {
+            let mut request = client.get(url).timeout(timeout);
+            if let Some(value) = auth_header {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            if let Some(ref etag) = validators.etag {
+                request = request.header(header::IF_NONE_MATCH, etag);
+            }
+            if let Some(ref lm) = validators.last_modified {
+                request = request.header(header::IF_MODIFIED_SINCE, lm);
+            }
 
-    match client.send(request).await {
-        Ok(response) => {
-            let status = response.status();
-            if status == reqwest::StatusCode::NOT_MODIFIED {
-                cb.record_success(&cb_key, probe);
-                return Ok(Revalidation::NotModified);
-            }
-            if status.is_success() {
-                let new_validators = Validators {
-                    etag: header_string(&response, header::ETAG),
-                    last_modified: header_string(&response, header::LAST_MODIFIED),
-                };
-                return match response.bytes().await {
-                    Ok(body) => {
+            match client.send(request).await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status == reqwest::StatusCode::NOT_MODIFIED {
                         cb.record_success(&cb_key, probe);
-                        Ok(Revalidation::Modified {
-                            body: body.to_vec(),
-                            validators: new_validators,
-                        })
+                        return Ok(Revalidation::NotModified);
                     }
-                    Err(e) => {
-                        // 2xx but the body could not be read (e.g. a mid-stream
-                        // drop) — a fetch failure for the breaker, as in
-                        // proxy_fetch_core; unreported, a half-open probe would
-                        // hold its slot until the #585 stall recovery.
-                        cb.record_failure(&cb_key, probe);
-                        Err(ProxyError::Network(e.to_string()))
+                    if status.is_success() {
+                        let new_validators = Validators {
+                            etag: header_string(&response, header::ETAG),
+                            last_modified: header_string(&response, header::LAST_MODIFIED),
+                        };
+                        return match response.bytes().await {
+                            Ok(body) => {
+                                cb.record_success(&cb_key, probe);
+                                Ok(Revalidation::Modified {
+                                    body: body.to_vec(),
+                                    validators: new_validators,
+                                })
+                            }
+                            Err(e) => {
+                                // 2xx but the body could not be read (e.g. a mid-stream
+                                // drop) — a fetch failure for the breaker, as in
+                                // proxy_fetch_core; unreported, a half-open probe would
+                                // hold its slot until the #585 stall recovery.
+                                cb.record_failure(&cb_key, probe);
+                                Err(ProxyError::Network(e.to_string()))
+                            }
+                        };
                     }
-                };
+                    let code = status.as_u16();
+                    if (400..500).contains(&code) {
+                        // 4xx — upstream alive; recover the breaker without clearing a
+                        // real failure tally, consistent with proxy_fetch_core (#606).
+                        cb.record_alive(&cb_key, probe);
+                        return Err(ProxyError::NotFound);
+                    }
+                    cb.record_failure(&cb_key, probe);
+                    Err(ProxyError::Upstream(code))
+                }
+                Err(e) => {
+                    cb.record_failure(&cb_key, probe);
+                    Err(ProxyError::Network(e.to_string()))
+                }
             }
-            let code = status.as_u16();
-            if (400..500).contains(&code) {
-                // 4xx — upstream alive; recover the breaker without clearing a
-                // real failure tally, consistent with proxy_fetch_core (#606).
-                cb.record_alive(&cb_key, probe);
-                return Err(ProxyError::NotFound);
-            }
-            cb.record_failure(&cb_key, probe);
-            Err(ProxyError::Upstream(code))
-        }
-        Err(e) => {
-            cb.record_failure(&cb_key, probe);
-            Err(ProxyError::Network(e.to_string()))
-        }
-    }
+        })
+        .await
 }
 
 #[cfg(test)]

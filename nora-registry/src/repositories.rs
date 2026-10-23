@@ -120,18 +120,8 @@ impl RepositoryCatalogue {
                 }
                 Err(_) => return Err(format!("repository {name}: cannot verify stored identity")),
             }
-            let source_id = match definition {
-                RepositoryConfig::Proxy(proxy) => {
-                    let mut url = reqwest::Url::parse(&proxy.upstream)
-                        .map_err(|_| format!("repository {name}: invalid upstream"))?;
-                    let _ = url.set_username("");
-                    let _ = url.set_password(None);
-                    hex::encode(Sha256::digest(
-                        url.as_str().trim_end_matches('/').as_bytes(),
-                    ))
-                }
-                _ => "local".into(),
-            };
+            let source_id =
+                source_id(definition).map_err(|error| format!("repository {name}: {error}"))?;
             let storage = root
                 .scoped(&format!("{prefix}/sources/{source_id}"))
                 .map_err(|_| format!("repository {name}: invalid namespace"))?;
@@ -409,6 +399,10 @@ impl Repository {
     }
 
     /// Shared security and shutdown services remain attached to the running server.
+    pub(crate) fn breaker_key(&self) -> String {
+        crate::circuit_breaker::repository_key(self.registry_type(), &self.name, &self.source_id)
+    }
+
     pub(crate) fn state(self: &Arc<Self>, root: &AppState) -> AppState {
         debug_assert!(
             root.repository.is_none(),
@@ -416,6 +410,8 @@ impl Repository {
         );
         let mut view = root.clone();
         view.repository = Some(Arc::clone(self));
+        view.repository_mount = None;
+        view.metadata_deadline = None;
         view.storage = self.storage.clone();
         view.config = Arc::clone(&self.config);
         view.repo_index = Arc::clone(&self.index);
@@ -423,6 +419,18 @@ impl Repository {
         view.proxy_coalesce = self.coalesce.clone();
         view
     }
+}
+
+pub(crate) fn source_id(definition: &RepositoryConfig) -> Result<String, &'static str> {
+    let RepositoryConfig::Proxy(proxy) = definition else {
+        return Ok("local".into());
+    };
+    let mut url = reqwest::Url::parse(&proxy.upstream).map_err(|_| "invalid upstream")?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    Ok(hex::encode(Sha256::digest(
+        url.as_str().trim_end_matches('/').as_bytes(),
+    )))
 }
 
 fn protocol_config(root: &Config, definition: &RepositoryConfig) -> Config {

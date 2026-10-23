@@ -10,6 +10,7 @@ pub(super) struct Mount(pub(super) Arc<str>);
 
 pub(super) fn bind(state: &mut AppState, mount: Mount) {
     state.repository_mount = Some(mount.0);
+    crate::registry::transport::begin_metadata(state);
 }
 
 pub(super) fn base(state: &AppState) -> String {

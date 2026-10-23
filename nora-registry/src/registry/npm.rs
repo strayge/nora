@@ -9,7 +9,9 @@ use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority
 use crate::circuit_breaker::BreakerScope;
 use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
-use crate::registry::transport::{proxy_fetch, proxy_fetch_conditional, proxy_forward_post};
+use crate::registry::transport::{
+    proxy_fetch, proxy_fetch_artifact, proxy_fetch_conditional, proxy_forward_post,
+};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, read_validators, validators_key,
     write_validators, ProxyError, Revalidation, Validators,
@@ -738,7 +740,7 @@ async fn handle_request(
             .zip(reqwest::Url::parse(&url).ok())
             .is_some_and(|(configured, target)| configured.origin() == target.origin());
         let auth = if same_origin { upstream.auth } else { None };
-        match proxy_fetch(
+        match proxy_fetch_artifact(
             &state,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
@@ -1722,7 +1724,10 @@ async fn upstream_metadata(
                 .map(Bytes::from)
         };
         let refreshed = if state.config.server.proxy_coalesce {
-            let budget = crate::proxy_coalesce::follower_budget(state.config.npm.proxy_timeout);
+            let budget = crate::registry::transport::metadata_wait_budget(
+                state,
+                state.config.npm.proxy_timeout,
+            );
             state
                 .proxy_coalesce
                 .coalesced(cache_key, "npm", budget, refetch)

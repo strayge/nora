@@ -14,7 +14,7 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
-use crate::registry::transport::{proxy_fetch, proxy_fetch_text};
+use crate::registry::transport::{proxy_fetch_artifact, proxy_fetch_text};
 use crate::registry::{circuit_open_response, method_not_allowed, nora_base_url, UpstreamMiss};
 use crate::registry_type::RegistryType;
 use crate::ui::components::html_escape;
@@ -154,11 +154,12 @@ async fn list_packages(
 /// (e.g. both cp310 and cp314) regardless of which were cached first.
 /// Falls back to local-only when upstream is unavailable.
 async fn package_versions(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
     Extension(mount): Extension<PypiMount>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    crate::registry::transport::begin_metadata(&mut state);
     let normalized = normalize_name(&name);
     if !crate::validation::is_one_segment(&normalized) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -359,10 +360,11 @@ async fn package_versions(
 /// GET /simple/{name}/{filename} — download a specific file.
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn download_file(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
     headers: HeaderMap,
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
+    crate::registry::transport::begin_metadata(&mut state);
     let normalized = normalize_name(&name);
     if !crate::validation::is_one_segment(&normalized) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -569,7 +571,7 @@ async fn download_file(
         } else {
             None
         };
-        match proxy_fetch(
+        match proxy_fetch_artifact(
             &state,
             &file_url,
             Duration::from_secs(state.config.pypi.proxy_timeout),
