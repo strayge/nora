@@ -377,6 +377,7 @@ fn build_context_full(
     let state = AppState {
         repositories: Arc::default(),
         repository: None,
+        repository_mount: None,
         storage,
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),
@@ -435,7 +436,7 @@ pub async fn with_named_repositories(mut context: TestContext) -> TestContext {
 
 fn router_for_state(state: &AppState) -> Router {
     let registry_routes = crate::registry_routes(&state.enabled_registries, &state.config)
-        .merge(state.repositories.pypi_routes(state));
+        .merge(state.repositories.routes(state));
     let public_routes = Router::new()
         .merge(crate::health::routes())
         .merge(crate::metrics::routes());

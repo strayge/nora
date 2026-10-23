@@ -1,6 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+mod named;
+
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, AuthenticatedUser, NamespaceAuthority};
@@ -28,13 +30,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/npm/{*path}",
-        get(handle_request)
+    routes_at("/npm/", true)
+}
+
+pub(crate) fn routes_at(prefix: &str, publish: bool) -> Router<AppState> {
+    let methods = get(handle_request).post(handle_npm_post);
+    let methods = if publish {
+        methods
             .put(handle_publish)
-            .post(handle_npm_post)
-            .fallback(|| async { method_not_allowed("GET, PUT, POST") }),
-    )
+            .fallback(|| async { method_not_allowed("GET, HEAD, PUT, POST") })
+    } else {
+        methods.fallback(|| async { method_not_allowed("GET, HEAD, POST") })
+    };
+    Router::new()
+        .route(&format!("{prefix}{{*path}}"), methods)
+        .layer(Extension(named::Mount(Arc::from(prefix))))
 }
 
 /// Max body accepted on the `npm audit` POST. Real audit payloads are well under
@@ -51,18 +61,26 @@ const NPM_AUDIT_BODY_CAP: usize = 8 * 1024 * 1024;
 /// is a 405. Dependency-confusion guard (#68/#733): internal-namespace package
 /// names must not leak upstream — see `strip_internal_bulk` / the quick refuse.
 async fn handle_npm_post(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
+    Extension(mount): Extension<named::Mount>,
     Path(path): Path<String>,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
+    named::bind(&mut state, mount);
     let is_bulk = path == "-/npm/v1/security/advisories/bulk";
     let is_quick = path == "-/npm/v1/security/audits/quick";
     // pnpm posts an npm6 dependency tree here (measured with pnpm 10.17, #1055).
     let is_full = path == "-/npm/v1/security/audits";
     if !is_bulk && !is_quick && !is_full {
         // POST is only meaningful on the audit endpoints.
-        return method_not_allowed("GET, PUT");
+        let proxy = state.repository.as_ref().is_some_and(|repository| {
+            matches!(
+                repository.definition,
+                crate::config::repositories::RepositoryConfig::Proxy(_)
+            )
+        });
+        return method_not_allowed(if proxy { "GET, HEAD" } else { "GET, HEAD, PUT" });
     }
 
     // Bound the body AT READ TIME. The global DefaultBodyLimit is 2 GB (for tarball
@@ -409,11 +427,13 @@ async fn handle_whoami(user: &AuthenticatedUser) -> Response {
 
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn handle_request(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
+    Extension(mount): Extension<named::Mount>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
+    named::bind(&mut state, mount);
     // Handle npm whoami endpoint
     if path == "-/whoami" {
         return handle_whoami(&user).await;
@@ -696,13 +716,33 @@ async fn handle_request(
     // --- Proxy fetch path ---
     if let Some(upstream) = state.config.npm.route(&path) {
         let proxy_url = upstream.url;
-        let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
-
+        let url = if state.repository.is_some() {
+            let Some(version) = tarball_version.as_deref() else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if github_packages.is_none() {
+                let short = package_name.rsplit('/').next().unwrap_or(&package_name);
+                if path != format!("{package_name}/-/{short}-{version}.tgz") {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+            }
+            match named::artifact_url(&state, &package_name, version).await {
+                Ok(url) => url.to_string(),
+                Err(status) => return status.into_response(),
+            }
+        } else {
+            format!("{}/{}", proxy_url.trim_end_matches('/'), path)
+        };
+        let same_origin = reqwest::Url::parse(proxy_url)
+            .ok()
+            .zip(reqwest::Url::parse(&url).ok())
+            .is_some_and(|(configured, target)| configured.origin() == target.origin());
+        let auth = if same_origin { upstream.auth } else { None };
         match proxy_fetch(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.npm.proxy_timeout),
-            upstream.auth,
+            auth,
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::Npm, upstream.url),
         )
@@ -1002,11 +1042,37 @@ async fn cached_copy_trusted(
     package_name: &str,
     tarball_version: Option<&str>,
 ) -> bool {
-    let Some(scope) = npm_scope_of(path) else {
-        return true;
-    };
-    if !state.config.npm.owned_scopes().any(|owned| owned == scope) {
-        return true;
+    let named_proxy = state.repository.as_ref().is_some_and(|repository| {
+        matches!(
+            repository.definition,
+            crate::config::repositories::RepositoryConfig::Proxy(_)
+        )
+    });
+    if !named_proxy {
+        if let Some(repository) = &state.repository {
+            if matches!(
+                repository.definition,
+                crate::config::repositories::RepositoryConfig::Local(_)
+            ) {
+                return match tarball_version {
+                    Some(version) => state
+                        .storage
+                        .stat(&format!("npm/{package_name}/versions/{version}.json"))
+                        .await
+                        .is_some(),
+                    None => matches!(
+                        published_state(&state.storage, package_name).await,
+                        Published::Yes(_)
+                    ),
+                };
+            }
+        }
+        let Some(scope) = npm_scope_of(path) else {
+            return true;
+        };
+        if !state.config.npm.owned_scopes().any(|owned| owned == scope) {
+            return true;
+        }
     }
     let published_here = match tarball_version {
         Some(version) => state
@@ -1021,7 +1087,7 @@ async fn cached_copy_trusted(
             .unwrap_or_default()
             .is_empty(),
     };
-    if published_here {
+    if published_here && !named_proxy {
         return true;
     }
     let Some(owner) = state.config.npm.route(path) else {
@@ -1039,7 +1105,7 @@ async fn cached_copy_trusted(
     origin == origin_of(owner.url) && state.storage.pin(key).await.as_deref() == Some(digest)
 }
 
-/// Refetch metadata from upstream, rewrite URLs, update cache.
+/// Refresh metadata without binding named cache bytes to a public alias.
 /// Returns None if upstream is unavailable (caller serves stale cache).
 ///
 /// `key` is the cache written; `seed_key` holds the copy being revalidated (`key`, or what an
@@ -1079,8 +1145,8 @@ async fn refetch_metadata(
     )
     .await
     {
-        // Upstream unchanged — serve the cached (already-rewritten) body and
-        // refresh its freshness so we don't revalidate again until the next TTL
+        // Upstream unchanged — reuse the stored body, rendering named aliases at egress.
+        // Refresh its freshness so we don't revalidate again until the next TTL
         // window. No body was downloaded.
         Ok(Revalidation::NotModified) => {
             match state.storage.get(key).await {
@@ -1120,19 +1186,9 @@ async fn refetch_metadata(
                 }
             }
         }
-        // New body — rewrite, cache it, then persist the fresh validators.
+        // The validators describe stored source bytes, not the named alias's rendered body.
         Ok(Revalidation::Modified { body, validators }) => {
-            let nora_base = nora_base_url(state);
-            let rewritten =
-                rewrite_tarball_urls(&body, &nora_base, proxy_url).unwrap_or_else(|()| {
-                    tracing::warn!(
-                        path = %path,
-                        "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
-                    );
-                    let upstream_trimmed = proxy_url.trim_end_matches('/');
-                    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-                    replace_upstream_bytes(&body, upstream_trimmed, &nora_npm_base)
-                });
+            let rewritten = named::for_storage(state, &body, proxy_url, path);
 
             // Before the cached copy is replaced: it may be the one a ledger starts from.
             if ledger {
@@ -1456,7 +1512,7 @@ async fn serve_metadata(
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
                 Ok(data) if is_assembled_by_nora(&state.storage, &key, &data).await => match spec {
-                    None => packument_response(headers, data),
+                    None => named::response(state, headers, data, name),
                     Some(spec) => published_version_manifest(state, name, spec).await,
                 },
                 _ => uncached_upstream_metadata(state, headers, path, name).await,
@@ -1481,7 +1537,7 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return packument_response(headers, data);
+            return named::response(state, headers, data, name);
         }
     }
     // LOCK-SAFE: tokio mutex, the one publish holds while it writes this package; a CI fleet
@@ -1498,7 +1554,7 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return packument_response(headers, data);
+            return named::response(state, headers, data, name);
         }
     }
     match assemble_packument(&state.storage, name).await.ok_or(()) {
@@ -1523,7 +1579,7 @@ async fn published_packument_response(
                 tracing::warn!(registry = "npm", package = %name, error = %e, "rebuilt packument not stored; served anyway");
             }
             state.metrics.record_cache_hit("npm");
-            packument_response(headers, Bytes::from(bytes))
+            named::response(state, headers, Bytes::from(bytes), name)
         }
         Err(()) => {
             tracing::warn!(registry = "npm", package = %name, "published packument cannot be assembled");
@@ -1548,15 +1604,18 @@ async fn published_version_manifest(state: &AppState, name: &str, spec: &str) ->
         .get(&format!("npm/{name}/versions/{version}.json"))
         .await
     {
-        Ok(doc) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            )],
-            doc,
-        )
-            .into_response(),
+        Ok(doc) => match named::render(state, doc, name) {
+            Ok(doc) => (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )],
+                doc,
+            )
+                .into_response(),
+            Err(status) => status.into_response(),
+        },
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1601,9 +1660,11 @@ async fn uncached_upstream_metadata(
     )
     .await
     {
-        Ok(data) => packument_response(
+        Ok(data) => named::response(
+            state,
             headers,
-            Bytes::from(rewrite_for_nora(state, &data, upstream.url, path)),
+            Bytes::from(named::for_storage(state, &data, upstream.url, path)),
+            name,
         ),
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -1652,7 +1713,7 @@ async fn upstream_metadata(
                 name,
             )
         {
-            return packument_response(headers, data);
+            return named::response(state, headers, data, name);
         }
         // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
         let refetch = || async {
@@ -1670,10 +1731,14 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return packument_response(headers, refreshed);
+            return named::response(state, headers, refreshed, name);
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
+            let data = match named::render(state, data, name) {
+                Ok(data) => data,
+                Err(status) => return status.into_response(),
+            };
             let (stale_body, stale_type) = packument_body(headers, data);
             return (
                 StatusCode::OK,
@@ -1718,7 +1783,7 @@ async fn upstream_metadata(
     .await
     {
         Ok(data) => {
-            let rewritten = rewrite_for_nora(state, &data, upstream.url, path);
+            let rewritten = named::for_storage(state, &data, upstream.url, path);
             if packument {
                 record_first_seen(state, cache_key, &rewritten, None).await;
             }
@@ -1738,7 +1803,7 @@ async fn upstream_metadata(
                     tracing::error!(panic = ?panic, "npm metadata cache task panicked");
                 }
             }));
-            packument_response(headers, Bytes::from(rewritten))
+            named::response(state, headers, Bytes::from(rewritten), name)
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -1766,12 +1831,14 @@ fn is_valid_attachment_name(name: &str) -> bool {
 }
 
 async fn handle_publish(
-    State(state): State<AppState>,
+    State(mut state): State<AppState>,
+    Extension(mount): Extension<named::Mount>,
     Path(path): Path<String>,
     Extension(authority): Extension<NamespaceAuthority>,
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
+    named::bind(&mut state, mount);
     let package_name = path;
 
     // Enforce OIDC namespace_scope on the package coordinate (#583).
@@ -1965,13 +2032,17 @@ async fn handle_publish(
     for (ver, ver_data) in new_versions {
         let mut vd = ver_data.clone();
         if let Some(dist) = vd.get_mut("dist") {
-            let tarball_url = format!(
-                "{}/npm/{}/-/{}-{}.tgz",
-                nora_base.trim_end_matches('/'),
-                package_name,
-                short_name,
-                ver
-            );
+            let tarball_url = if state.repository.is_some() {
+                format!("{package_name}/-/{short_name}-{ver}.tgz")
+            } else {
+                format!(
+                    "{}/npm/{}/-/{}-{}.tgz",
+                    nora_base.trim_end_matches('/'),
+                    package_name,
+                    short_name,
+                    ver
+                )
+            };
             dist["tarball"] = serde_json::Value::String(tarball_url);
         }
         let version_key = format!("npm/{}/versions/{}.json", package_name, ver);
@@ -2373,19 +2444,8 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     )
     .await
     {
-        // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
-        // refetch_metadata do, so a subsequent client reading the cached
-        // packument is not sent back to the upstream.
-        let nora_base = nora_base_url(state);
-        let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
-            tracing::warn!(
-                package = %package_name,
-                "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
-            );
-            let upstream_trimmed = proxy_url.trim_end_matches('/');
-            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-            replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
-        });
+        // Named caches keep source URLs; legacy caches still contain their public rewrite.
+        let rewritten = named::for_storage(state, &data, proxy_url, package_name);
         let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
     }
 }
@@ -2548,6 +2608,9 @@ fn with_content_type(
         data,
     )
 }
+
+#[cfg(test)]
+mod repositories_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -2899,9 +2962,11 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
+    use super::named;
     use crate::test_helpers::{
         body_bytes, create_test_context, create_test_context_with_auth, send, send_with_headers,
     };
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_npm_namespace_scope_enforced() {
@@ -2922,6 +2987,7 @@ mod integration_tests {
         // Out of scope -> 403, decided before any payload parsing.
         let resp = super::handle_publish(
             State(ctx.state.clone()),
+            Extension(named::Mount(Arc::from("/npm/"))),
             Path("@other/pkg".to_string()),
             Extension(scoped.clone()),
             None,
@@ -2933,6 +2999,7 @@ mod integration_tests {
         // In scope -> enforcement passes (then fails payload validation, not 403).
         let resp = super::handle_publish(
             State(ctx.state.clone()),
+            Extension(named::Mount(Arc::from("/npm/"))),
             Path("@myorg/pkg".to_string()),
             Extension(scoped),
             None,
@@ -3242,6 +3309,7 @@ mod integration_tests {
 
         let resp = super::handle_publish(
             State(ctx.state.clone()),
+            Extension(named::Mount(Arc::from("/npm/"))),
             Path("@scope/mypkg".to_string()),
             Extension(NamespaceAuthority::Unrestricted),
             None,

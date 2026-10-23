@@ -165,7 +165,7 @@ impl RepositoryCatalogue {
         path: &str,
         enabled: &std::collections::HashSet<crate::registry_type::RegistryType>,
     ) -> Option<crate::registry_type::RegistryType> {
-        self.pypi_members(enabled)
+        self.mounted_members(enabled)
             .find(|member| {
                 member
                     .definition
@@ -176,25 +176,45 @@ impl RepositoryCatalogue {
             .map(|member| member.registry_type())
     }
 
-    fn pypi_members<'a>(
+    fn mounted_members<'a>(
         &'a self,
         enabled: &'a std::collections::HashSet<crate::registry_type::RegistryType>,
     ) -> impl Iterator<Item = &'a Arc<Repository>> + 'a {
-        self.members().filter(move |member| {
-            enabled.contains(&crate::registry_type::RegistryType::PyPI)
-                && member.definition.format() == RepositoryFormat::Pypi
-        })
+        self.members()
+            .filter(move |member| enabled.contains(&member.registry_type()))
     }
 
-    pub(crate) fn pypi_routes(&self, root: &AppState) -> axum::Router<AppState> {
+    pub(crate) fn is_npm_audit(
+        &self,
+        path: &str,
+        enabled: &std::collections::HashSet<crate::registry_type::RegistryType>,
+    ) -> bool {
+        self.mounted_members(enabled)
+            .filter(|member| member.definition.format() == RepositoryFormat::Npm)
+            .any(|member| {
+                member.definition.paths().iter().any(|prefix| {
+                    path.strip_prefix(prefix).is_some_and(|path| {
+                        matches!(
+                            path,
+                            "-/npm/v1/security/advisories/bulk"
+                                | "-/npm/v1/security/audits/quick"
+                                | "-/npm/v1/security/audits"
+                        )
+                    })
+                })
+            })
+    }
+
+    pub(crate) fn routes(&self, root: &AppState) -> axum::Router<AppState> {
         let mut routes = axum::Router::new();
-        for member in self.pypi_members(&root.enabled_registries) {
+        for member in self.mounted_members(&root.enabled_registries) {
             let mut aliases = axum::Router::new();
             for prefix in member.definition.paths() {
-                aliases = aliases.merge(crate::registry::pypi_routes_at(
-                    prefix,
-                    matches!(member.definition, RepositoryConfig::Local(_)),
-                ));
+                let publish = matches!(member.definition, RepositoryConfig::Local(_));
+                aliases = aliases.merge(match member.definition.format() {
+                    RepositoryFormat::Pypi => crate::registry::pypi_routes_at(prefix, publish),
+                    RepositoryFormat::Npm => crate::registry::npm::routes_at(prefix, publish),
+                });
             }
             routes = routes.merge(aliases.with_state(member.state(root)));
         }

@@ -377,6 +377,7 @@ pub struct ReloadableConfig {
 pub struct AppState {
     pub(crate) repositories: Arc<repositories::RepositoryCatalogue>,
     pub(crate) repository: Option<Arc<repositories::Repository>>,
+    pub(crate) repository_mount: Option<Arc<str>>,
     pub storage: Storage,
     pub config: Arc<Config>,
     pub enabled_registries: Arc<HashSet<RegistryType>>,
@@ -2406,6 +2407,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let state = AppState {
         repositories,
         repository: None,
+        repository_mount: None,
         storage,
         config: Arc::new(config),
         enabled_registries,
@@ -2437,7 +2439,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     };
 
     let registry_routes = registry_routes(&state.enabled_registries, &state.config)
-        .merge(state.repositories.pypi_routes(&state));
+        .merge(state.repositories.routes(&state));
     let app_routes = if rate_limit_enabled {
         let (routes, enforced) = rate_limited_routes(
             auth::token_routes(),
@@ -3019,20 +3021,23 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
 /// reaches every route a client does (the NuGet aliases included).
 fn registry_routes(enabled: &HashSet<RegistryType>, config: &Config) -> Router<AppState> {
     let replaced = |mount: &str| {
-        enabled.contains(&RegistryType::PyPI)
-            && config
-                .repositories
-                .values()
-                .filter(|repository| {
-                    repository.format() == config::repositories::RepositoryFormat::Pypi
-                        && !matches!(repository, config::repositories::RepositoryConfig::Group(_))
-                })
-                .any(|repository| {
-                    repository
-                        .paths()
-                        .iter()
-                        .any(|prefix| prefix.starts_with(mount) || mount.starts_with(prefix))
-                })
+        config
+            .repositories
+            .values()
+            .filter(|repository| {
+                let format = match repository.format() {
+                    config::repositories::RepositoryFormat::Npm => RegistryType::Npm,
+                    config::repositories::RepositoryFormat::Pypi => RegistryType::PyPI,
+                };
+                enabled.contains(&format)
+                    && !matches!(repository, config::repositories::RepositoryConfig::Group(_))
+            })
+            .any(|repository| {
+                repository
+                    .paths()
+                    .iter()
+                    .any(|prefix| prefix.starts_with(mount) || mount.starts_with(prefix))
+            })
     };
     let mut registry_routes = Router::new();
     for reg in enabled {

@@ -385,7 +385,10 @@ pub async fn auth_middleware(
     // package names under a filter, and never forwards the client credential.
     let is_npm_audit = *request.method() == axum::http::Method::POST
         && (path == "/npm/-/npm/v1/security/advisories/bulk"
-            || path == "/npm/-/npm/v1/security/audits/quick");
+            || path == "/npm/-/npm/v1/security/audits/quick"
+            || state
+                .repositories
+                .is_npm_audit(path, &state.enabled_registries));
 
     // A request that presents credentials is always validated below (honest
     // `docker login`, correct audit attribution) — never short-circuited to
@@ -2784,6 +2787,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let state = crate::AppState {
             repositories: ctx.state.repositories.clone(),
             repository: ctx.state.repository.clone(),
+            repository_mount: ctx.state.repository_mount.clone(),
             storage: ctx.state.storage.clone(),
             config: ctx.state.config.clone(),
             enabled_registries: ctx.state.enabled_registries.clone(),
