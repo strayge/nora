@@ -180,6 +180,10 @@ fn apply_base_path(html: &str, base: &str) -> String {
         .replace("'/ui", &format!("'{base}/ui"))
         .replace("\"/api/ui", &format!("\"{base}/api/ui"))
         .replace("'/api/ui", &format!("'{base}/api/ui"))
+        .replace(
+            "\"/api/v1/repositories/",
+            &format!("\"{base}/api/v1/repositories/"),
+        )
         // The API-docs (Swagger UI) entry link in the nav and the root-absolute
         // spec URL the Swagger initializer embeds ("/api-docs/openapi.json").
         .replace("\"/api-docs", &format!("\"{base}/api-docs"))

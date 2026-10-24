@@ -11,6 +11,123 @@ fn configure(config: &mut crate::config::Config, format: &str) {
     config.server.public_url = Some("https://packages.example/base".into());
 }
 
+#[tokio::test]
+async fn local_release_actions_group_files_rewrite_base_paths_and_preserve_empty_retry_targets() {
+    let context =
+        test_helpers::with_named_repositories(test_helpers::create_test_context_with_config(|c| {
+            configure(c, "pypi")
+        }))
+        .await;
+    let storage = &context.state.repositories.get("a").unwrap().storage;
+    for file in ["demo-1.0.zip", "demo-1.0-py3-none-any.whl", "demo-2.0.zip"] {
+        storage
+            .put(&format!("pypi/demo/{file}"), b"archive")
+            .await
+            .unwrap();
+    }
+    let package = json_response(&context.app, "/api/ui/repositories/a/package/demo").await;
+    assert_eq!(package["releases"].as_array().unwrap().len(), 2);
+    assert_eq!(package["releases"][0]["files"], 2);
+    assert_eq!(package["stored_versions"].as_array().unwrap().len(), 3);
+    let response = send(
+        &context.app,
+        Method::GET,
+        "/ui/repositories/a/package/demo?retry_version=0.5",
+        Body::empty(),
+    )
+    .await;
+    let html = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+    assert!(html.contains("action=\"/base/api/v1/repositories/a/packages/demo?version=1.0\""));
+    assert!(html.contains("Retry version deletion"));
+    assert!(html.contains("version=0.5"));
+    assert!(html.contains("window.confirm"));
+    assert!(html.contains("history.replaceState"));
+    assert!(html.contains("Delete package"));
+    let html = String::from_utf8(
+        body_bytes(
+            send(
+                &context.app,
+                Method::GET,
+                "/ui/repositories/a/package/missing?retry_version=1.0",
+                Body::empty(),
+            )
+            .await,
+        )
+        .await
+        .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("No releases are stored"));
+    assert!(html.contains("Retry version deletion"));
+}
+
+#[tokio::test]
+async fn local_mutation_controls_require_a_verified_writer_when_browsing_is_public() {
+    let context = test_helpers::with_named_repositories(
+        test_helpers::create_test_context_with_anonymous_read_and_config(
+            &[("user", "pass")],
+            |c| configure(c, "npm"),
+        ),
+    )
+    .await;
+    for (credentials, allowed) in [(None, false), (Some("Basic dXNlcjpwYXNz"), true)] {
+        let headers = credentials
+            .map(|value| vec![("Authorization", value)])
+            .unwrap_or_default();
+        let response = send_with_headers(
+            &context.app,
+            Method::GET,
+            "/ui/repositories/a/package/@scope%2Fdemo",
+            headers,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+        assert_eq!(html.contains("Delete package"), allowed);
+    }
+    let token = context
+        .state
+        .tokens
+        .as_ref()
+        .unwrap()
+        .create_token("user", 1, None, crate::tokens::Role::Read)
+        .unwrap();
+    let header = format!("Bearer {token}");
+    let html = String::from_utf8(
+        body_bytes(
+            send_with_headers(
+                &context.app,
+                Method::GET,
+                "/ui/repositories/a/package/demo",
+                vec![("Authorization", &header)],
+                Body::empty(),
+            )
+            .await,
+        )
+        .await
+        .to_vec(),
+    )
+    .unwrap();
+    assert!(!html.contains("Delete package"));
+    let html = String::from_utf8(
+        body_bytes(
+            send_with_headers(
+                &context.app,
+                Method::GET,
+                "/ui/repositories/all/package/demo",
+                vec![("Authorization", "Basic dXNlcjpwYXNz")],
+                Body::empty(),
+            )
+            .await,
+        )
+        .await
+        .to_vec(),
+    )
+    .unwrap();
+    assert!(!html.contains("delete-local"));
+}
+
 async fn json_response(app: &Router, path: &str) -> Value {
     let response = send(app, Method::GET, path, Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -133,7 +250,11 @@ async fn pypi_browser_lists_every_supported_distribution_without_merging_group_m
         .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("selected source: a") && html.contains("offline readiness"));
+    assert!(
+        html.contains("selected source:")
+            && html.contains("/base/ui/repositories/a/package/demo")
+            && html.contains("offline readiness")
+    );
     for path in [
         "/api/ui/pypi/list",
         "/api/ui/pypi/legacy",

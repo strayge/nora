@@ -14,7 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt::Write, sync::Arc};
@@ -75,6 +75,24 @@ struct Package {
     commands: Vec<Commands>,
     stored_versions: Vec<StoredVersion>,
     description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    releases: Option<Vec<Release>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    residual_files: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct Release {
+    version: String,
+    files: usize,
+    size: u64,
+}
+
+#[derive(Default, Deserialize)]
+struct PackageQuery {
+    retry_version: Option<String>,
 }
 
 pub(super) fn selection_required() -> Response {
@@ -319,6 +337,34 @@ async fn package_data(
             .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?
     };
     let member = selected(root, &repository.name, &name).await?;
+    let (releases, inventory_error, residual_files) = if repository.kind == "local" {
+        match crate::repository_management::Inventory::read(
+            &member.state(root),
+            member.definition.format(),
+            &name,
+        )
+        .await
+        {
+            Ok(inventory) => {
+                let releases = crate::repository_management::release_files(&inventory)
+                    .into_iter()
+                    .map(|(version, (files, size))| Release {
+                        version,
+                        files,
+                        size,
+                    })
+                    .collect();
+                let residual = inventory.unassigned.len();
+                (Some(releases), None, Some(residual))
+            }
+            Err(error) => {
+                tracing::warn!(%error, repository=%repository.name, "Local inventory unavailable");
+                (None, Some("Inventory could not be read. Counts are unknown; cleanup can still be retried.".into()), None)
+            }
+        }
+    } else {
+        (None, None, None)
+    };
     let detail = if repository.format == "npm" {
         api::get_npm_detail(&member.storage, &name, true, true).await
     } else {
@@ -342,6 +388,9 @@ async fn package_data(
         commands,
         stored_versions,
         description: detail.metadata.description,
+        releases,
+        inventory_error,
+        residual_files,
     })
 }
 
@@ -493,33 +542,188 @@ async fn repository(
     page(&root, &headers, &list.repository.name, &body)
 }
 
+fn delete_form(
+    repository: &str,
+    name: &str,
+    version: Option<&str>,
+    label: &str,
+    summary: &str,
+) -> String {
+    let mut action = format!(
+        "/api/v1/repositories/{}/packages/{}",
+        encode_uri_component(repository),
+        encode_uri_component(name)
+    );
+    if let Some(version) = version {
+        let _ = write!(action, "?version={}", encode_uri_component(version));
+    }
+    let target = version
+        .map(|v| format!("{name}@{v}"))
+        .unwrap_or_else(|| name.to_owned());
+    let confirmation = format!("Permanently delete {target} from {repository}? {summary} All current files for this target will be removed. Re-upload is allowed.");
+    format!(
+        r#"<form method="post" action="{}" class="delete-local" data-version="{}" data-confirm="{}"><button type="submit" class="text-red-400 hover:text-red-300">{}</button></form>"#,
+        components::html_escape(&action),
+        components::html_escape(version.unwrap_or("")),
+        components::html_escape(&confirmation),
+        components::html_escape(label)
+    )
+}
+
+fn render_local_releases(
+    body: &mut String,
+    package: &Package,
+    retry: Option<&str>,
+    can_delete: bool,
+) {
+    body.push_str("<h2 class=\"text-lg font-semibold text-white mt-8 mb-2\">Releases</h2>");
+    let summary = package
+        .releases
+        .as_ref()
+        .map(|releases| {
+            format!(
+                "Displayed inventory: {} releases, {} distribution files.",
+                releases.len(),
+                releases.iter().map(|release| release.files).sum::<usize>()
+            )
+        })
+        .unwrap_or_else(|| "Inventory counts are unknown.".into());
+    if let Some(error) = &package.inventory_error {
+        let _ = write!(
+            body,
+            "<p role=\"alert\" class=\"text-amber-400\">{}</p>",
+            components::html_escape(error)
+        );
+    }
+    if can_delete {
+        body.push_str(&delete_form(
+            &package.repository.name,
+            &package.name,
+            None,
+            "Delete package",
+            &summary,
+        ));
+        if let Some(version) = retry.filter(|v| crate::repository_management::valid_version(v)) {
+            let _ = write!(body, "<p class=\"text-amber-400 mt-4\">A previous deletion may be incomplete. Retry only the selected release.</p>{}", delete_form(&package.repository.name, &package.name, Some(version), "Retry version deletion", "Some files may already be gone."));
+        }
+    }
+    if let Some(count) = package.residual_files.filter(|count| *count > 0) {
+        let _ = write!(body, "<p class=\"text-amber-400 mt-4\">{count} files cannot be assigned to a release. Delete the whole package to remove them.</p>");
+    }
+    body.push_str("<p id=\"delete-error\" role=\"alert\" class=\"text-amber-400 mt-4\" hidden></p><table class=\"w-full text-sm text-left mt-4\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Version</th><th class=\"p-3\">Files</th><th class=\"p-3\">Size</th><th class=\"p-3\">Actions</th></tr></thead><tbody class=\"text-slate-300\">");
+    if let Some(releases) = &package.releases {
+        for release in releases {
+            let action = if can_delete {
+                delete_form(
+                    &package.repository.name,
+                    &package.name,
+                    Some(&release.version),
+                    "Delete version",
+                    &format!("Displayed inventory: {} distribution files.", release.files),
+                )
+            } else {
+                String::new()
+            };
+            let _ = write!(body, "<tr class=\"border-t border-slate-700\"><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{action}</td></tr>", components::html_escape(&release.version), release.files, components::format_size(release.size));
+        }
+        if releases.is_empty() {
+            body.push_str("<tr><td colspan=\"4\" class=\"p-6 text-slate-500\">No releases are stored. Package cleanup can still remove orphan metadata.</td></tr>");
+        }
+    }
+    body.push_str("</tbody></table>");
+    if can_delete {
+        body.push_str(r#"<script>
+document.querySelectorAll('form.delete-local').forEach(function(form) {
+    form.addEventListener('submit', async function(event) {
+        event.preventDefault();
+        if (!window.confirm(form.dataset.confirm)) return;
+        const error = document.getElementById('delete-error');
+        error.hidden = true;
+        const url = new URL(window.location.href);
+        if (form.dataset.version) {
+            url.searchParams.set('retry_version', form.dataset.version);
+            history.replaceState(null, '', url);
+        }
+        const buttons = document.querySelectorAll('form.delete-local button');
+        buttons.forEach(button => button.disabled = true);
+        try {
+            const response = await fetch(form.action, {method: 'DELETE', headers: {'HX-Request': 'true'}});
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.message || 'Deletion did not complete. Some files may already be gone; retry or refresh.');
+            if (result.package_removed) window.location.assign(document.getElementById('repository-back').href);
+            else {
+                url.searchParams.delete('retry_version');
+                window.location.assign(url.href);
+            }
+        } catch (failure) {
+            error.textContent = 'Deletion was not confirmed. Some files may already be gone or cleanup may still be running. ' + failure.message + ' Refresh this page or retry the same action.';
+            error.hidden = false;
+            buttons.forEach(button => button.disabled = false);
+        }
+    });
+});
+</script>"#);
+    }
+}
+
 async fn package(
     State(root): State<AppState>,
     Path((repository, name)): Path<(String, String)>,
+    Query(query): Query<PackageQuery>,
+    role: Option<Extension<crate::auth::AuthenticatedRole>>,
+    authority: Option<Extension<crate::auth::NamespaceAuthority>>,
     headers: HeaderMap,
 ) -> Response {
     let package = match package_data(&root, &repository, &name).await {
         Ok(package) => package,
         Err(response) => return *response,
     };
-    let mut body=format!("<a class=\"text-sky-400 text-sm\" href=\"/ui/repositories/{}\">{}</a><h1 class=\"text-2xl font-bold text-white mt-4 mb-2\">{}</h1><p class=\"text-slate-400 mb-6\">{} repository · selected source: {}</p>",encode_uri_component(&repository),components::html_escape(&repository),components::html_escape(&package.name),package.repository.kind,components::html_escape(&package.source_repository));
-    if let Some(description) = package.description {
+    let mut body=format!("<a id=\"repository-back\" class=\"text-sky-400 text-sm\" href=\"/ui/repositories/{}\">{}</a><h1 class=\"text-2xl font-bold text-white mt-4 mb-2\">{}</h1><p class=\"text-slate-400 mb-6\">{} repository · selected source: {}</p>",encode_uri_component(&repository),components::html_escape(&repository),components::html_escape(&package.name),package.repository.kind,components::html_escape(&package.source_repository));
+    let source_link = format!(
+        "<a class=\"text-sky-400\" href=\"/ui/repositories/{}/package/{}\">{}</a>",
+        encode_uri_component(&package.source_repository),
+        encode_uri_component(&package.name),
+        components::html_escape(&package.source_repository)
+    );
+    body = body.replace(
+        &format!(
+            "selected source: {}",
+            components::html_escape(&package.source_repository)
+        ),
+        &format!("selected source: {source_link}"),
+    );
+    let can_delete = package.repository.kind == "local"
+        && (!root.config.auth.enabled
+            || (role.is_some_and(|Extension(role)| role.0.can_write())
+                && authority.is_some_and(|Extension(authority)| {
+                    crate::auth::enforce_namespace_scope(&authority, &package.name).is_ok()
+                })));
+    if let Some(description) = &package.description {
         let _ = write!(
             body,
             "<p class=\"text-slate-300 mb-6\">{}</p>",
-            components::html_escape(&description)
+            components::html_escape(description)
         );
     }
-    for command in package.commands {
+    for command in &package.commands {
         let _ = write!(
             body,
             "<p class=\"text-sm text-slate-400 mt-4 mb-2\">{}</p>",
             components::html_escape(&command.endpoint)
         );
         body.push_str(&command_block(&command.install));
-        if let Some(publish) = command.publish {
-            body.push_str(&command_block(&publish));
+        if let Some(publish) = &command.publish {
+            body.push_str(&command_block(publish));
         }
+    }
+    if package.repository.kind == "local" {
+        render_local_releases(
+            &mut body,
+            &package,
+            query.retry_version.as_deref(),
+            can_delete,
+        );
+        return page(&root, &headers, &package.name, &body);
     }
     body.push_str("<h2 class=\"text-lg font-semibold text-white mt-8 mb-2\">Stored distribution files</h2><p class=\"text-sm text-slate-400 mb-4\">Stored inventory is not a guarantee of offline readiness. Proxy serving still checks current source, integrity and policy.</p><table class=\"w-full text-sm text-left\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Version</th><th class=\"p-3\">Size</th><th class=\"p-3\">Updated</th></tr></thead><tbody class=\"text-slate-300\">");
     if package.stored_versions.is_empty() {

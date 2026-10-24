@@ -211,7 +211,8 @@ test.describe('Detail page: npm', () => {
   test('copy controls and stored versions are visible', async ({ page }) => {
     await expect(page.getByRole('button', { name: 'Copy command' }).first()).toBeVisible();
     await expect(page.locator('tbody')).toContainText(seed.npm.version);
-    await expect(page.locator('main')).toContainText('not a guarantee of offline readiness');
+    await expect(page.getByRole('heading', { name: 'Releases', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Delete package', exact: true })).toBeVisible();
   });
 });
 
