@@ -12,6 +12,8 @@ pub mod docker;
 pub mod docker_auth;
 pub(crate) mod gems;
 mod go;
+#[cfg(test)]
+mod groups_tests;
 pub(crate) mod hf;
 mod maven;
 pub(crate) mod npm;
@@ -52,6 +54,7 @@ pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub(crate) use pypi::cleanup_proxy_temp_dir as cleanup_pypi_proxy_temp_dir;
+pub(crate) use pypi::group_routes_at as pypi_group_routes_at;
 pub use pypi::routes as pypi_routes;
 pub(crate) use pypi::routes_at as pypi_routes_at;
 pub(crate) use pypi::{

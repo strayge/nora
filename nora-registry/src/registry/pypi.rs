@@ -10,9 +10,11 @@
 //!   POST /simple/                     — twine upload (multipart/form-data)
 
 mod cache;
+mod group;
 mod model;
 mod named;
 mod transfer;
+pub(crate) use group::routes_at as group_routes_at;
 pub(crate) use transfer::Transfer;
 
 pub(crate) fn cleanup_proxy_temp_dir(data: &str) {
@@ -117,8 +119,16 @@ async fn list_packages(
         packages.into_iter().collect()
     };
     pkg_list.sort();
+    package_list_response(&state, &mount, &headers, pkg_list)
+}
 
-    if wants_json(&headers) {
+fn package_list_response(
+    state: &AppState,
+    mount: &PypiMount,
+    headers: &HeaderMap,
+    pkg_list: Vec<String>,
+) -> Response {
+    if wants_json(headers) {
         // PEP 691 JSON response
         let projects: Vec<serde_json::Value> = pkg_list
             .iter()
@@ -142,7 +152,7 @@ async fn list_packages(
         let mut html = String::from(
             "<!DOCTYPE html>\n<html><head><title>Simple Index</title></head><body><h1>Simple Index</h1>\n",
         );
-        let base = html_escape(&index_base_url(&state, &mount));
+        let base = html_escape(&index_base_url(state, mount));
         for pkg in pkg_list {
             let _ = writeln!(
                 html,
@@ -388,6 +398,7 @@ async fn download_file(
     method: Method,
     headers: HeaderMap,
     Path((name, filename)): Path<(String, String)>,
+    prepared: Option<Extension<named::View>>,
 ) -> Response {
     crate::registry::transport::begin_metadata(&mut state);
     let normalized = normalize_name(&name);
@@ -412,6 +423,7 @@ async fn download_file(
         &state,
         &normalized,
         state.config.server.trust_upstream_dates || release_age_applies(&state),
+        prepared.map(|Extension(view)| view),
     )
     .await
     {

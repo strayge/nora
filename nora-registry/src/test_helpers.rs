@@ -539,12 +539,32 @@ const COUNTED_METHODS: [&str; 11] = [
 pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
     failed_write_prefix: parking_lot::RwLock<Option<String>>,
+    failed_read_prefix: parking_lot::RwLock<Option<String>>,
 }
 
 impl OpCounts {
     /// Selective failures leave identity setup and unrelated companion writes intact.
     pub fn fail_writes_to(&self, prefix: Option<&str>) {
         *self.failed_write_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    /// Failed package reads must not masquerade as confirmed absence during selection.
+    pub fn fail_reads_to(&self, prefix: Option<&str>) {
+        *self.failed_read_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    fn check_read(&self, key: &str) -> crate::storage::Result<()> {
+        if self
+            .failed_read_prefix
+            .read()
+            .as_ref()
+            .is_some_and(|prefix| key.starts_with(prefix))
+        {
+            return Err(crate::storage::StorageError::Network(
+                "injected read failure".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn check_write(&self, key: &str) -> crate::storage::Result<()> {
@@ -632,6 +652,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
         self.counts.hit("get");
+        self.counts.check_read(key)?;
         self.inner.get(key).await
     }
 
@@ -647,6 +668,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.counts.hit("list");
+        self.counts.check_read(prefix)?;
         self.inner.list(prefix).await
     }
 
@@ -660,6 +682,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
         self.counts.hit("list_with_meta");
+        self.counts.check_read(prefix)?;
         self.inner.list_with_meta(prefix).await
     }
 

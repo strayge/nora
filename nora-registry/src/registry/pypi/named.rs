@@ -676,6 +676,16 @@ pub(super) async fn project(
         Ok(view) => view,
         Err(error) => return failure(error),
     };
+    project_view(state, name, base, headers, view).await
+}
+
+pub(super) async fn project_view(
+    state: &AppState,
+    name: &str,
+    base: &str,
+    headers: &HeaderMap,
+    view: View,
+) -> Response {
     let Some(project) = &view.snapshot.project else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -723,6 +733,7 @@ pub(super) async fn prepare_download(
     state: &AppState,
     name: &str,
     prefetch: bool,
+    prepared: Option<View>,
 ) -> Result<Option<View>, Box<Response>> {
     if !is_proxy(state) {
         return Ok(None);
@@ -733,6 +744,9 @@ pub(super) async fn prepare_download(
         name,
     ) {
         return Err(Box::new(response));
+    }
+    if let Some(view) = prepared {
+        return Ok(Some(view));
     }
     if !prefetch {
         return Ok(None);

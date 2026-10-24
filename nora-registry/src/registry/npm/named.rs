@@ -8,6 +8,31 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct Mount(pub(super) Arc<str>);
 
+#[derive(Clone)]
+pub(super) struct Package {
+    pub body: Bytes,
+    pub stale: bool,
+}
+
+pub(super) fn package_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    package: Package,
+    name: &str,
+) -> Response {
+    let mut response = response(state, headers, package.body, name);
+    if package.stale && response.status() == StatusCode::OK {
+        response
+            .headers_mut()
+            .insert("x-nora-stale", HeaderValue::from_static("true"));
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=0, must-revalidate"),
+        );
+    }
+    response
+}
+
 pub(super) fn bind(state: &mut AppState, mount: Mount) {
     state.repository_mount = Some(mount.0);
     crate::registry::transport::begin_metadata(state);
@@ -121,39 +146,17 @@ pub(super) async fn artifact_url(
     state: &AppState,
     name: &str,
     version: &str,
+    prepared: Option<&Package>,
 ) -> Result<reqwest::Url, StatusCode> {
     let upstream = state.config.npm.route(name).ok_or(StatusCode::NOT_FOUND)?;
-    let key = upstream_packument_key(name);
-    let cached = if cached_copy_trusted(state, name, &key, name, None).await {
-        match state.storage.get_verified(&key).await {
-            Ok(nora_registry::verified::GateOutcome::Verified(blob)) => {
-                Some(nora_registry::verified::verified_body(blob))
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let data = match cached {
-        Some(data) => data,
+    let data = match prepared {
+        Some(package) => package.body.clone(),
         None => {
-            let url = format!("{}/{}", upstream.url.trim_end_matches('/'), name);
-            let data = proxy_fetch(
-                state,
-                &url,
-                Duration::from_secs(state.config.npm.proxy_timeout),
-                upstream.auth,
-                &state.circuit_breaker,
-                BreakerScope::upstream(RegistryType::Npm, upstream.url),
-            )
-            .await
-            .map_err(|error| match error {
-                ProxyError::NotFound => StatusCode::NOT_FOUND,
-                _ => StatusCode::BAD_GATEWAY,
-            })?;
-            record_first_seen(state, &key, &data, None).await;
-            let _ = put_with_origin(&state.storage, &key, &data, &origin_of(upstream.url)).await;
-            Bytes::from(data)
+            load_upstream_metadata(state, name, name, &upstream_packument_key(name), true)
+                .await
+                .map_err(|response| response.status())?
+                .ok_or(StatusCode::NOT_FOUND)?
+                .body
         }
     };
     let json: serde_json::Value =

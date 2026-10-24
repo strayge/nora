@@ -644,6 +644,10 @@ async fn conditional_refresh_and_offline_metadata_keep_raw_storage_and_current_a
         .iter()
         .any(|request| request.headers.contains_key("if-none-match")));
     upstream.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&upstream)
+        .await;
     let response = send(&context.app, Method::GET, &format!("/alias/{NAME}"), "").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-nora-stale"], "true");

@@ -3,6 +3,8 @@
 
 //! Named runtime state is shared between aliases, never between repository identities.
 
+pub(crate) mod groups;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use crate::{AppState, PublishLocks};
 #[derive(Default)]
 pub(crate) struct RepositoryCatalogue {
     members: BTreeMap<String, Arc<Repository>>,
+    groups: BTreeMap<String, Arc<groups::Group>>,
 }
 
 pub(crate) struct Repository {
@@ -34,6 +37,7 @@ pub(crate) struct Repository {
     index: Arc<RepoIndex>,
     locks: PublishLocks,
     coalesce: InflightMap<Bytes>,
+    pub npm_refreshes: InflightMap<crate::registry::npm::MetadataRefresh>,
     pub pypi_refreshes: InflightMap<tokio::sync::watch::Receiver<crate::registry::PypiRefresh>>,
     pub pypi_transfers: InflightMap<Arc<crate::registry::PypiTransfer>>,
 }
@@ -75,11 +79,12 @@ impl RepositoryCatalogue {
 
     async fn load(config: &Config, root: &Storage, create: bool) -> Result<Self, String> {
         let mut members = BTreeMap::new();
+        let mut groups = BTreeMap::new();
         for (name, definition) in &config.repositories {
             let kind = match definition {
                 RepositoryConfig::Local(_) => "local",
                 RepositoryConfig::Proxy(_) => "proxy",
-                RepositoryConfig::Group(_) => continue,
+                RepositoryConfig::Group(_) => "group",
             };
             let prefix = format!("repositories/{name}");
             let key = format!("{prefix}/.nora-repository.json");
@@ -123,6 +128,16 @@ impl RepositoryCatalogue {
                 }
                 Err(_) => return Err(format!("repository {name}: cannot verify stored identity")),
             }
+            if let RepositoryConfig::Group(definition) = definition {
+                groups.insert(
+                    name.clone(),
+                    Arc::new(groups::Group {
+                        name: name.clone(),
+                        definition: definition.clone(),
+                    }),
+                );
+                continue;
+            }
             let source_id =
                 source_id(definition).map_err(|error| format!("repository {name}: {error}"))?;
             let storage = root
@@ -153,21 +168,25 @@ impl RepositoryCatalogue {
                     index: Arc::new(RepoIndex::new()),
                     locks: Arc::default(),
                     coalesce: InflightMap::new(),
+                    npm_refreshes: InflightMap::new(),
                     pypi_refreshes: InflightMap::new(),
                     pypi_transfers: InflightMap::new(),
                 }),
             );
         }
-        Ok(Self { members })
+        Ok(Self { members, groups })
     }
 
-    #[allow(dead_code)] // Route selection is wired in the next slice.
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<Repository>> {
         self.members.get(name)
     }
 
     pub(crate) fn members(&self) -> impl Iterator<Item = &Arc<Repository>> {
         self.members.values()
+    }
+
+    pub(crate) fn groups(&self) -> impl Iterator<Item = &Arc<groups::Group>> {
+        self.groups.values()
     }
 
     pub(crate) fn registry_for_path(
@@ -184,6 +203,18 @@ impl RepositoryCatalogue {
                     .any(|prefix| path.starts_with(prefix))
             })
             .map(|member| member.registry_type())
+            .or_else(|| {
+                self.groups()
+                    .find(|group| {
+                        enabled.contains(&group.registry_type())
+                            && group
+                                .definition
+                                .paths
+                                .iter()
+                                .any(|prefix| path.starts_with(prefix))
+                    })
+                    .map(|group| group.registry_type())
+            })
     }
 
     fn mounted_members<'a>(
@@ -201,16 +232,23 @@ impl RepositoryCatalogue {
     ) -> bool {
         self.mounted_members(enabled)
             .filter(|member| member.definition.format() == RepositoryFormat::Npm)
-            .any(|member| {
-                member.definition.paths().iter().any(|prefix| {
-                    path.strip_prefix(prefix).is_some_and(|path| {
-                        matches!(
-                            path,
-                            "-/npm/v1/security/advisories/bulk"
-                                | "-/npm/v1/security/audits/quick"
-                                | "-/npm/v1/security/audits"
-                        )
+            .flat_map(|member| member.definition.paths())
+            .chain(
+                self.groups()
+                    .filter(|group| {
+                        group.definition.format == RepositoryFormat::Npm
+                            && enabled.contains(&group.registry_type())
                     })
+                    .flat_map(|group| &group.definition.paths),
+            )
+            .any(|prefix| {
+                path.strip_prefix(prefix).is_some_and(|path| {
+                    matches!(
+                        path,
+                        "-/npm/v1/security/advisories/bulk"
+                            | "-/npm/v1/security/audits/quick"
+                            | "-/npm/v1/security/audits"
+                    )
                 })
             })
     }
@@ -227,6 +265,24 @@ impl RepositoryCatalogue {
                 });
             }
             routes = routes.merge(aliases.with_state(member.state(root)));
+        }
+        for group in self
+            .groups()
+            .filter(|group| root.enabled_registries.contains(&group.registry_type()))
+        {
+            for prefix in &group.definition.paths {
+                routes = routes.merge(
+                    match group.definition.format {
+                        RepositoryFormat::Pypi => {
+                            crate::registry::pypi_group_routes_at(prefix, group.clone())
+                        }
+                        RepositoryFormat::Npm => {
+                            crate::registry::npm::group_routes_at(prefix, group.clone())
+                        }
+                    }
+                    .with_state(root.clone()),
+                );
+            }
         }
         routes.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::CONTENT_SECURITY_POLICY,

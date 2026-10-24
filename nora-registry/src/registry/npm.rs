@@ -1,7 +1,9 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+mod group;
 mod named;
+pub(crate) use group::routes_at as group_routes_at;
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -30,6 +32,24 @@ use base64::Engine;
 use sha2::Digest;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Clone)]
+pub(crate) enum MetadataRefresh {
+    Found(Bytes),
+    Absent,
+    Failed(StatusCode),
+    CircuitOpen(String),
+}
+impl MetadataRefresh {
+    fn into_result(self) -> Result<Option<Bytes>, Box<Response>> {
+        match self {
+            Self::Found(body) => Ok(Some(body)),
+            Self::Absent => Ok(None),
+            Self::Failed(status) => Err(Box::new(status.into_response())),
+            Self::CircuitOpen(key) => Err(Box::new(circuit_open_response(&key))),
+        }
+    }
+}
 
 pub fn routes() -> Router<AppState> {
     routes_at("/npm/", true)
@@ -434,8 +454,10 @@ async fn handle_request(
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
     Extension(user): Extension<AuthenticatedUser>,
+    prepared: Option<Extension<named::Package>>,
 ) -> Response {
     named::bind(&mut state, mount);
+    let prepared = prepared.map(|Extension(package)| package);
     // Handle npm whoami endpoint
     if path == "-/whoami" {
         return handle_whoami(&user).await;
@@ -496,6 +518,16 @@ async fn handle_request(
         };
     }
 
+    if crate::registry::transport::policy(&state).is_some() {
+        if let Some(response) = crate::curation::check_namespace_isolation(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Npm,
+            &package_name,
+        ) {
+            return response;
+        }
+    }
+
     // Extract publish date from cached metadata (npm `time` field). Hoisted to
     // function scope so the digest-quarantine serve gate below can seed first_seen
     // from a trusted upstream release date (#750). Non-tarball requests have no
@@ -508,17 +540,24 @@ async fn handle_request(
         // so the date is readable on this same request) — gated on trust,
         // namespace-safe, best-effort. Mirrors Cargo's `ensure_cargo_metadata_cached`
         // and PyPI's `ensure_pypi_dates_cached`.
-        if state.config.server.trust_upstream_dates {
-            ensure_npm_metadata_cached(&state, &package_name).await;
+        if let Some(package) = prepared
+            .as_ref()
+            .filter(|_| state.config.server.trust_upstream_dates)
+        {
+            npm_publish_date(&package.body, ver)
+        } else {
+            if state.config.server.trust_upstream_dates {
+                ensure_npm_metadata_cached(&state, &package_name).await;
+            }
+            let meta_key = packument_key_for_reading(&state.storage, &package_name).await;
+            extract_npm_publish_date(
+                &state.storage,
+                &meta_key,
+                ver,
+                state.config.server.trust_upstream_dates,
+            )
+            .await
         }
-        let meta_key = packument_key_for_reading(&state.storage, &package_name).await;
-        extract_npm_publish_date(
-            &state.storage,
-            &meta_key,
-            ver,
-            state.config.server.trust_upstream_dates,
-        )
-        .await
     } else {
         None
     };
@@ -733,7 +772,7 @@ async fn handle_request(
                     return StatusCode::NOT_FOUND.into_response();
                 }
             }
-            match named::artifact_url(&state, &package_name, version).await {
+            match named::artifact_url(&state, &package_name, version, prepared.as_ref()).await {
                 Ok(url) => url.to_string(),
                 Err(status) => return status.into_response(),
             }
@@ -1136,7 +1175,7 @@ async fn cached_copy_trusted(
 }
 
 /// Refresh metadata without binding named cache bytes to a public alias.
-/// Returns None if upstream is unavailable (caller serves stale cache).
+/// Confirmed absence stays distinct from an outage through the named refresh flight.
 ///
 /// `key` is the cache written; `seed_key` holds the copy being revalidated (`key`, or what an
 /// older release cached), from which a missing first-seen ledger starts. `ledger` says whether
@@ -1147,15 +1186,18 @@ async fn refetch_metadata(
     key: &str,
     seed_key: &str,
     ledger: bool,
-) -> Option<Vec<u8>> {
-    let upstream = state.config.npm.route(path)?;
+    conditional: bool,
+) -> MetadataRefresh {
+    let Some(upstream) = state.config.npm.route(path) else {
+        return MetadataRefresh::Failed(StatusCode::SERVICE_UNAVAILABLE);
+    };
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
     // Revalidate with a conditional request when enabled and we have stored
     // validators. Empty validators ⇒ no conditional headers ⇒ always a 200,
     // which is also how the first fetch captures validators for next time (#596).
-    let validators = if state.config.npm.revalidate {
+    let validators = if conditional && state.config.npm.revalidate {
         read_validators(&state.storage, key)
             .await
             .unwrap_or_default()
@@ -1179,6 +1221,9 @@ async fn refetch_metadata(
         // Refresh its freshness so we don't revalidate again until the next TTL
         // window. No body was downloaded.
         Ok(Revalidation::NotModified) => {
+            if state.repository.is_some() && !had_validators {
+                return MetadataRefresh::Failed(StatusCode::BAD_GATEWAY);
+            }
             match state.storage.get(key).await {
                 Ok(cached) => {
                     crate::metrics::PROXY_UPSTREAM_304_TOTAL
@@ -1197,10 +1242,15 @@ async fn refetch_metadata(
                     let key_clone = key.to_string();
                     let body = cached.clone();
                     let origin = origin_of(proxy_url);
-                    tokio::spawn(async move {
+                    let write = async move {
                         let _ = put_with_origin(&storage, &key_clone, &body, &origin).await;
-                    });
-                    Some(cached.to_vec())
+                    };
+                    if state.repository.is_some() {
+                        write.await;
+                    } else {
+                        tokio::spawn(write);
+                    }
+                    MetadataRefresh::Found(cached)
                 }
                 Err(_) => {
                     // Body gone (GC, retention, corruption). Delete the stale
@@ -1212,7 +1262,7 @@ async fn refetch_metadata(
                         key = %key,
                         "304 but cached body missing; cleared validators for full refetch"
                     );
-                    None
+                    MetadataRefresh::Failed(StatusCode::BAD_GATEWAY)
                 }
             }
         }
@@ -1224,32 +1274,92 @@ async fn refetch_metadata(
             if ledger {
                 record_first_seen(state, key, &rewritten, Some(seed_key)).await;
             }
+            if state.repository.is_some() {
+                if let Err(error) = state.storage.delete(&validators_key(key)).await {
+                    if !matches!(error, crate::storage::StorageError::NotFound) {
+                        tracing::warn!(key, "npm metadata not cached because old validators could not be invalidated");
+                        return MetadataRefresh::Found(Bytes::from(rewritten));
+                    }
+                }
+            }
             let storage = state.storage.clone();
             let key_clone = key.to_string();
             let cache_data = rewritten.clone();
             let origin = origin_of(proxy_url);
-            tokio::spawn(async move {
-                // Body first; the validator sidecar must never advertise
-                // freshness for a body that isn't there (#596).
+            let write = async move {
+                // Body and provenance precede the validators that describe them.
                 if let Err(e) = put_with_origin(&storage, &key_clone, &cache_data, &origin).await {
                     tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
                     return;
                 }
                 write_validators(&storage, &key_clone, &validators).await;
-            });
-
-            Some(rewritten)
+            };
+            if state.repository.is_some() {
+                write.await;
+            } else {
+                tokio::spawn(write);
+            }
+            MetadataRefresh::Found(Bytes::from(rewritten))
         }
-        // Upstream unavailable / error — fall back to the caller's serve_stale /
-        // 502 path exactly as before.
-        Err(_) => {
+        Err(ProxyError::NotFound) => {
+            if state.repository.is_some() {
+                for key in [key, seed_key] {
+                    for companion in [origin_key(key), validators_key(key)] {
+                        if let Err(error) = state.storage.delete(&companion).await {
+                            if !matches!(error, crate::storage::StorageError::NotFound) {
+                                return MetadataRefresh::Failed(StatusCode::SERVICE_UNAVAILABLE);
+                            }
+                        }
+                    }
+                }
+            }
+            MetadataRefresh::Absent
+        }
+        Err(error) => {
             if had_validators {
                 crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
                     .with_label_values(&["npm"])
                     .inc();
             }
-            None
+            match error {
+                ProxyError::CircuitOpen(key) => MetadataRefresh::CircuitOpen(key),
+                _ => MetadataRefresh::Failed(StatusCode::BAD_GATEWAY),
+            }
         }
+    }
+}
+
+async fn named_refresh(
+    state: &AppState,
+    path: &str,
+    key: &str,
+    seed: &str,
+    ledger: bool,
+    conditional: bool,
+) -> MetadataRefresh {
+    let Some(repository) = &state.repository else {
+        return MetadataRefresh::Failed(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let fetch =
+        || async { Some(refetch_metadata(state, path, key, seed, ledger, conditional).await) };
+    if state.config.server.proxy_coalesce {
+        repository
+            .npm_refreshes
+            .coalesced(
+                key,
+                "npm",
+                crate::registry::transport::metadata_wait_budget(
+                    state,
+                    state.config.npm.proxy_timeout,
+                ),
+                fetch,
+            )
+            .await
+            .unwrap_or(MetadataRefresh::Failed(StatusCode::BAD_GATEWAY))
+    } else {
+        fetch()
+            .await
+            .unwrap_or(MetadataRefresh::Failed(StatusCode::BAD_GATEWAY))
     }
 }
 
@@ -1562,12 +1672,23 @@ async fn published_packument_response(
     name: &str,
     published: &std::collections::BTreeSet<String>,
 ) -> Response {
+    match load_published_packument(state, name, published).await {
+        Ok(data) => named::response(state, headers, data, name),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn load_published_packument(
+    state: &AppState,
+    name: &str,
+    published: &std::collections::BTreeSet<String>,
+) -> Result<Bytes, StatusCode> {
     let key = published_packument_key(name);
     let current = |data: &Bytes| listed_versions(data).as_ref() == Some(published);
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return named::response(state, headers, data, name);
+            return Ok(data);
         }
     }
     // LOCK-SAFE: tokio mutex, the one publish holds while it writes this package; a CI fleet
@@ -1584,7 +1705,7 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return named::response(state, headers, data, name);
+            return Ok(data);
         }
     }
     match assemble_packument(&state.storage, name).await.ok_or(()) {
@@ -1600,7 +1721,7 @@ async fn published_packument_response(
                 versions = ?unreadable,
                 "published versions cannot be read; packument not served"
             );
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            Err(StatusCode::SERVICE_UNAVAILABLE)
         }
         Ok(bytes) => {
             PACKUMENT_REBUILT_TOTAL.with_label_values(&["npm"]).inc();
@@ -1609,11 +1730,11 @@ async fn published_packument_response(
                 tracing::warn!(registry = "npm", package = %name, error = %e, "rebuilt packument not stored; served anyway");
             }
             state.metrics.record_cache_hit("npm");
-            named::response(state, headers, Bytes::from(bytes), name)
+            Ok(Bytes::from(bytes))
         }
         Err(()) => {
             tracing::warn!(registry = "npm", package = %name, "published packument cannot be assembled");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            Err(StatusCode::SERVICE_UNAVAILABLE)
         }
     }
 }
@@ -1714,6 +1835,20 @@ async fn upstream_metadata(
     cache_key: &str,
     packument: bool,
 ) -> Response {
+    match load_upstream_metadata(state, path, name, cache_key, packument).await {
+        Ok(Some(package)) => named::package_response(state, headers, package, name),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(response) => *response,
+    }
+}
+
+async fn load_upstream_metadata(
+    state: &AppState,
+    path: &str,
+    name: &str,
+    cache_key: &str,
+    packument: bool,
+) -> Result<Option<named::Package>, Box<Response>> {
     let legacy_key = legacy_cache_key(path);
     let mut cached = None;
     for key in [cache_key, legacy_key.as_str()] {
@@ -1743,13 +1878,40 @@ async fn upstream_metadata(
                 name,
             )
         {
-            return named::response(state, headers, data, name);
+            return Ok(Some(named::Package {
+                body: data,
+                stale: false,
+            }));
         }
-        // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
-        let refetch = || async {
-            refetch_metadata(state, path, cache_key, &from_key, packument)
+        if crate::registry::transport::policy(state).is_some() {
+            return match named_refresh(state, path, cache_key, &from_key, packument, true)
                 .await
-                .map(Bytes::from)
+                .into_result()
+            {
+                Ok(Some(body)) => Ok(Some(named::Package { body, stale: false })),
+                Ok(None) => Ok(None),
+                Err(response) => {
+                    if state.config.npm.serve_stale
+                        && cached_copy_trusted(state, path, &from_key, name, None).await
+                    {
+                        if let Ok(nora_registry::verified::GateOutcome::Verified(blob)) =
+                            state.storage.get_verified(&from_key).await
+                        {
+                            return Ok(Some(named::Package {
+                                body: nora_registry::verified::verified_body(blob),
+                                stale: true,
+                            }));
+                        }
+                    }
+                    Err(response)
+                }
+            };
+        }
+        let refetch = || async {
+            match refetch_metadata(state, path, cache_key, &from_key, packument, true).await {
+                MetadataRefresh::Found(body) => Some(body),
+                _ => None,
+            }
         };
         let refreshed = if state.config.server.proxy_coalesce {
             let budget = crate::registry::transport::metadata_wait_budget(
@@ -1764,34 +1926,19 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return named::response(state, headers, refreshed, name);
+            return Ok(Some(named::Package {
+                body: refreshed,
+                stale: false,
+            }));
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
-            let data = match named::render(state, data, name) {
-                Ok(data) => data,
-                Err(status) => return status.into_response(),
-            };
-            let (stale_body, stale_type) = packument_body(headers, data);
-            return (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, HeaderValue::from_static(stale_type)),
-                    (header::VARY, HeaderValue::from_static("Accept")),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static("public, max-age=0, must-revalidate"),
-                    ),
-                    (
-                        axum::http::header::HeaderName::from_static("x-nora-stale"),
-                        HeaderValue::from_static("true"),
-                    ),
-                ],
-                stale_body.to_vec(),
-            )
-                .into_response();
+            return Ok(Some(named::Package {
+                body: data,
+                stale: true,
+            }));
         }
-        return StatusCode::BAD_GATEWAY.into_response();
+        return Err(Box::new(StatusCode::BAD_GATEWAY.into_response()));
     }
 
     if let Some(response) = crate::curation::check_namespace_isolation(
@@ -1799,11 +1946,17 @@ async fn upstream_metadata(
         crate::curation::RegistryType::Npm,
         name,
     ) {
-        return response;
+        return Err(Box::new(response));
     }
     let Some(upstream) = state.config.npm.route(path) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return Ok(None);
     };
+    if state.repository.is_some() {
+        return named_refresh(state, path, cache_key, cache_key, packument, false)
+            .await
+            .into_result()
+            .map(|body| body.map(|body| named::Package { body, stale: false }));
+    }
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
         state,
@@ -1836,13 +1989,16 @@ async fn upstream_metadata(
                     tracing::error!(panic = ?panic, "npm metadata cache task panicked");
                 }
             }));
-            named::response(state, headers, Bytes::from(rewritten), name)
+            Ok(Some(named::Package {
+                body: Bytes::from(rewritten),
+                stale: false,
+            }))
         }
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
-        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => Err(Box::new(circuit_open_response(&reg))),
+        Err(ProxyError::NotFound) => Ok(None),
         Err(e) => {
             tracing::warn!(registry = "npm", path = %path, error = ?e, "npm upstream failed, returning 502");
-            StatusCode::BAD_GATEWAY.into_response()
+            Err(Box::new(StatusCode::BAD_GATEWAY.into_response()))
         }
     }
 }
@@ -2465,6 +2621,10 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     let Some(upstream) = state.config.npm.route(package_name) else {
         return;
     };
+    if state.repository.is_some() {
+        let _ = load_upstream_metadata(state, package_name, package_name, &key, true).await;
+        return;
+    }
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
     if let Ok(data) = proxy_fetch(
@@ -2502,9 +2662,12 @@ async fn extract_npm_publish_date(
         return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
     }
     let data = storage.get(metadata_key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let date_str = json.get("time")?.get(version)?.as_str()?;
-    crate::curation::parse_iso8601_to_unix(date_str)
+    npm_publish_date(&data, version)
+}
+
+fn npm_publish_date(data: &[u8], version: &str) -> Option<i64> {
+    let json: serde_json::Value = serde_json::from_slice(data).ok()?;
+    crate::curation::parse_iso8601_to_unix(json.get("time")?.get(version)?.as_str()?)
 }
 
 /// npm's abbreviated packument — `application/vnd.npm.install-v1+json`, the
@@ -5142,9 +5305,9 @@ mod spec_conformance_tests {
         // Call refetch_metadata directly — simulates the race where the handler
         // entered the cache-hit path (body was present at get_verified), TTL
         // expired, but GC deleted the body before refetch_metadata re-reads it.
-        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true).await;
+        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true, true).await;
         assert!(
-            result.is_none(),
+            matches!(result, MetadataRefresh::Failed(_)),
             "must return None when body is missing on 304"
         );
 
@@ -8417,8 +8580,8 @@ mod published_and_upstream_keys {
             published_callers.into_iter().collect::<Vec<_>>(),
             [
                 "handle_publish",
+                "load_published_packument",
                 "packument_key_for_reading",
-                "published_packument_response",
                 "published_state",
                 "serve_dist_tags",
                 "serve_metadata",
@@ -8430,8 +8593,8 @@ mod published_and_upstream_keys {
             [
                 "ensure_npm_metadata_cached",
                 "handle_request",
+                "load_upstream_metadata",
                 "packument_key_for_reading",
-                "upstream_metadata",
             ]
         );
     }

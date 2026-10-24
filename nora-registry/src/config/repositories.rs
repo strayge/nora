@@ -110,7 +110,7 @@ struct GroupDefinition {
     owners: BTreeMap<String, String>,
 }
 
-/// Canonical rules are format-neutral so the future shared resolver never case-folds.
+/// Selection consumes canonical coordinates without changing a format's name identity.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledOwners {
     exact: BTreeMap<String, String>,
@@ -119,7 +119,6 @@ pub struct CompiledOwners {
 
 impl CompiledOwners {
     /// Coordinates must already be canonicalized at the format's request boundary.
-    #[allow(dead_code)] // Consumed by the shared resolver after catalogue cutover.
     pub fn owner(&self, coordinate: &str) -> Option<&str> {
         self.exact.get(coordinate).map(String::as_str).or_else(|| {
             self.prefixes
