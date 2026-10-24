@@ -79,6 +79,8 @@ use crate::AppState;
         // Maven
         crate::openapi::maven_artifact_get,
         crate::openapi::maven_artifact_put,
+        // Local repository management
+        crate::openapi::repository_delete,
         // npm
         crate::openapi::npm_package,
         crate::openapi::npm_publish,
@@ -1439,6 +1441,34 @@ pub async fn revoke_token() {}
     )
 )]
 pub async fn admin_reindex() {}
+
+/// Permanently remove a named local package or an exact release's current files.
+///
+/// Write/Admin access and existing namespace scope are required when auth is on.
+/// Auth-disabled servers remain open. Deleted coordinates may be published again.
+/// No native unpublish, proxy deletion or group mutation is provided.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/repositories/{repository}/packages/{name}",
+    tag = "repositories",
+    params(
+        ("repository" = String, Path, description = "Configured local repository identity"),
+        ("name" = String, Path, description = "Canonical package name; encode scoped npm names"),
+        ("version" = Option<String>, Query, description = "Exact displayed release; omit to delete the entire package"),
+        ("HX-Request" = String, Header, description = "Must be true; required browser CSRF header")
+    ),
+    responses(
+        (status = 200, description = "Complete deletion or already absent after orphan cleanup", body = crate::repository_management::DeleteResult),
+        (status = 400, description = "Invalid coordinate or query"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Write role, namespace authority or CSRF header missing"),
+        (status = 404, description = "Unknown repository or disabled format"),
+        (status = 405, description = "Proxy and group repositories cannot be deleted from"),
+        (status = 500, description = "Incomplete deletion; some files may be gone. Retry the same target."),
+        (status = 503, description = "Inventory unavailable or maintenance running; retry later")
+    )
+)]
+pub async fn repository_delete() {}
 
 // ============ Routes ============
 

@@ -59,6 +59,7 @@ mod registry;
 mod registry_type;
 mod repo_index;
 mod repositories;
+mod repository_management;
 mod request_id;
 mod retention;
 mod secrets;
@@ -406,6 +407,7 @@ pub struct AppState {
     pub(crate) repository_mount: Option<Arc<str>>,
     pub(crate) metadata_deadline: Option<tokio::time::Instant>,
     pub(crate) background_tasks: tokio_util::task::TaskTracker,
+    pub(crate) cleanup_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) background_cancel: tokio_util::sync::CancellationToken,
     pub storage: Storage,
     pub config: Arc<Config>,
@@ -2467,6 +2469,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         repository_mount: None,
         metadata_deadline: None,
         background_tasks: tokio_util::task::TaskTracker::new(),
+        cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
         background_cancel: tokio_util::sync::CancellationToken::new(),
         storage,
         config: Arc::new(config),
@@ -2533,7 +2536,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     // The periodic cleanup cycle takes it once per cycle and runs every due
     // pass under it; it also serializes future manual/admin cleanup entry
     // points against that cycle.
-    let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let cleanup_lock = state.cleanup_lock.clone();
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let catalogue = state.repositories.clone();
@@ -2666,6 +2669,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         // (auth::is_admin_path); abuse is bounded by the in-handler reindex
         // debounce rather than the optional HTTP rate limiter.
         .merge(admin::routes())
+        .merge(repository_management::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
         ));

@@ -380,6 +380,7 @@ fn build_context_full(
         repository_mount: None,
         metadata_deadline: None,
         background_tasks: tokio_util::task::TaskTracker::new(),
+        cleanup_lock: Arc::new(tokio::sync::Mutex::new(())),
         background_cancel: tokio_util::sync::CancellationToken::new(),
         storage,
         config: Arc::new(config),
@@ -468,6 +469,7 @@ fn router_for_state(state: &AppState) -> Router {
         .merge(public_routes)
         .merge(app_routes)
         .merge(crate::admin::routes())
+        .merge(crate::repository_management::routes())
         .layer(DefaultBodyLimit::max(
             state.config.server.body_limit_mb * 1024 * 1024,
         ));
@@ -559,6 +561,14 @@ pub struct OpCounts {
     failed_read_prefix: parking_lot::RwLock<Option<String>>,
     failed_delete_prefix: parking_lot::RwLock<Option<String>>,
     failed_stat_prefix: parking_lot::RwLock<Option<String>>,
+    delete_pause: parking_lot::RwLock<Option<DeletePause>>,
+}
+
+#[derive(Clone)]
+struct DeletePause {
+    prefix: String,
+    started: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
 }
 
 impl OpCounts {
@@ -570,6 +580,21 @@ impl OpCounts {
     /// Failed package reads must not masquerade as confirmed absence during selection.
     pub fn fail_reads_to(&self, prefix: Option<&str>) {
         *self.failed_read_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    /// Keep an issued deletion in flight while its request future is dropped.
+    pub fn pause_deletes_to(
+        &self,
+        prefix: &str,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let pause = DeletePause {
+            prefix: prefix.into(),
+            started: Arc::default(),
+            proceed: Arc::default(),
+        };
+        let result = (pause.started.clone(), pause.proceed.clone());
+        *self.delete_pause.write() = Some(pause);
+        result
     }
 
     pub fn fail_deletes_to(&self, prefix: Option<&str>) {
@@ -704,6 +729,11 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
         self.counts.hit("delete");
+        let pause = self.counts.delete_pause.read().clone();
+        if let Some(pause) = pause.filter(|pause| key.starts_with(&pause.prefix)) {
+            pause.started.notify_one();
+            pause.proceed.notified().await;
+        }
         self.counts.check_delete(key)?;
         self.inner.delete(key).await
     }

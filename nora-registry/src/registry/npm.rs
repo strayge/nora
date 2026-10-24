@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+pub(crate) mod deletion;
 mod group;
 mod named;
 pub(crate) use group::routes_at as group_routes_at;

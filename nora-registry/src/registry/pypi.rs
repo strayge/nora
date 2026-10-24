@@ -4,6 +4,7 @@
 //! PyPI Simple HTML/JSON and Core Metadata at explicit repository aliases; only local repositories accept twine uploads.
 
 mod cache;
+pub(crate) mod deletion;
 mod group;
 mod model;
 mod named;
@@ -938,6 +939,9 @@ async fn upload(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // A package sweep must not retire companions of an upload in progress.
+    let package_lock = state.publish_lock(&format!("pypi/{normalized}/"));
+    let _package_guard = package_lock.lock().await;
     // TOCTOU protection: lock per file to prevent concurrent uploads
     let file_key = format!("pypi/{}/{}", normalized, filename);
     // Retention retires all companions under this lock before taking individual file locks.
