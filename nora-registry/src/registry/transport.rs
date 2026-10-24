@@ -205,7 +205,7 @@ fn deadline(seconds: u64) -> Option<tokio::time::Instant> {
     tokio::time::Instant::now().checked_add(Duration::from_secs(seconds))
 }
 
-fn policy(state: &AppState) -> Option<&ProxyRepository> {
+pub(super) fn policy(state: &AppState) -> Option<&ProxyRepository> {
     match &state.repository.as_ref()?.definition {
         crate::config::repositories::RepositoryConfig::Proxy(policy) => Some(policy),
         _ => None,

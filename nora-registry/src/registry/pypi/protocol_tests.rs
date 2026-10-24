@@ -822,6 +822,197 @@ async fn unknown_size_ranges_validate_offsets_and_keep_base_json_metadata_withou
 }
 
 #[tokio::test]
+async fn unsaved_files_and_sidecars_keep_metadata_and_security_records_but_not_offline_candidates()
+{
+    let _lock = crate::test_env::env_lock();
+    let source = source().await;
+    let configure = |config: &mut Config| {
+        policy(config);
+        config.server.trust_upstream_dates = false;
+        let crate::config::repositories::RepositoryConfig::Proxy(proxy) =
+            config.repositories.get_mut("remote").unwrap()
+        else {
+            unreachable!()
+        };
+        proxy.save_files = false;
+        proxy.metadata_ttl = 0;
+        config.curation.pypi.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+        config.curation.pypi.quarantine_ttl = Some("1h".into());
+        config.circuit_breaker.enabled = true;
+        config.circuit_breaker.failure_threshold = 1;
+        config.circuit_breaker.reset_timeout = 3600;
+    };
+    let context = rich_tests::context(&source.uri, None, configure).await;
+    assert_eq!(
+        body_bytes(request(&context, Method::GET, FILE, vec![]).await).await,
+        DATA
+    );
+    assert_eq!(
+        body_bytes(request(&context, Method::GET, &format!("{FILE}.metadata"), vec![]).await).await,
+        METADATA
+    );
+    absent(&context, FILE).await;
+    absent(&context, &format!("{FILE}.metadata")).await;
+    for data in [DATA, METADATA] {
+        assert!(!matches!(
+            context.state.digest_store.check(
+                "pypi",
+                &format!("sha256:{}", hex::encode(sha2::Sha256::digest(data))),
+                3600
+            ),
+            crate::digest_quarantine::QuarantineStatus::New
+        ));
+    }
+    let repository = context.state.repositories.get("remote").unwrap();
+    assert!(named::stored(&repository.state(&context.state), "pkg")
+        .await
+        .unwrap()
+        .unwrap()
+        .project
+        .is_some());
+    source.state.down.store(true, Ordering::Relaxed);
+    let (_, offline) = rich_tests::index(&context, "/alias/").await;
+    assert!(offline["files"].as_array().unwrap().is_empty());
+    assert_eq!(
+        request(&context, Method::GET, FILE, vec![]).await.status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        request(&context, Method::GET, &format!("{FILE}.metadata"), vec![])
+            .await
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(source.calls(FILE, Method::GET), 1);
+    assert_eq!(source.calls(&format!("{FILE}.metadata"), Method::GET), 1);
+}
+
+#[tokio::test]
+async fn mixed_save_policies_and_flag_changes_keep_old_ready_files_and_local_publication() {
+    let _lock = crate::test_env::env_lock();
+    let source = source().await;
+    let configure = |config: &mut Config| {
+        policy(config);
+        config.repositories.extend(
+            toml::from_str::<Config>(&format!(
+                r#"
+[repositories.transient]
+format="pypi"
+kind="proxy"
+paths=["/transient/"]
+upstream="{}/simple"
+save_files=false
+[repositories.local]
+format="pypi"
+kind="local"
+paths=["/local/"]
+"#,
+                source.uri
+            ))
+            .unwrap()
+            .repositories,
+        );
+    };
+    let context = rich_tests::context(&source.uri, None, configure).await;
+    assert_eq!(
+        body_bytes(request(&context, Method::GET, FILE, vec![]).await).await,
+        DATA
+    );
+    assert_eq!(
+        body_bytes(request(&context, Method::GET, &format!("{FILE}.metadata"), vec![]).await).await,
+        METADATA
+    );
+    let response = send_with_headers(
+        &context.app,
+        Method::GET,
+        &format!("/transient/pkg/{FILE}"),
+        vec![],
+        "",
+    )
+    .await;
+    assert_eq!(body_bytes(response).await, DATA);
+    settled(&context).await;
+    let transient = context.state.repositories.get("transient").unwrap();
+    assert!(transient
+        .storage
+        .stat(&format!("pypi/pkg/{FILE}"))
+        .await
+        .is_none());
+    assert!(transient
+        .storage
+        .stat(&super::cache::ready_key("pkg", FILE))
+        .await
+        .is_none());
+    source.state.down.store(true, Ordering::Relaxed);
+    let changed = rich_tests::context(&source.uri, Some(context.state.storage.clone()), |config| {
+        configure(config);
+        let crate::config::repositories::RepositoryConfig::Proxy(proxy) =
+            config.repositories.get_mut("remote").unwrap()
+        else {
+            unreachable!()
+        };
+        proxy.save_files = false;
+    })
+    .await;
+    assert_eq!(
+        body_bytes(request(&changed, Method::GET, FILE, vec![]).await).await,
+        DATA
+    );
+    assert_eq!(
+        body_bytes(request(&changed, Method::GET, &format!("{FILE}.metadata"), vec![]).await).await,
+        METADATA
+    );
+    let content_type = format!(
+        "multipart/form-data; boundary={}",
+        super::local_index_cost_tests::BOUNDARY
+    );
+    let uploaded = send_with_headers(
+        &changed.app,
+        Method::POST,
+        "/local/",
+        vec![("content-type", &content_type)],
+        super::local_index_cost_tests::upload_body("pkg", "1.0", FILE, DATA),
+    )
+    .await;
+    assert_eq!(uploaded.status(), StatusCode::OK);
+    assert_eq!(
+        body_bytes(
+            send_with_headers(
+                &changed.app,
+                Method::GET,
+                &format!("/local/pkg/{FILE}"),
+                vec![],
+                ""
+            )
+            .await
+        )
+        .await,
+        DATA
+    );
+    let head = send_with_headers(
+        &changed.app,
+        Method::HEAD,
+        &format!("/local/pkg/{FILE}"),
+        vec![],
+        "",
+    )
+    .await;
+    assert_eq!(head.headers()[header::CONTENT_LENGTH], "10");
+    assert!(body_bytes(head).await.is_empty());
+    assert!(changed
+        .state
+        .repositories
+        .get("local")
+        .unwrap()
+        .storage
+        .stat(&format!("pypi/pkg/{FILE}"))
+        .await
+        .is_some());
+    assert_eq!(source.calls(FILE, Method::GET), 2);
+    assert_eq!(source.calls(&format!("{FILE}.metadata"), Method::GET), 1);
+}
+
+#[tokio::test]
 async fn known_project_quarantine_blocks_cached_sidecars_head_range_aliases_and_restart() {
     let _lock = crate::test_env::env_lock();
     let source = source().await;

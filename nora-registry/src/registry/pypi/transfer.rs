@@ -1092,7 +1092,7 @@ async fn join(
             match result {
                 Ok(complete) => {
                     verdict.status.send_modify(|status| status.done = Some(Ok(())));
-                    if complete.cacheable && !complete.head.cached {
+                    if complete.cacheable && !complete.head.cached && crate::registry::transport::policy(&worker).is_none_or(|policy| policy.save_files) {
                         let stored = async {
                             let stage = staging(&shared.path).await?;
                             cache::publish(&worker, &name, &file, complete.size, &complete.hashes, &complete.head.validators, &stage.path).await

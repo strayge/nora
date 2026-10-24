@@ -685,13 +685,18 @@ async fn handle_request(
         state
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
+        let digest_origin = state
+            .repository
+            .as_ref()
+            .map(|repository| repository.breaker_key())
+            .unwrap_or_else(|| "cache".into());
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
             "npm",
             &data,
             &q_mode,
             q_secs,
-            "cache",
+            &digest_origin,
             publish_date,
         ) {
             return resp;
@@ -764,15 +769,18 @@ async fn handle_request(
                         return response;
                     }
                 }
-                // Compute and store sha256
-                let hash = hex::encode(sha2::Sha256::digest(&data));
-                let hash_key = format!("{}.sha256", key);
-                let storage = state.storage.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
-                        tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
-                    }
-                });
+                let save_files = crate::registry::transport::policy(&state)
+                    .is_none_or(|policy| policy.save_files);
+                if save_files {
+                    let hash = hex::encode(sha2::Sha256::digest(&data));
+                    let hash_key = format!("{}.sha256", key);
+                    let storage = state.storage.clone();
+                    spawn_artifact_cache_write(&state, async move {
+                        if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
+                            tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
+                        }
+                    });
+                }
 
                 state.metrics.record_download("npm");
                 state.metrics.record_cache_miss("npm");
@@ -786,23 +794,23 @@ async fn handle_request(
                     .audit
                     .log(AuditEntry::new("proxy_fetch", "proxy", "", "npm", ""));
 
-                let data_to_cache = data.clone();
                 let data_to_serve = data;
-                // LOCK-SAFE: a tarball is immutable; no lock is held here.
-                // Cache in background, invalidate index AFTER write completes
-                let storage = state.storage.clone();
-                let key_clone = key.clone();
-                let repo_index = Arc::clone(&state.repo_index);
-                let origin = origin_of(proxy_url);
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        put_with_origin(&storage, &key_clone, &data_to_cache, &origin).await
-                    {
-                        tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
-                    } else {
-                        repo_index.invalidate("npm");
-                    }
-                });
+                if save_files {
+                    let data_to_cache = data_to_serve.clone();
+                    let storage = state.storage.clone();
+                    let key_clone = key.clone();
+                    let repo_index = Arc::clone(&state.repo_index);
+                    let origin = origin_of(proxy_url);
+                    spawn_artifact_cache_write(&state, async move {
+                        if let Err(e) =
+                            put_with_origin(&storage, &key_clone, &data_to_cache, &origin).await
+                        {
+                            tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache artifact");
+                        } else {
+                            repo_index.invalidate("npm");
+                        }
+                    });
+                }
 
                 if is_tarball {
                     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -817,13 +825,18 @@ async fn handle_request(
                             .quarantine_ttl
                             .as_deref()),
                     );
+                    let digest_origin = state
+                        .repository
+                        .as_ref()
+                        .map(|repository| repository.breaker_key())
+                        .unwrap_or_else(|| url.clone());
                     if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
                         &state.digest_store,
                         "npm",
                         &data_to_serve,
                         &q_mode,
                         q_secs,
-                        &url,
+                        &digest_origin,
                         publish_date,
                     ) {
                         return resp;
@@ -844,6 +857,21 @@ async fn handle_request(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// Named artifact jobs share bounded shutdown without changing other worker lifetimes.
+fn spawn_artifact_cache_write(
+    state: &AppState,
+    write: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    if state.repository.is_some() {
+        let cancel = state.background_cancel.clone();
+        state.background_tasks.spawn(async move {
+            tokio::select! { biased; () = cancel.cancelled() => {}, () = write => {} }
+        });
+    } else {
+        tokio::spawn(write);
+    }
 }
 
 /// Internal prefix holding npm cache provenance sidecars (#1055).

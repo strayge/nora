@@ -97,6 +97,252 @@ fn metadata(tarball: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn unsaved_tarballs_keep_packuments_and_security_records_without_artifact_companions() {
+    let _lock = crate::test_env::env_lock();
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{NAME}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata(&format!(
+            "{}/file.tgz?token=private",
+            upstream.uri()
+        ))))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/file.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"unsaved"))
+        .mount(&upstream)
+        .await;
+    let context = with_named_repositories(create_test_context_with_config(|config| {
+        proxy_config(config, &upstream.uri(), 300);
+        config.server.trust_upstream_dates = false;
+        let crate::config::repositories::RepositoryConfig::Proxy(proxy) =
+            config.repositories.get_mut("remote").unwrap()
+        else {
+            unreachable!()
+        };
+        proxy.save_files = false;
+        config.curation.npm.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+        config.curation.npm.quarantine_ttl = Some("1h".into());
+    }))
+    .await;
+    let uri = format!("/alias/{NAME}/-/pkg-1.0.0.tgz");
+    let response = send(&context.app, Method::GET, &uri, "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.as_ref(), b"unsaved");
+    assert!(context.state.background_tasks.is_empty());
+    cached(&context, "remote", &upstream_packument_key(NAME)).await;
+    let repository = context.state.repositories.get("remote").unwrap();
+    let key = format!("npm/{NAME}/tarballs/pkg-1.0.0.tgz");
+    for key in [&key, &format!("{key}.sha256"), &origin_key(&key)] {
+        assert!(repository.storage.stat(key).await.is_none(), "{key}");
+    }
+    assert!(repository.storage.pin(&key).await.is_none());
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"unsaved")));
+    assert!(!matches!(
+        context.state.digest_store.check("npm", &digest, 3600),
+        crate::digest_quarantine::QuarantineStatus::New
+    ));
+    assert_eq!(
+        context
+            .state
+            .digest_store
+            .record("npm", &digest, "not-an-origin", None)
+            .upstream,
+        repository.breaker_key()
+    );
+    upstream.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&upstream)
+        .await;
+    assert!(json(&context, &format!("/packages/{NAME}")).await["versions"][VERSION].is_object());
+    assert_eq!(
+        send(&context.app, Method::GET, &uri, "").await.status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(repository.storage.stat(&key).await.is_none());
+}
+
+#[tokio::test]
+async fn mixed_cache_policies_and_flag_changes_preserve_trusted_files_and_local_publish() {
+    let _lock = crate::test_env::env_lock();
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{NAME}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(metadata(&format!("{}/file.tgz", upstream.uri()))),
+        )
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/file.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"saved"))
+        .mount(&upstream)
+        .await;
+    let configure = |config: &mut Config| {
+        proxy_config(config, &upstream.uri(), 300);
+        config.repositories.extend(
+            toml::from_str::<Config>(&format!(
+                r#"
+[repositories.transient]
+format="npm"
+kind="proxy"
+paths=["/transient/"]
+upstream="{}"
+save_files=false
+[repositories.local]
+format="npm"
+kind="local"
+paths=["/local/"]
+"#,
+                upstream.uri()
+            ))
+            .unwrap()
+            .repositories,
+        );
+    };
+    let context = with_named_repositories(create_test_context_with_config(configure)).await;
+    for prefix in ["/packages/", "/transient/"] {
+        assert_eq!(
+            body_bytes(
+                send(
+                    &context.app,
+                    Method::GET,
+                    &format!("{prefix}{NAME}/-/pkg-1.0.0.tgz"),
+                    ""
+                )
+                .await
+            )
+            .await
+            .as_ref(),
+            b"saved"
+        );
+    }
+    let key = format!("npm/{NAME}/tarballs/pkg-1.0.0.tgz");
+    cached(&context, "remote", &key).await;
+    context.state.background_tasks.close();
+    context.state.background_tasks.wait().await;
+    let transient = context.state.repositories.get("transient").unwrap();
+    for key in [&key, &format!("{key}.sha256"), &origin_key(&key)] {
+        assert!(transient.storage.stat(key).await.is_none());
+    }
+    upstream.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&upstream)
+        .await;
+    let changed = with_named_repositories(create_test_context_with_storage_and_config(
+        context.state.storage.clone(),
+        |config| {
+            configure(config);
+            let crate::config::repositories::RepositoryConfig::Proxy(proxy) =
+                config.repositories.get_mut("remote").unwrap()
+            else {
+                unreachable!()
+            };
+            proxy.save_files = false;
+        },
+    ))
+    .await;
+    assert_eq!(
+        body_bytes(
+            send(
+                &changed.app,
+                Method::GET,
+                &format!("/alias/{NAME}/-/pkg-1.0.0.tgz"),
+                ""
+            )
+            .await
+        )
+        .await
+        .as_ref(),
+        b"saved"
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    publish(&changed, "/local/", b"local").await;
+    assert_eq!(
+        body_bytes(
+            send(
+                &changed.app,
+                Method::GET,
+                &format!("/local/{NAME}/-/pkg-1.0.0.tgz"),
+                ""
+            )
+            .await
+        )
+        .await
+        .as_ref(),
+        b"local"
+    );
+    assert!(changed
+        .state
+        .repositories
+        .get("local")
+        .unwrap()
+        .storage
+        .stat(&key)
+        .await
+        .is_some());
+}
+
+/// The caller can observe queued jobs before a current-thread executor polls their writers.
+#[tokio::test(flavor = "current_thread")]
+async fn named_tarball_cache_jobs_are_tracked_and_force_cancellation_skips_their_writes() {
+    let _lock = crate::test_env::env_lock();
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{NAME}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(metadata(&format!("{}/file.tgz", upstream.uri()))),
+        )
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/file.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tracked"))
+        .mount(&upstream)
+        .await;
+    for cancelled in [false, true] {
+        let context = with_named_repositories(create_test_context_with_config(|config| {
+            proxy_config(config, &upstream.uri(), 300)
+        }))
+        .await;
+        if cancelled {
+            context.state.background_cancel.cancel();
+        }
+        let response = send(
+            &context.app,
+            Method::GET,
+            &format!("/alias/{NAME}/-/pkg-1.0.0.tgz"),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!context.state.background_tasks.is_empty());
+        assert_eq!(body_bytes(response).await.as_ref(), b"tracked");
+        context.state.background_tasks.close();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            context.state.background_tasks.wait(),
+        )
+        .await
+        .unwrap();
+        let repository = context.state.repositories.get("remote").unwrap();
+        let key = format!("npm/{NAME}/tarballs/pkg-1.0.0.tgz");
+        for key in [&key, &format!("{key}.sha256"), &origin_key(&key)] {
+            assert_eq!(
+                repository.storage.stat(key).await.is_some(),
+                !cancelled,
+                "{key}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_aliases_are_request_local_and_publication_records_are_neutral() {
     let _lock = crate::test_env::env_lock();
     let context = with_named_repositories(create_test_context_with_config(local_config)).await;
