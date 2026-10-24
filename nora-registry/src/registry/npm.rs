@@ -4,6 +4,7 @@
 pub(crate) mod deletion;
 mod group;
 mod named;
+pub(crate) mod saved;
 pub(crate) use group::routes_at as group_routes_at;
 
 use crate::activity_log::{ActionType, ActivityEntry};

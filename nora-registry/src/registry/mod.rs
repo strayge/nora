@@ -23,6 +23,7 @@ pub(crate) mod pypi;
 pub(crate) mod range;
 pub(crate) mod raw;
 pub(crate) mod rpm;
+pub(crate) mod saved;
 mod spool;
 pub(crate) mod terraform;
 pub(crate) mod transport;
