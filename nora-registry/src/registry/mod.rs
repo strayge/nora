@@ -403,7 +403,9 @@ where
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
                     cb.record_alive(&cb_key, probe);
-                    return Err(ProxyError::NotFound);
+                    return Err(if matches!(client, ProxyClient::Named { .. }) && !matches!(status, 404 | 410) {
+                        ProxyError::Upstream(status)
+                    } else { ProxyError::NotFound });
                 }
                 if attempt == 0 {
                     UPSTREAM_REQUEST_DURATION
@@ -927,14 +929,11 @@ impl Validators {
 }
 
 /// Outcome of a conditional upstream request.
-pub(crate) enum Revalidation {
+pub(crate) enum Revalidation<T = Vec<u8>> {
     /// Upstream answered `304 Not Modified` — the cached body is still valid.
     NotModified,
     /// Upstream answered `200` with a (possibly) new body and fresh validators.
-    Modified {
-        body: Vec<u8>,
-        validators: Validators,
-    },
+    Modified { body: T, validators: Validators },
 }
 
 /// Storage key of the validator sidecar for a cached object.
@@ -1010,6 +1009,42 @@ async fn proxy_fetch_conditional_client(
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
+    proxy_fetch_conditional_extract(
+        client,
+        url,
+        timeout,
+        auth,
+        validators,
+        None,
+        |response| async {
+            response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| ProxyError::Network(error.to_string()))
+        },
+        cb,
+        scope,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_fetch_conditional_extract<T, F, Fut>(
+    client: ProxyClient<'_>,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    validators: &Validators,
+    extra_headers: Option<(&str, &str)>,
+    extract: F,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Revalidation<T>, ProxyError>
+where
+    F: FnOnce(reqwest::Response) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+{
     let auth_header = upstream_auth_header(auth)?;
     let cb_key = client.breaker_key(scope.into());
     let probe = cb.check(&cb_key)?;
@@ -1026,6 +1061,9 @@ async fn proxy_fetch_conditional_client(
             if let Some(ref lm) = validators.last_modified {
                 request = request.header(header::IF_MODIFIED_SINCE, lm);
             }
+            if let Some((key, value)) = extra_headers {
+                request = request.header(key, value);
+            }
 
             match client.send(request).await {
                 Ok(response) => {
@@ -1039,21 +1077,17 @@ async fn proxy_fetch_conditional_client(
                             etag: header_string(&response, header::ETAG),
                             last_modified: header_string(&response, header::LAST_MODIFIED),
                         };
-                        return match response.bytes().await {
+                        return match extract(response).await {
                             Ok(body) => {
                                 cb.record_success(&cb_key, probe);
                                 Ok(Revalidation::Modified {
-                                    body: body.to_vec(),
+                                    body,
                                     validators: new_validators,
                                 })
                             }
-                            Err(e) => {
-                                // 2xx but the body could not be read (e.g. a mid-stream
-                                // drop) — a fetch failure for the breaker, as in
-                                // proxy_fetch_core; unreported, a half-open probe would
-                                // hold its slot until the #585 stall recovery.
+                            Err(error) => {
                                 cb.record_failure(&cb_key, probe);
-                                Err(ProxyError::Network(e.to_string()))
+                                Err(error)
                             }
                         };
                     }
@@ -1062,7 +1096,15 @@ async fn proxy_fetch_conditional_client(
                         // 4xx — upstream alive; recover the breaker without clearing a
                         // real failure tally, consistent with proxy_fetch_core (#606).
                         cb.record_alive(&cb_key, probe);
-                        return Err(ProxyError::NotFound);
+                        return Err(
+                            if matches!(client, ProxyClient::Named { .. })
+                                && !matches!(code, 404 | 410)
+                            {
+                                ProxyError::Upstream(code)
+                            } else {
+                                ProxyError::NotFound
+                            },
+                        );
                     }
                     cb.record_failure(&cb_key, probe);
                     Err(ProxyError::Upstream(code))

@@ -536,9 +536,29 @@ const COUNTED_METHODS: [&str; 11] = [
 #[derive(Default)]
 pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
+    failed_write_prefix: parking_lot::RwLock<Option<String>>,
 }
 
 impl OpCounts {
+    /// Selective failures leave identity setup and unrelated companion writes intact.
+    pub fn fail_writes_to(&self, prefix: Option<&str>) {
+        *self.failed_write_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    fn check_write(&self, key: &str) -> crate::storage::Result<()> {
+        if self
+            .failed_write_prefix
+            .read()
+            .as_ref()
+            .is_some_and(|prefix| key.starts_with(prefix))
+        {
+            return Err(crate::storage::StorageError::Network(
+                "injected write failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn hit(&self, method: &'static str) {
         let slot = COUNTED_METHODS
             .iter()
@@ -604,6 +624,7 @@ pub fn op_counting_storage() -> (Storage, Arc<OpCounts>) {
 impl crate::storage::StorageBackend for OpCountingBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.counts.hit("put");
+        self.counts.check_write(key)?;
         self.inner.put(key, data, sha256).await
     }
 
@@ -663,11 +684,13 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         sha256: Option<&str>,
     ) -> crate::storage::Result<()> {
         self.counts.hit("put_from_path");
+        self.counts.check_write(key)?;
         self.inner.put_from_path(key, src, sha256).await
     }
 
     async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
         self.counts.hit("copy");
+        self.counts.check_write(dst)?;
         self.inner.copy(src, dst, sha256).await
     }
 

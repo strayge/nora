@@ -9,6 +9,9 @@
 //!   GET  /simple/{name}/{filename}    — download file
 //!   POST /simple/                     — twine upload (multipart/form-data)
 
+mod model;
+mod named;
+
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
@@ -161,11 +164,16 @@ async fn package_versions(
 ) -> Response {
     crate::registry::transport::begin_metadata(&mut state);
     let normalized = normalize_name(&name);
-    if !crate::validation::is_one_segment(&normalized) {
+    if !crate::validation::is_one_segment(&normalized)
+        || (state.repository.is_some() && !model::valid_name(&normalized))
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let prefix = format!("pypi/{}/", normalized);
     let base_url = index_base_url(&state, &mount);
+    if named::is_proxy(&state) {
+        return named::project(&state, &normalized, &base_url, &headers).await;
+    }
 
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
@@ -366,7 +374,9 @@ async fn download_file(
 ) -> Response {
     crate::registry::transport::begin_metadata(&mut state);
     let normalized = normalize_name(&name);
-    if !crate::validation::is_one_segment(&normalized) {
+    if !crate::validation::is_one_segment(&normalized)
+        || (state.repository.is_some() && !model::valid_name(&normalized))
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -380,6 +390,17 @@ async fn download_file(
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
 
     let key = format!("pypi/{}/{}", normalized, filename);
+    let named_snapshot = match named::prepare_download(
+        &state,
+        &normalized,
+        &key,
+        state.config.server.trust_upstream_dates || release_age_applies(&state),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(response) => return *response,
+    };
 
     // The release date of this file, for min-release-age and to seed the digest-quarantine
     // first-seen clock so a provably-old release is not held as "new to this mirror"
@@ -535,33 +556,56 @@ async fn download_file(
     for up in &state.config.pypi.upstreams() {
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
-        let html = match proxy_fetch_text(
-            &state,
-            &page_url,
-            Duration::from_secs(state.config.pypi.proxy_timeout),
-            up.auth().map(UpstreamAuth::Basic),
-            Some(("Accept", "text/html")),
-            &state.circuit_breaker,
-            BreakerScope::upstream(RegistryType::PyPI, up.url()),
-        )
-        .await
-        {
-            Ok(html) => html,
-            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
-                circuit_open = true;
-                continue;
+        let file_url = if named::is_proxy(&state) {
+            let fetched;
+            let snapshot = if let Some(snapshot) = &named_snapshot {
+                snapshot
+            } else {
+                fetched = match named::fetch(&state, &normalized).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return named::failure(error),
+                };
+                &fetched
+            };
+            if named::quarantined(snapshot) {
+                return StatusCode::FORBIDDEN.into_response();
             }
-            Err(e) => {
-                tracing::debug!(error = ?e, package = %normalized, upstream = %up.url(), "PyPI page proxy fetch failed, trying next upstream");
-                miss.record(&e);
+            let Some(file) = snapshot
+                .project
+                .files
+                .iter()
+                .find(|file| file.filename == filename)
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            file.url.clone()
+        } else {
+            let html = match proxy_fetch_text(
+                &state,
+                &page_url,
+                Duration::from_secs(state.config.pypi.proxy_timeout),
+                up.auth().map(UpstreamAuth::Basic),
+                Some(("Accept", "text/html")),
+                &state.circuit_breaker,
+                BreakerScope::upstream(RegistryType::PyPI, up.url()),
+            )
+            .await
+            {
+                Ok(html) => html,
+                Err(crate::registry::ProxyError::CircuitOpen(_)) => {
+                    circuit_open = true;
+                    continue;
+                }
+                Err(error) => {
+                    miss.record(&error);
+                    continue;
+                }
+            };
+            let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+                miss.answered();
                 continue;
-            }
-        };
-
-        // The file may live on a later upstream — keep walking the list.
-        let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
-            miss.answered();
-            continue;
+            };
+            file_url
         };
 
         // The upstream's credential goes to the upstream's own origin only: an index may name its
@@ -758,6 +802,9 @@ async fn upload(
 
     // Normalize name and store
     let normalized = normalize_name(&name);
+    if state.repository.is_some() && !model::valid_name(&normalized) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     // Enforce OIDC namespace_scope on the project coordinate (#583).
     if enforce_namespace_scope(&authority, &normalized).is_err() {
@@ -1024,6 +1071,13 @@ async fn pypi_publish_date(
     artifact_key: &str,
 ) -> Option<i64> {
     let trust = state.config.server.trust_upstream_dates;
+    if named::is_proxy(state) {
+        return if trust || release_age_applies(state) {
+            named::publish_date(state, normalized, filename).await
+        } else {
+            None
+        };
+    }
     let dates_key = format!("pypi/{}/dates.json", normalized);
     let dates = match state.storage.get(&dates_key).await {
         Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
@@ -3791,6 +3845,8 @@ mod hash_marker_tests {
 mod baseline_tests;
 #[cfg(test)]
 mod repositories_tests;
+#[cfg(test)]
+mod rich_tests;
 
 #[cfg(test)]
 mod upstream_failure_cases {
