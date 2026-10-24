@@ -381,7 +381,30 @@ where
     F: FnOnce(reqwest::Response) -> Fut,
     Fut: std::future::Future<Output = Result<T, ProxyError>>,
 {
-    let auth_header = upstream_auth_header(auth)?;
+    let mut request = client.get(url).timeout(timeout);
+    if let Some(value) = upstream_auth_header(auth)? {
+        request = request.header(header::AUTHORIZATION, value);
+    }
+    if let Some((key, value)) = extra_headers {
+        request = request.header(key, value);
+    }
+    proxy_fetch_request(client, url, request, false, extract, cb, scope).await
+}
+
+/// Explicit methods retain the same origin transport, operation budget, and probe lifetime.
+async fn proxy_fetch_request<T, F, Fut>(
+    client: ProxyClient<'_>,
+    url: &str,
+    request: reqwest::RequestBuilder,
+    conditional_statuses: bool,
+    extract: F,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<T, ProxyError>
+where
+    F: FnOnce(reqwest::Response) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+{
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = client.breaker_key(scope);
@@ -390,24 +413,22 @@ where
 
     client.run(cb, &cb_key, probe, async {
     for attempt in 0..2 {
-        let mut request = client.get(url).timeout(timeout);
-        if let Some(value) = &auth_header {
-            request = request.header(header::AUTHORIZATION, value.clone());
-        }
-        if let Some((key, val)) = extra_headers {
-            request = request.header(key, val);
-        }
-
+        let Some(request) = request.try_clone() else {
+            cb.record_alive(&cb_key, probe);
+            return Err(ProxyError::Local("unrepeatable upstream request".into()));
+        };
         let upstream_start = Instant::now();
         match client.send(request).await {
             Ok(response) => {
                 let elapsed = upstream_start.elapsed().as_secs_f64();
-                if response.status().is_success() {
+                let response_status = response.status();
+                if response_status.is_success() || conditional_statuses && matches!(response_status.as_u16(), 304 | 412 | 416) {
+                    let label = if response_status.is_success() { "2xx" } else if response_status.is_redirection() { "3xx" } else { "4xx" };
                     UPSTREAM_REQUEST_DURATION
-                        .with_label_values(&[registry_str, "2xx"])
+                        .with_label_values(&[registry_str, label])
                         .observe(elapsed);
                     let result = extract(response).await;
-                    if matches!(result, Err(ProxyError::Local(_))) {
+                    if matches!(result, Err(ProxyError::Local(_))) || result.is_ok() && response_status.is_client_error() {
                         cb.record_alive(&cb_key, probe);
                     } else if result.is_ok() {
                         cb.record_success(&cb_key, probe);

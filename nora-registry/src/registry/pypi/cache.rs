@@ -8,9 +8,87 @@ use super::{named, AppState};
 use crate::registry::{ProxyError, Validators};
 use nora_registry::verified::{verified_body, GateOutcome};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::BTreeMap;
 
 pub(super) const READY: &str = ".nora-pypi-ready/";
+
+#[derive(Clone, Serialize)]
+pub(super) struct Artifact {
+    pub file: Distribution,
+    pub parent: Option<Distribution>,
+}
+
+impl std::ops::Deref for Artifact {
+    type Target = Distribution;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl Artifact {
+    pub fn distribution(file: Distribution) -> Self {
+        Self { file, parent: None }
+    }
+    pub fn coordinate(&self) -> &Distribution {
+        self.parent.as_ref().unwrap_or(&self.file)
+    }
+    pub fn binding(&self) -> Option<String> {
+        let parent = self.parent.as_ref()?;
+        let url = (!parent.hashes.keys().any(|algorithm| {
+            matches!(
+                algorithm.as_str(),
+                "sha224" | "sha256" | "sha384" | "sha512"
+            )
+        }))
+        .then_some(&parent.url);
+        Some(hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&(&parent.filename, &parent.hashes, url)).ok()?,
+        )))
+    }
+    pub fn resolve(project: &super::model::Project, filename: &str) -> Option<Self> {
+        if let Some(parent) = filename.strip_suffix(".metadata") {
+            if !super::is_valid_pypi_filename(parent) {
+                return None;
+            }
+            let parent = project.files.iter().find(|file| file.filename == parent)?;
+            Self::sidecar(parent)
+        } else {
+            project
+                .files
+                .iter()
+                .find(|file| file.filename == filename)
+                .cloned()
+                .map(Self::distribution)
+        }
+    }
+    pub fn sidecar(parent: &Distribution) -> Option<Self> {
+        let metadata = parent
+            .core_metadata
+            .as_ref()
+            .filter(|metadata| metadata.available())?;
+        let hashes = match metadata {
+            super::model::CoreMetadata::Hashes(hashes) => hashes.clone(),
+            _ => BTreeMap::new(),
+        };
+        let mut url = reqwest::Url::parse(&parent.url).ok()?;
+        url.set_path(&format!("{}.metadata", url.path()));
+        url.set_fragment(None);
+        Some(Self {
+            file: Distribution {
+                filename: format!("{}.metadata", parent.filename),
+                url: url.to_string(),
+                hashes,
+                requires_python: None,
+                yanked: None,
+                core_metadata: None,
+                size: None,
+                upload_time: None,
+            },
+            parent: Some(parent.clone()),
+        })
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Ready {
@@ -18,6 +96,8 @@ pub(super) struct Ready {
     pub source_id: String,
     pub name: String,
     pub file: Distribution,
+    #[serde(default)]
+    pub parent_binding: Option<String>,
     pub size: u64,
     pub hashes: BTreeMap<String, String>,
     pub validators: Validators,
@@ -79,8 +159,8 @@ async fn read_record(
 async fn current(
     state: &AppState,
     name: &str,
-    original: &Distribution,
-) -> Result<Distribution, ProxyError> {
+    original: &Artifact,
+) -> Result<Artifact, ProxyError> {
     let mut metadata_state = state.clone();
     metadata_state.metadata_deadline = None;
     crate::registry::transport::begin_metadata(&mut metadata_state);
@@ -93,24 +173,19 @@ async fn current(
     let file = snapshot
         .project
         .as_ref()
-        .and_then(|project| {
-            project
-                .files
-                .iter()
-                .find(|file| file.filename == original.filename)
-        })
+        .and_then(|project| Artifact::resolve(project, &original.filename))
         .ok_or_else(failure)?;
-    if !same_description(original, file) {
+    if !same_description(original, &file) || original.binding() != file.binding() {
         return Err(failure());
     }
-    Ok(file.clone())
+    Ok(file)
 }
 
 /// Earlier named caches can acquire proof only after their exact source bytes are reverified.
 async fn migrate(
     state: &AppState,
     name: &str,
-    file: &Distribution,
+    file: &Artifact,
 ) -> Result<Option<Ready>, ProxyError> {
     use tokio::io::AsyncReadExt;
     let Some(expected) = file.hashes.get("sha256") else {
@@ -180,7 +255,8 @@ async fn migrate(
             .source_id
             .clone(),
         name: name.into(),
-        file,
+        parent_binding: file.binding(),
+        file: file.file,
         size,
         validators: Validators {
             etag: Some(format!("\"{expected}\"")),
@@ -208,9 +284,27 @@ pub(super) async fn load(
     file: &Distribution,
     known_size: Option<u64>,
 ) -> Result<Option<Ready>, ProxyError> {
+    load_artifact(
+        state,
+        name,
+        &Artifact::distribution(file.clone()),
+        known_size,
+        true,
+    )
+    .await
+}
+
+pub(super) async fn load_artifact(
+    state: &AppState,
+    name: &str,
+    file: &Artifact,
+    known_size: Option<u64>,
+    migrate_missing: bool,
+) -> Result<Option<Ready>, ProxyError> {
     let repository = state.repository.as_ref().ok_or_else(failure)?;
     let ready = match read_record(state, name, &file.filename).await? {
         Some(ready) => ready,
+        None if !migrate_missing => return Ok(None),
         None => match migrate(state, name, file).await? {
             Some(ready) => ready,
             None => return Ok(None),
@@ -223,7 +317,10 @@ pub(super) async fn load(
     {
         return Err(failure());
     }
-    if !same_description(&ready.file, file) || !expected_match(file, ready.size, &ready.hashes) {
+    if ready.parent_binding != file.binding()
+        || !same_description(&ready.file, file)
+        || !expected_match(file, ready.size, &ready.hashes)
+    {
         return Ok(None);
     }
     let key = body_key(name, &file.filename);
@@ -247,7 +344,7 @@ pub(super) async fn load(
 pub(super) async fn publish(
     state: &AppState,
     name: &str,
-    original: &Distribution,
+    original: &Artifact,
     size: u64,
     hashes: &BTreeMap<String, String>,
     validators: &Validators,
@@ -287,7 +384,8 @@ pub(super) async fn publish(
         schema: 1,
         source_id: repository.source_id.clone(),
         name: name.into(),
-        file: current,
+        parent_binding: current.binding(),
+        file: current.file,
         size,
         hashes: hashes.clone(),
         validators: validators.clone(),

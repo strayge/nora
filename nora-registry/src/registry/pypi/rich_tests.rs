@@ -122,7 +122,7 @@ pub(super) async fn settled(context: &TestContext) {
 }
 
 #[tokio::test]
-async fn json_first_metadata_is_rich_neutral_and_does_not_advertise_sidecars_early() {
+async fn json_first_metadata_is_rich_neutral_and_preserves_sidecar_descriptors() {
     let _lock = crate::test_env::env_lock();
     let upstream = MockServer::start().await;
     mount(&upstream, "active").await;
@@ -140,7 +140,7 @@ async fn json_first_metadata_is_rich_neutral_and_does_not_advertise_sidecars_ear
         json["files"][0]["url"],
         format!("https://nora.example/base/python/pkg/{FILE}")
     );
-    assert!(json["files"][0].get("core-metadata").is_none());
+    assert_eq!(json["files"][0]["core-metadata"]["sha256"], "cd".repeat(32));
     let snapshot = named::stored(
         &context
             .state
@@ -168,7 +168,10 @@ async fn json_first_metadata_is_rich_neutral_and_does_not_advertise_sidecars_ear
     let html = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
     assert!(html.contains("data-requires-python=\"&gt;=3.8,&lt;4\""));
     assert!(html.contains("data-yanked=\"\""));
-    assert!(!html.contains("data-core-metadata"));
+    assert!(html.contains(&format!(
+        "data-core-metadata=\"sha256={}\"",
+        "cd".repeat(32)
+    )));
     assert!(upstream
         .received_requests()
         .await

@@ -33,7 +33,7 @@ use crate::validation::ends_with_ci;
 use crate::AppState;
 use axum::{
     extract::{Multipart, Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
     Extension, Router,
@@ -381,10 +381,11 @@ async fn package_versions(
 // Download
 // ============================================================================
 
-/// GET /simple/{name}/{filename} — download a specific file.
+/// Metadata-only HEAD must never inherit a cache-filling artifact GET.
 // LOCK-SAFE: cache-through proxy — get miss → fetch upstream → put; no RMW race
 async fn download_file(
     State(mut state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
@@ -398,12 +399,13 @@ async fn download_file(
 
     // Block download of internal bookkeeping files (dates.json, etc.) that
     // live alongside packages in storage but are not real artifacts (#891).
-    if !is_valid_pypi_filename(&filename) {
+    let coordinate = filename.strip_suffix(".metadata").unwrap_or(&filename);
+    if !is_valid_pypi_filename(coordinate) || (coordinate != filename && !named::is_proxy(&state)) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Curation check — before storage access
-    let version = crate::curation::parse_pypi_version(&normalized, &filename);
+    // Sidecars inherit their parent's package/version policy, not a synthetic metadata version.
+    let version = crate::curation::parse_pypi_version(&normalized, coordinate);
 
     let key = format!("pypi/{}/{}", normalized, filename);
     let named_snapshot = match named::prepare_download(
@@ -420,7 +422,13 @@ async fn download_file(
     // The release date of this file, for min-release-age and to seed the digest-quarantine
     // first-seen clock so a provably-old release is not held as "new to this mirror"
     // (#748/#750). Obtained here whatever index the client read.
-    let publish_date = pypi_publish_date(&state, &normalized, &filename, &key).await;
+    let publish_date = pypi_publish_date(
+        &state,
+        &normalized,
+        coordinate,
+        &format!("pypi/{normalized}/{coordinate}"),
+    )
+    .await;
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -448,11 +456,27 @@ async fn download_file(
         Err(response) => return *response,
     };
     if let Some(view) = named_snapshot {
-        return transfer::download(&state, &normalized, &filename, &headers, publish_date, view)
-            .await;
+        return transfer::download(
+            &state,
+            &normalized,
+            &filename,
+            method,
+            &headers,
+            publish_date,
+            view,
+        )
+        .await;
     }
     if state.repository.is_some() {
-        return transfer::local(&state, &normalized, &filename, &headers, publish_date).await;
+        return transfer::local(
+            &state,
+            &normalized,
+            &filename,
+            method,
+            &headers,
+            publish_date,
+        )
+        .await;
     }
 
     // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
@@ -1206,7 +1230,9 @@ fn wants_json(headers: &HeaderMap) -> bool {
 
 /// Content-type for PyPI files.
 fn pypi_content_type(filename: &str) -> &'static str {
-    if ends_with_ci(filename, ".whl") {
+    if ends_with_ci(filename, ".metadata") {
+        "text/plain; charset=utf-8"
+    } else if ends_with_ci(filename, ".whl") {
         "application/zip"
     } else if ends_with_ci(filename, ".tar.gz") || ends_with_ci(filename, ".tgz") {
         "application/gzip"
@@ -3844,6 +3870,8 @@ mod hash_marker_tests {
 
 #[cfg(test)]
 mod baseline_tests;
+#[cfg(test)]
+mod protocol_tests;
 #[cfg(test)]
 mod repositories_tests;
 #[cfg(test)]

@@ -602,7 +602,7 @@ fn response(
         return StatusCode::NOT_FOUND.into_response();
     };
     if wants_json(headers) {
-        match model::render_json(project, files, base, full, false, None) {
+        match model::render_json(project, files, base, full, true, None) {
             Ok(bytes) => (
                 [
                     (header::CONTENT_TYPE, PEP691_JSON),
@@ -616,7 +616,7 @@ fn response(
     } else {
         (
             [(header::VARY, "Accept")],
-            Html(model::render_html(project, files, base, false, None)),
+            Html(model::render_html(project, files, base, true, None)),
         )
             .into_response()
     }
@@ -679,28 +679,43 @@ pub(super) async fn project(
     let Some(project) = &view.snapshot.project else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !view.offline {
-        return response(&view.snapshot, &project.files, base, headers, true);
-    }
-    let keys = match state.storage.list_with_meta(&format!("pypi/{name}/")).await {
-        Ok(keys) => keys.into_iter().collect::<BTreeMap<_, _>>(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let mut files = Vec::new();
-    for file in &project.files {
-        let key = format!("pypi/{name}/{}", file.filename);
-        let Some(meta) = keys.get(&key) else { continue };
-        let Ok(Some(ready)) = super::cache::load(state, name, file, Some(meta.size)).await else {
-            continue;
+    let mut files = if view.offline {
+        let keys = match state.storage.list_with_meta(&format!("pypi/{name}/")).await {
+            Ok(keys) => keys.into_iter().collect::<BTreeMap<_, _>>(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-        let mut file = file.clone();
-        file.size = Some(ready.size);
-        files.push(file);
+        let mut files = Vec::new();
+        for file in &project.files {
+            let key = format!("pypi/{name}/{}", file.filename);
+            let Some(meta) = keys.get(&key) else { continue };
+            let Ok(Some(ready)) = super::cache::load(state, name, file, Some(meta.size)).await
+            else {
+                continue;
+            };
+            let mut file = file.clone();
+            file.size = Some(ready.size);
+            files.push(file);
+        }
+        files
+    } else {
+        project.files.clone()
+    };
+    for file in &mut files {
+        if file
+            .core_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.available())
+            && !super::transfer::metadata_available(state, name, file, view.offline).await
+        {
+            file.core_metadata = None;
+        }
     }
-    let mut result = response(&view.snapshot, &files, base, headers, false);
-    result
-        .headers_mut()
-        .insert("x-nora-stale", axum::http::HeaderValue::from_static("true"));
+    let mut result = response(&view.snapshot, &files, base, headers, !view.offline);
+    if view.offline {
+        result
+            .headers_mut()
+            .insert("x-nora-stale", axum::http::HeaderValue::from_static("true"));
+    }
     result
 }
 

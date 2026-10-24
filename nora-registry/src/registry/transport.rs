@@ -384,6 +384,9 @@ impl<'a> ProxyClient<'a> {
     pub(super) fn for_raw_artifact(state: &'a AppState) -> Self {
         Self::for_operation(state, true, true)
     }
+    pub(super) fn for_raw_metadata(state: &'a AppState) -> Self {
+        Self::for_operation(state, false, true)
+    }
 
     fn for_operation(state: &'a AppState, artifact: bool, raw: bool) -> Self {
         if let Some(repository) = state.repository.as_ref() {
@@ -476,6 +479,9 @@ impl<'a> ProxyClient<'a> {
 
     pub(super) fn get(self, url: &str) -> RequestBuilder {
         self.template().get(url)
+    }
+    pub(super) fn request(self, method: reqwest::Method, url: &str) -> RequestBuilder {
+        self.template().request(method, url)
     }
     pub(super) fn post(self, url: &str) -> RequestBuilder {
         self.template().post(url)
