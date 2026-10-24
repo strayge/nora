@@ -2,6 +2,9 @@
 
 **One binary, seventeen package formats, no database.** NORA is a self-hosted artifact registry and pull-through cache for Docker, Maven, npm, PyPI, Cargo, Go and more, with supply-chain controls built in.
 
+> **Fork notice:** npm/PyPI repositories and proxy behavior differ from upstream.
+> See [FORK.md](FORK.md) for the changes, migration notes and build guidance.
+
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docker Pulls](https://img.shields.io/docker/pulls/getnora/nora)](https://hub.docker.com/r/getnora/nora)
