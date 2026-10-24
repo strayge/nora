@@ -298,19 +298,6 @@ pub(super) fn parse_json(bytes: &[u8], name: &str, base: &Url) -> Result<Project
             upload_time: timestamp(entry.get("upload-time"))?,
         });
     }
-    if let Some(versions) = &versions {
-        let keys: BTreeSet<_> = versions
-            .iter()
-            .map(|version| version_key(version))
-            .collect();
-        if files
-            .iter()
-            .filter_map(|file| nora_registry::pypi_files::parse_pypi_version(name, &file.filename))
-            .any(|version| !keys.contains(&version_key(&version)))
-        {
-            return Err("incomplete authoritative versions");
-        }
-    }
     Ok(Project {
         name: name.into(),
         files,

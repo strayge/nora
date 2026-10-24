@@ -237,13 +237,31 @@ fn authoritative_versions_keep_their_spelling_for_legacy_equivalent_filenames() 
         rendered(&project, &project.files, false, false)["versions"],
         json!(["1.0.post1"])
     );
-    input["versions"] = json!(["2.0"]);
-    assert!(parse_json(
-        &serde_json::to_vec(&input).unwrap(),
-        "pkg",
-        &Url::parse(PUBLIC).unwrap()
-    )
-    .is_err());
+}
+
+/// Historical uploads can belong to a release that differs from the filename's version.
+#[test]
+fn legacy_release_versions_need_not_match_distribution_filenames() {
+    let mut input = document();
+    input["versions"] = json!(["0.2"]);
+    input["files"][0]["filename"] = json!("pkg-0.3.tar.gz");
+    input["files"][0]["url"] = json!("../../files/pkg-0.3.tar.gz");
+    input["project-status"] = json!({"status": "active"});
+    let project = parsed(&input);
+    let output = rendered(&project, &project.files, true, false);
+    assert_eq!(output["versions"], json!(["0.2"]));
+    assert_eq!(output["files"][0]["filename"], "pkg-0.3.tar.gz");
+    assert_eq!(
+        rendered(&project, &project.files, false, false)["versions"],
+        json!(["0.3"])
+    );
+
+    input["project-status"]["status"] = json!("quarantined");
+    let project = parsed(&input);
+    assert!(rendered(&project, &project.files, true, false)["files"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
