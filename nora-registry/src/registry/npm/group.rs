@@ -51,14 +51,10 @@ async fn index(State(root): State<AppState>, Extension(mount): Extension<Mount>)
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         let state = repository.state(&root);
-        packages.extend(
-            state
-                .repo_index
-                .get("npm", &state.storage)
-                .await
-                .iter()
-                .map(|package| package.name.clone()),
-        );
+        match known_packages(&state).await {
+            Ok(known) => packages.extend(known),
+            Err(status) => return status.into_response(),
+        };
     }
     axum::Json(serde_json::json!({"name":mount.group.name,"packages":packages})).into_response()
 }
@@ -90,7 +86,7 @@ async fn lookup(state: &AppState, name: &str) -> Lookup<named::Package, Box<Resp
                 crate::curation::RegistryType::Npm,
                 name,
             ) {
-                return Lookup::Failure(Box::new(response));
+                return Lookup::Failure(Box::new(crate::audit::attribute_refusal(state, response)));
             }
             load_upstream_metadata(state, name, name, &upstream_packument_key(name), true).await
         }
@@ -115,7 +111,9 @@ async fn lookup(state: &AppState, name: &str) -> Lookup<named::Package, Box<Resp
             }
         }
         Ok(None) => Lookup::Absent,
-        Err(response) => Lookup::Failure(response),
+        Err(response) => {
+            Lookup::Failure(Box::new(crate::audit::attribute_refusal(state, *response)))
+        }
     }
 }
 
@@ -153,9 +151,7 @@ async fn handle(
             },
         }
     };
-    if !matches!(classify_metadata_path(name), MetadataPath::Packument { name: parsed } if parsed == name)
-        || crate::validation::validate_storage_key(&format!("npm/{name}")).is_err()
-    {
+    if !valid_package_name(name) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let selection = match groups::resolve(
@@ -179,8 +175,8 @@ async fn handle(
     let prefix = groups::bound_prefix(&mount.prefix, &selection.binding);
     named::bind(&mut state, named::Mount(Arc::from(prefix.as_str())));
     if artifact {
-        return handle_request(
-            State(state),
+        let response = handle_request(
+            State(state.clone()),
             Extension(named::Mount(Arc::from(prefix))),
             headers,
             Path(path.to_owned()),
@@ -188,6 +184,7 @@ async fn handle(
             Some(Extension(selection.package)),
         )
         .await;
+        return crate::audit::attribute_refusal(&state, response);
     }
     let mut package = selection.package;
     match target {

@@ -391,6 +391,23 @@ impl StorageBackend for ObjectStorage {
             .collect())
     }
 
+    async fn exists(&self, key: &str) -> Result<bool> {
+        let path = Path::from(encode_object_key(key));
+        let result = match self.store.head(&path).await {
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                self.store
+                    .head(&Path::from(encode_object_key_legacy(key)))
+                    .await
+            }
+            result => result,
+        };
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(StorageError::Network(error.to_string())),
+        }
+    }
+
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);

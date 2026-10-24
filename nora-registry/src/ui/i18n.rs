@@ -45,6 +45,7 @@ impl Lang {
 pub struct Translations {
     // Navigation
     pub nav_dashboard: &'static str,
+    pub nav_repositories: &'static str,
     pub nav_registries: &'static str,
 
     // Dashboard
@@ -166,6 +167,7 @@ pub fn get_translations(lang: Lang) -> &'static Translations {
 pub static TRANSLATIONS_EN: Translations = Translations {
     // Navigation
     nav_dashboard: "Dashboard",
+    nav_repositories: "Repositories",
     nav_registries: "Registries",
 
     // Dashboard
@@ -279,6 +281,7 @@ pub static TRANSLATIONS_EN: Translations = Translations {
 pub static TRANSLATIONS_RU: Translations = Translations {
     // Navigation
     nav_dashboard: "Панель",
+    nav_repositories: "Репозитории",
     nav_registries: "Реестры",
 
     // Dashboard
@@ -392,6 +395,7 @@ pub static TRANSLATIONS_RU: Translations = Translations {
 pub static TRANSLATIONS_ZH: Translations = Translations {
     // Navigation
     nav_dashboard: "仪表盘",
+    nav_repositories: "软件仓库",
     nav_registries: "注册表",
 
     // Dashboard

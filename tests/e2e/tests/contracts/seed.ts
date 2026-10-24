@@ -11,7 +11,7 @@ import * as crypto from 'crypto';
 
 export interface SeedResult {
   docker: { name: string; tags: string[] };
-  npm: { name: string; version: string };
+  npm: { name: string; version: string; repository: string };
   raw: { path: string };
   maven: { group: string; artifact: string; version: string; path: string };
 }
@@ -84,7 +84,7 @@ export async function seedDocker(
 
 /**
  * Publish an npm package with metadata.
- * Uses the npm publish endpoint (PUT /npm/{name}).
+ * Publishing targets the explicit local alias, never the read-only group.
  */
 export async function seedNpm(
   request: APIRequestContext
@@ -114,7 +114,7 @@ export async function seedNpm(
     },
   };
 
-  const resp = await request.put(`/npm/${name}`, {
+  const resp = await request.put(`/npm-local/${name}`, {
     data: publishBody,
     headers: { 'Content-Type': 'application/json' },
   });
@@ -124,7 +124,7 @@ export async function seedNpm(
     throw new Error(`seedNpm: unexpected status ${resp.status()}`);
   }
 
-  return { name, version };
+  return { name, version, repository: 'smoke-npm-local' };
 }
 
 /**

@@ -6,6 +6,7 @@ set -euo pipefail
 # Exit code 0 = all passed, non-zero = failures.
 
 NORA_BIN="${NORA_BIN:-./target/release/nora}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${NORA_TEST_PORT:-14100}"
 BASE="http://localhost:${PORT}"
 STORAGE_DIR=$(mktemp -d)
@@ -57,6 +58,7 @@ start_nora() {
     NORA_HOST=127.0.0.1 \
     NORA_PORT=$PORT \
     NORA_STORAGE_PATH="$STORAGE_DIR" \
+    NORA_CONFIG_PATH="$SCRIPT_DIR/repositories/smoke.toml" \
     NORA_RATE_LIMIT_ENABLED=false \
     NORA_PUBLIC_URL="$BASE" \
     "$@" "$NORA_BIN" serve &
@@ -397,6 +399,11 @@ echo "--- 5. SIGHUP Hot Reload ---"
 BLOCKLIST_FILE="$CONFIG_DIR/blocklist.json"
 ALLOWLIST_FILE="$CONFIG_DIR/allowlist.json"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
+RELOAD_REPOSITORY_CONFIG='
+[repositories.reload-npm]
+format = "npm"
+kind = "local"
+paths = ["/npm/"]'
 
 # Create an allowlist (required for enforce mode)
 cat > "$ALLOWLIST_FILE" << 'EOF'
@@ -437,6 +444,7 @@ mode = "off"
 blocklist_path = "$BLOCKLIST_FILE"
 allowlist_path = "$ALLOWLIST_FILE"
 EOF
+printf '%s\n' "$RELOAD_REPOSITORY_CONFIG" >> "$CONFIG_FILE"
 
 kill "$NORA_PID" 2>/dev/null && wait "$NORA_PID" 2>/dev/null || true
 NORA_PID=""
@@ -468,6 +476,7 @@ mode = "enforce"
 blocklist_path = "$BLOCKLIST_FILE"
 allowlist_path = "$ALLOWLIST_FILE"
 EOF
+printf '%s\n' "$RELOAD_REPOSITORY_CONFIG" >> "$CONFIG_FILE"
 
 # Send SIGHUP
 if kill -HUP "$NORA_PID" 2>/dev/null; then
@@ -534,6 +543,7 @@ path = "$STORAGE_DIR"
 [curation]
 mode = "off"
 EOF
+            printf '%s\n' "$RELOAD_REPOSITORY_CONFIG" >> "$CONFIG_FILE"
             start_nora_with_config "$CONFIG_FILE" env NORA_RATE_LIMIT_ENABLED=false
         fi
     else
@@ -552,6 +562,7 @@ path = "$STORAGE_DIR"
 [curation]
 mode = "off"
 EOF
+    printf '%s\n' "$RELOAD_REPOSITORY_CONFIG" >> "$CONFIG_FILE"
 
     # Multiple rapid SIGHUPs → no race/crash
     for _ in 1 2 3 4 5; do
@@ -874,9 +885,10 @@ echo "--- 10. PyPI PEP 691 Compliance ---"
 PYPI_PKG="polygon-test-pkg"
 PYPI_FILE="polygon_test_pkg-1.0.tar.gz"
 PYPI_HASH="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-mkdir -p "$STORAGE_DIR/pypi/${PYPI_PKG}"
-echo "fake-pypi-tarball" > "$STORAGE_DIR/pypi/${PYPI_PKG}/${PYPI_FILE}"
-echo -n "$PYPI_HASH" > "$STORAGE_DIR/pypi/${PYPI_PKG}/${PYPI_FILE}.sha256"
+PYPI_LOCAL="$STORAGE_DIR/repositories/smoke-python-local/sources/local/pypi"
+mkdir -p "$PYPI_LOCAL/${PYPI_PKG}"
+echo "fake-pypi-tarball" > "$PYPI_LOCAL/${PYPI_PKG}/${PYPI_FILE}"
+echo -n "$PYPI_HASH" > "$PYPI_LOCAL/${PYPI_PKG}/${PYPI_FILE}.sha256"
 
 # Request PEP 691 JSON format
 PYPI_HEADERS=$(mktemp)
@@ -914,10 +926,10 @@ import sys,json
 data = json.load(sys.stdin)
 print(data.get('meta', {}).get('api-version', ''))
 " 2>/dev/null || echo "")
-    if [ "$API_VER" = "1.0" ]; then
-        pass "PyPI meta.api-version = 1.0"
+    if [ "$API_VER" = "1.1" ]; then
+        pass "PyPI meta.api-version = 1.1"
     else
-        fail "PyPI meta.api-version = '$API_VER' (expected 1.0)"
+        fail "PyPI meta.api-version = '$API_VER' (expected 1.1)"
     fi
 
     # 10.4 File URLs point to NORA, not pypi.org

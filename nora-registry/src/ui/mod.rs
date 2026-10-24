@@ -7,6 +7,7 @@ pub(crate) mod api;
 pub mod components;
 pub mod i18n;
 
+mod repositories;
 mod static_assets;
 mod templates;
 
@@ -109,6 +110,7 @@ fn extract_lang_from_headers(headers: &axum::http::HeaderMap) -> Lang {
 /// The UI router: pages and the HTMX fragment endpoints under `/api/ui`.
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(repositories::routes())
         // UI Pages
         .route("/", get(|| async { Redirect::to("/ui/") }))
         .route("/ui", get(|| async { Redirect::to("/ui/") }))
@@ -361,59 +363,12 @@ async fn maven_detail(
 }
 
 // npm pages
-async fn npm_list(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
-    let auth_enabled = state.auth.is_some();
-
-    let all_packages = state.repo_index.get("npm", &state.storage).await;
-    let (packages, total) = paginate(&all_packages, page, limit);
-
-    Html(render_registry_list_paginated(
-        "npm",
-        "npm Registry",
-        &packages,
-        page,
-        limit,
-        total,
-        lang,
-        auth_enabled,
-    ))
+async fn npm_list() -> Redirect {
+    Redirect::to("/ui/repositories?format=npm")
 }
 
-async fn npm_detail(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(query): Query<DetailQuery>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = {
-        let lang_q = LangQuery {
-            lang: query.lang.clone(),
-        };
-        extract_lang(
-            &Query(lang_q),
-            headers.get("cookie").and_then(|v| v.to_str().ok()),
-        )
-    };
-    let base_url = resolve_base_url(&state);
-    let auth_enabled = state.auth.is_some();
-    let show_prerelease = query.prerelease.unwrap_or(false);
-    let show_all = query.all.unwrap_or(false);
-    let detail = get_npm_detail(&state.storage, &name, show_prerelease, show_all).await;
-    Html(render_package_detail(
-        "npm",
-        &name,
-        &detail,
-        lang,
-        &base_url,
-        auth_enabled,
-    ))
+async fn npm_detail() -> Redirect {
+    Redirect::to("/ui/repositories?format=npm")
 }
 
 // Cargo pages
@@ -473,59 +428,12 @@ async fn cargo_detail(
 }
 
 // PyPI pages
-async fn pypi_list(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
-    let auth_enabled = state.auth.is_some();
-
-    let all_packages = state.repo_index.get("pypi", &state.storage).await;
-    let (packages, total) = paginate(&all_packages, page, limit);
-
-    Html(render_registry_list_paginated(
-        "pypi",
-        "PyPI Repository",
-        &packages,
-        page,
-        limit,
-        total,
-        lang,
-        auth_enabled,
-    ))
+async fn pypi_list() -> Redirect {
+    Redirect::to("/ui/repositories?format=pypi")
 }
 
-async fn pypi_detail(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(query): Query<DetailQuery>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = {
-        let lang_q = LangQuery {
-            lang: query.lang.clone(),
-        };
-        extract_lang(
-            &Query(lang_q),
-            headers.get("cookie").and_then(|v| v.to_str().ok()),
-        )
-    };
-    let base_url = resolve_base_url(&state);
-    let auth_enabled = state.auth.is_some();
-    let show_prerelease = query.prerelease.unwrap_or(false);
-    let show_all = query.all.unwrap_or(false);
-    let detail = get_pypi_detail(&state.storage, &name, show_prerelease, show_all).await;
-    Html(render_package_detail(
-        "pypi",
-        &name,
-        &detail,
-        lang,
-        &base_url,
-        auth_enabled,
-    ))
+async fn pypi_detail() -> Redirect {
+    Redirect::to("/ui/repositories?format=pypi")
 }
 
 // Go pages

@@ -48,6 +48,12 @@ docker pull localhost:4000/myapp:v1
 
 ### Use as npm Registry
 
+First mount a config with explicit npm/PyPI repositories and wanted aliases; the
+Compose quickstart creates neither `/npm/` nor `/simple/` automatically. The
+commands below assume those aliases were configured. See the
+[named repository guide](../docs/repositories.md); publish directly to a local
+alias, never a proxy or group.
+
 ```bash
 npm config set registry http://localhost:4000/npm/
 npm install lodash
@@ -79,7 +85,8 @@ environment:
   - NORA_PUBLIC_URL=https://registry.example.com
 ```
 
-**PyPI index URL** — use `/simple/`, not `/pypi/simple/`:
+**PyPI index URL** — use your configured alias. These examples assume `/simple/`
+was explicitly configured; there is no fixed default index path:
 
 ```bash
 pip install --index-url https://registry.example.com/simple/ requests
@@ -167,6 +174,11 @@ docker pull localhost:4000/myapp:v1
 
 ### Использование как npm реестр
 
+Сначала смонтируйте конфигурацию с явными npm/PyPI-репозиториями и alias:
+Compose не создаёт `/npm/` и `/simple/` автоматически. Примеры ниже предполагают,
+что эти alias настроены. См. [руководство](../docs/repositories.md).
+Публиковать следует напрямую в local, а не в proxy или group.
+
 ```bash
 npm config set registry http://localhost:4000/npm/
 npm install lodash
@@ -198,7 +210,8 @@ environment:
   - NORA_PUBLIC_URL=https://registry.example.com
 ```
 
-**URL для PyPI** — используйте `/simple/`, а не `/pypi/simple/`:
+**URL для PyPI** — используйте настроенный alias. Здесь `/simple/` предполагает
+явную настройку; фиксированного пути индекса по умолчанию нет:
 
 ```bash
 pip install --index-url https://registry.example.com/simple/ requests

@@ -138,17 +138,6 @@ fn open_staging(_root: &Path) -> std::io::Result<Staging> {
     ))
 }
 
-/// The directory a listing names must be readable: a listing that silently skipped it would
-/// answer "nothing here" for files that are there (a published npm package would read as
-/// unpublished). A directory deeper down that cannot be read is still skipped, as before.
-fn readable_listing_root(root: &Path) -> std::result::Result<(), StorageError> {
-    match std::fs::read_dir(root) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StorageError::Io(e)),
-    }
-}
-
 /// Remove the staging directories of dead instances: those whose lock can be taken,
 /// those without a lock file, and `.new-*` ones abandoned half-created. A directory
 /// whose lock is held belongs to a live instance and is left alone, and so is any
@@ -593,71 +582,79 @@ impl LocalStorage {
         self.base_path.join(key)
     }
 
-    /// Recursively list all files under a directory (sync helper)
-    fn list_files_sync(dir: &PathBuf, base: &PathBuf, prefix: &str, results: &mut Vec<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Ok(rel_path) = path.strip_prefix(base) {
-                        let key = rel_path.to_string_lossy().replace('\\', "/");
-                        if key != PIN_FILE
-                            && !super::is_reserved_signing_key(&key)
-                            && (key.starts_with(prefix) || prefix.is_empty())
-                        {
-                            results.push(key);
-                        }
-                    }
-                } else if path.is_dir() && !is_staging_dir(&path, base) {
-                    Self::list_files_sync(&path, base, prefix, results);
-                }
+    /// Partial inventories must not turn unavailable packages into confirmed absence.
+    fn walk_files_sync(
+        dir: &Path,
+        base: &Path,
+        prefix: &str,
+        visit: &mut impl FnMut(String, FileMeta),
+    ) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let Ok(relative) = path.strip_prefix(base) else {
+                continue;
+            };
+            let key = relative.to_string_lossy().replace('\\', "/");
+            if key == PIN_FILE
+                || key == super::SIGNING_KEY_PREFIX.trim_end_matches('/')
+                || super::is_reserved_signing_key(&key)
+                || is_staging_dir(&path, base)
+            {
+                continue;
+            }
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.is_file() && (key.starts_with(prefix) || prefix.is_empty()) {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| time.as_secs())
+                    .unwrap_or(0);
+                visit(
+                    key,
+                    FileMeta {
+                        size: metadata.len(),
+                        modified,
+                    },
+                );
+            } else if metadata.is_dir() {
+                Self::walk_files_sync(&path, base, prefix, visit)?;
             }
         }
+        Ok(())
     }
 
-    /// Like [`Self::list_files_sync`] but also captures size/mtime from each
-    /// file's metadata during the walk, so callers do not need a follow-up
-    /// `stat()` per key (#738). Uses `std::fs::metadata` (symlink-following) to
-    /// match the semantics of [`StorageBackend::stat`].
+    fn list_files_sync(
+        dir: &Path,
+        base: &Path,
+        prefix: &str,
+        results: &mut Vec<String>,
+    ) -> Result<()> {
+        Self::walk_files_sync(dir, base, prefix, &mut |key, _| results.push(key))
+    }
+
     fn list_files_with_meta_sync(
-        dir: &PathBuf,
-        base: &PathBuf,
+        dir: &Path,
+        base: &Path,
         prefix: &str,
         results: &mut Vec<(String, FileMeta)>,
-    ) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Ok(metadata) = std::fs::metadata(&path) else {
-                    continue;
-                };
-                if metadata.is_file() {
-                    if let Ok(rel_path) = path.strip_prefix(base) {
-                        let key = rel_path.to_string_lossy().replace('\\', "/");
-                        if key != PIN_FILE
-                            && !super::is_reserved_signing_key(&key)
-                            && (key.starts_with(prefix) || prefix.is_empty())
-                        {
-                            let modified = metadata
-                                .modified()
-                                .ok()
-                                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            results.push((
-                                key,
-                                FileMeta {
-                                    size: metadata.len(),
-                                    modified,
-                                },
-                            ));
-                        }
-                    }
-                } else if metadata.is_dir() && !is_staging_dir(&path, base) {
-                    Self::list_files_with_meta_sync(&path, base, prefix, results);
-                }
-            }
-        }
+    ) -> Result<()> {
+        Self::walk_files_sync(dir, base, prefix, &mut |key, metadata| {
+            results.push((key, metadata))
+        })
     }
 }
 
@@ -762,9 +759,10 @@ impl StorageBackend for LocalStorage {
         // Use blocking task for filesystem traversal
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
-                readable_listing_root(&root)?;
-                Self::list_files_sync(&root, &base, &prefix, &mut results);
+            if let Some(root) = list_root(&base, &prefix) {
+                if root.try_exists()? {
+                    Self::list_files_sync(&root, &base, &prefix, &mut results)?;
+                }
             }
             results.sort();
             Ok(results)
@@ -779,15 +777,20 @@ impl StorageBackend for LocalStorage {
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
-                readable_listing_root(&root)?;
-                Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results);
+            if let Some(root) = list_root(&base, &prefix) {
+                if root.try_exists()? {
+                    Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results)?;
+                }
             }
             results.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(results)
         })
         .await
         .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))?
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        Ok(fs::try_exists(self.key_to_path(key)).await?)
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -1079,7 +1082,8 @@ mod tests {
                 &dir.path().to_path_buf(),
                 prefix,
                 &mut out,
-            );
+            )
+            .unwrap();
             out.sort();
             out
         };
@@ -1306,8 +1310,7 @@ mod tests {
         );
     }
 
-    /// A listing whose own directory cannot be read is an error, not "nothing here"; a directory
-    /// deeper down that cannot be read is still skipped. (Root reads anything: then it is moot.)
+    /// An unreadable subtree can hide package membership, so partial inventories are errors.
     #[tokio::test]
     async fn an_unreadable_listing_directory_is_an_error() {
         use std::os::unix::fs::PermissionsExt;
@@ -1325,20 +1328,36 @@ mod tests {
         let own = storage.list("npm/pkg/versions/").await;
         let meta = storage.list_with_meta("npm/pkg/versions/").await;
         let wider = storage.list("npm/pkg/").await;
+        let wider_meta = storage.list_with_meta("npm/pkg/").await;
         std::fs::set_permissions(&versions, std::fs::Permissions::from_mode(0o755)).unwrap();
         if unreadable {
             assert!(own.is_err(), "{own:?}");
             assert!(meta.is_err());
-            assert_eq!(
-                wider.unwrap(),
-                vec!["npm/pkg/tarballs/pkg-1.0.0.tgz".to_string()]
-            );
+            assert!(wider.is_err());
+            assert!(wider_meta.is_err());
         }
         assert!(storage
             .list("npm/absent/versions/")
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_file_removed_during_listing_is_not_an_unavailable_inventory() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("raw")).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(dir.path().join("raw").join(name), b"body").unwrap();
+        }
+        let mut keys = Vec::new();
+        LocalStorage::walk_files_sync(dir.path(), dir.path(), "raw/", &mut |key, _| {
+            let other = if key == "raw/a" { "raw/b" } else { "raw/a" };
+            std::fs::remove_file(dir.path().join(other)).unwrap();
+            keys.push(key);
+        })
+        .unwrap();
+        assert_eq!(keys.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2445,7 +2464,8 @@ mod tests {
                 &dir.path().to_path_buf(),
                 prefix,
                 &mut full,
-            );
+            )
+            .unwrap();
             assert_eq!(full, vec![key.to_string()], "oracle {prefix:?}");
             assert_eq!(storage.list(prefix).await.unwrap(), full, "list {prefix:?}");
             let meta: Vec<String> = storage

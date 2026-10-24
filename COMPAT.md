@@ -12,9 +12,9 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 |--------|:---:|:---:|---|---|
 | Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
 | Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
-| npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
+| npm | ✅ | ✅ | none | explicit named local/proxy/group repositories; local-only publishing |
 | Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
-| PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
+| PyPI | ✅ | ✅ | none | explicit named local/proxy/group repositories; local-only publishing |
 | Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
 | Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT`/`GET` (ETag, `If-Match`, `If-None-Match`) on every backend; upload verification via `Repr-Digest` (RFC 9530) |
 | RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented |
@@ -79,6 +79,11 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 
 ## npm
 
+All paths are explicit aliases; `/npm/` exists only when configured. See the
+[named repository guide](docs/repositories.md) for configuration, first-package
+selection/ownership, source-bound links, persistence and conversion. Groups are
+read-only and do not merge versions or tags; their audit endpoint returns 501.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Package metadata (GET) | Full | JSON with all versions |
@@ -89,7 +94,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
 | Dist-tags (`latest`, `next`) | Partial | Read from metadata, no explicit management |
 | Search (`/-/v1/search`) | — | Not implemented |
-| Audit (`bulk` npm7 / `audits/quick` npm6) | Full | Proxy repos: forwarded to upstream verbatim; internal-namespace names stripped/refused; anonymous-read eligible. Proxied packages only (no local advisory DB). (#597) |
+| Audit (`bulk` npm7 / `audits/quick` npm6) | Partial | Direct proxies forward to their upstream with existing security filtering; groups return 501; no local advisory DB or false-clean outage result |
 | Upstream proxy | Full | Configurable TTL |
 
 ## Maven
@@ -126,18 +131,26 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 
 ## PyPI (PEP 503/691)
 
+All paths are explicit aliases; `/simple/` exists only when configured. Groups
+select one package source, unlike the former multi-upstream merging model. Stored
+inventory is not a guarantee of offline readiness; see the [repository guide](docs/repositories.md).
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Simple index (HTML) | Full | PEP 503 |
 | Simple index (JSON) | Full | PEP 691, via Accept header |
 | Package versions page | Full | HTML + JSON |
 | File download | Full | Wheel, sdist, egg |
-| `twine upload` | Full | Multipart form-data |
+| `twine upload` | Full | Multipart form-data to local repositories only |
 | SHA256 hashes | Full | In metadata links |
 | Case normalization | Full | `My-Package` → `my-package` |
 | Upstream proxy | Full | Configurable TTL |
 | JSON API metadata | Full | `application/vnd.pypi.simple.v1+json` |
-| Yanking | — | Not implemented |
+| Yanked metadata | Full | Preserve upstream yanked state and reasons; no local yank management |
+| Requires-Python / project status | Full | Preserve upstream constraints and project status/reasons |
+| Rich Simple JSON | Partial | Hashes, real timestamps and authoritative versions; honest API 1.0 fallback when sizes are unknown |
+| HEAD / conditional / Range | Full | True upstream HEAD, validators and single byte ranges; partial responses never become complete cache entries |
+| Core Metadata sidecars | Partial | Advertised upstream sidecars only, with own hashes and parent binding; no local metadata generation |
 | Upload signatures (PGP) | — | Not implemented |
 
 ## Go Module Proxy (GOPROXY)

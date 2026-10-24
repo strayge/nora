@@ -45,12 +45,11 @@ test.describe('Dashboard', () => {
     }
   });
 
-  test('registry cards present (7–13)', async ({ page }) => {
+  test('registry cards match enabled formats', async ({ page, request }) => {
+    const response = await request.get('/api/ui/dashboard');
+    const dashboard = await response.json();
     await page.goto('/ui/');
-    const cards = page.locator(DASHBOARD.registryCardSelector);
-    const count = await cards.count();
-    expect(count).toBeGreaterThanOrEqual(7);
-    expect(count).toBeLessThanOrEqual(13);
+    await expect(page.locator(DASHBOARD.registryCardSelector)).toHaveCount(dashboard.registry_stats.length);
   });
 
   test('mount points table visible', async ({ page }) => {
@@ -193,34 +192,42 @@ test.describe('Detail page: Docker', () => {
 // ══════════════════════════════════════════════════════════════════
 
 test.describe('Detail page: npm', () => {
-  const contract = getRegistry('npm');
-
-  test('breadcrumb links back to /ui/npm', async ({ page }) => {
-    await page.goto(`/ui/npm/${seed.npm.name}`);
-    // Scope to main content to avoid matching sidebar link
-    const crumb = page.locator('main a[href="/ui/npm"]').first();
-    await expect(crumb).toBeVisible();
-    await expect(crumb).toContainText(contract.detail.breadcrumbRootText);
+  test.beforeEach(async ({ page }) => {
+    await page.goto(`/ui/repositories/${seed.npm.repository}/package/${seed.npm.name}`);
   });
 
-  test('#install-cmd visible and matches pattern', async ({ page }) => {
-    await page.goto(`/ui/npm/${seed.npm.name}`);
-    const cmd = page.locator('#install-cmd');
-    await expect(cmd).toBeVisible();
-    const text = await cmd.textContent();
-    expect(text).toMatch(contract.detail.installCommandPattern!);
+  test('breadcrumb preserves repository identity', async ({ page }) => {
+    await expect(
+      page.locator(`main a[href="/ui/repositories/${seed.npm.repository}"]`)
+    ).toHaveText(seed.npm.repository);
   });
 
-  test('#copy-btn present', async ({ page }) => {
-    await page.goto(`/ui/npm/${seed.npm.name}`);
-    await expect(page.locator('#copy-btn')).toBeVisible();
+  test('install command uses the explicit alias and terminates options', async ({ page }) => {
+    const command = page.locator('main code').first();
+    await expect(command).toContainText('--registry');
+    await expect(command).toContainText(`/npm-local/' -- '${seed.npm.name}'`);
   });
 
-  test('version rows with data-version attribute', async ({ page }) => {
-    await page.goto(`/ui/npm/${seed.npm.name}`);
-    const rows = page.locator('.version-row[data-version]');
-    const count = await rows.count();
-    expect(count).toBeGreaterThanOrEqual(1);
+  test('copy controls and stored versions are visible', async ({ page }) => {
+    await expect(page.getByRole('button', { name: 'Copy command' }).first()).toBeVisible();
+    await expect(page.locator('tbody')).toContainText(seed.npm.version);
+    await expect(page.locator('main')).toContainText('not a guarantee of offline readiness');
+  });
+});
+
+test.describe('Repository browser', () => {
+  test('directory exposes local and group identities', async ({ page }) => {
+    await page.goto('/ui/repositories');
+    await expect(page.locator('h1')).toHaveText('Repositories');
+    await expect(page.locator('main a[href="/ui/repositories/smoke-npm-local"]')).toBeVisible();
+    await expect(page.locator('main a[href="/ui/repositories/smoke-npm"]')).toBeVisible();
+  });
+
+  test('group inventory selects one member and has no publish command', async ({ page, request }) => {
+    await page.goto(`/ui/repositories/smoke-npm/package/${seed.npm.name}`);
+    await expect(page.locator('main')).toContainText('selected source: smoke-npm-local');
+    await expect(page.locator('main')).not.toContainText('npm publish');
+    expect((await request.get('/api/ui/npm/list')).status()).toBe(400);
   });
 });
 
@@ -320,7 +327,7 @@ test.describe('Special interactions', () => {
   test('search input triggers HTMX update of #repo-table-body', async ({
     page,
   }) => {
-    await page.goto('/ui/npm');
+    await page.goto('/ui/docker');
     const input = page.locator('input[name="q"]');
     await expect(input).toBeVisible();
     // Verify HTMX attributes

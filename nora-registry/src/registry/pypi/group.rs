@@ -46,23 +46,10 @@ async fn index(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         let state = repository.state(&root);
-        if named::is_proxy(&state) {
-            match named::known_projects(&state).await {
-                Ok(known) => names.extend(known),
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            }
-        } else {
-            let keys = match state.storage.list("pypi/").await {
-                Ok(keys) => keys,
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            names.extend(
-                keys.iter()
-                    .filter_map(|key| key.strip_prefix("pypi/")?.split('/').next())
-                    .filter(|name| model::valid_name(name))
-                    .map(str::to_owned),
-            );
-        }
+        match known_packages(&state).await {
+            Ok(known) => names.extend(known),
+            Err(status) => return status.into_response(),
+        };
     }
     package_list_response(
         &root,
@@ -100,14 +87,17 @@ async fn lookup(state: &AppState, name: &str) -> Lookup<Package, Box<Response>> 
                 crate::curation::RegistryType::PyPI,
                 name,
             ) {
-                return Lookup::Failure(Box::new(response));
+                return Lookup::Failure(Box::new(crate::audit::attribute_refusal(state, response)));
             }
             match named::ensure(state, name).await {
                 Ok(view) if view.snapshot.project.is_some() => {
                     Lookup::Present(Package::Proxy(view))
                 }
                 Ok(_) | Err(crate::registry::ProxyError::NotFound) => Lookup::Absent,
-                Err(error) => Lookup::Failure(Box::new(named::failure(error))),
+                Err(error) => Lookup::Failure(Box::new(crate::audit::attribute_refusal(
+                    state,
+                    named::failure(error),
+                ))),
             }
         }
         RepositoryConfig::Group(_) => {
@@ -153,9 +143,9 @@ async fn project(
     };
     let state = selection.repository.state(&root);
     let mount = PypiMount(groups::bound_prefix(&mount.prefix, &selection.binding));
-    match selection.package {
+    let response = match selection.package {
         Package::Local => {
-            package_versions(State(state), Extension(mount), Path(name), headers).await
+            package_versions(State(state.clone()), Extension(mount), Path(name), headers).await
         }
         Package::Proxy(view) => {
             named::project_view(
@@ -167,7 +157,8 @@ async fn project(
             )
             .await
         }
-    }
+    };
+    crate::audit::attribute_refusal(&state, response)
 }
 
 async fn file(
@@ -210,12 +201,14 @@ async fn download(
         Package::Local => None,
         Package::Proxy(view) => Some(Extension(view)),
     };
-    download_file(
-        State(selection.repository.state(&root)),
+    let state = selection.repository.state(&root);
+    let response = download_file(
+        State(state.clone()),
         method,
         headers,
         Path((name, filename)),
         prepared,
     )
-    .await
+    .await;
+    crate::audit::attribute_refusal(&state, response)
 }

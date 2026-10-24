@@ -1,0 +1,34 @@
+# Explicit opt-in aliases for smoke/CI fixtures, never the server's default configuration.
+[repositories.smoke-npm-local]
+format = "npm"
+kind = "local"
+paths = ["/npm-local/"]
+
+[repositories.smoke-npm-public]
+format = "npm"
+kind = "proxy"
+paths = ["/npm-public/"]
+upstream = "https://registry.npmjs.org"
+
+[repositories.smoke-npm]
+format = "npm"
+kind = "group"
+paths = ["/npm/"]
+members = ["smoke-npm-local", "smoke-npm-public"]
+
+[repositories.smoke-python-local]
+format = "pypi"
+kind = "local"
+paths = ["/simple-local/"]
+
+[repositories.smoke-python-public]
+format = "pypi"
+kind = "proxy"
+paths = ["/simple-public/"]
+upstream = "https://pypi.org/simple/"
+
+[repositories.smoke-python]
+format = "pypi"
+kind = "group"
+paths = ["/simple/"]
+members = ["smoke-python-local", "smoke-python-public"]

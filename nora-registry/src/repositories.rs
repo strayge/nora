@@ -305,6 +305,12 @@ impl RepositoryCatalogue {
             let parts: Vec<_> = key.split('/').collect();
             let Some(name) = parts.get(1) else { continue };
             match self.members.get(*name) {
+                None if self.groups.contains_key(*name)
+                    && parts.len() == 3
+                    && matches!(
+                        parts[2],
+                        ".nora-repository.json" | ".nora-repository.json.sha256"
+                    ) => {}
                 None => {
                     retained.insert(format!("repositories/{name}/"));
                 }
@@ -395,10 +401,9 @@ impl RepositoryCatalogue {
     pub(crate) async fn gc(&self, root: &AppState) {
         for member in self.members() {
             let state = member.state(root);
-            let result = crate::gc_pass(
+            let result = crate::gc::run_gc(
                 &state.storage,
                 &state.publish_locks,
-                &state.repo_index,
                 root.config.gc.dry_run,
                 root.config.gc.grace_secs,
                 matches!(member.definition, RepositoryConfig::Proxy(_)),
@@ -406,6 +411,9 @@ impl RepositoryCatalogue {
             )
             .instrument(tracing::info_span!("repository_gc", repository = %member.name))
             .await;
+            if !root.config.gc.dry_run && result.removed_anything() {
+                member.index.invalidate_all();
+            }
             tracing::info!(repository = %member.name, source = %member.source_id,
                 deleted = result.deleted, "Named repository GC finished");
         }
@@ -414,19 +422,75 @@ impl RepositoryCatalogue {
     pub(crate) async fn retain(&self, root: &AppState) {
         for member in self.members() {
             let state = member.state(root);
-            let result = crate::retention_pass(
+            let result = crate::retention::run_retention(
                 &state.storage,
                 &state.publish_locks,
-                &state.repo_index,
                 state.signer.as_deref(),
                 &root.config.retention.rules,
                 root.config.retention.dry_run,
-                &root.audit,
             )
             .instrument(tracing::info_span!("repository_retention", repository = %member.name))
             .await;
+            crate::record_retention_result(
+                &result,
+                &state.repo_index,
+                root.config.retention.dry_run,
+                &root.audit,
+                Some(member),
+            );
             tracing::info!(repository = %member.name, deleted = result.deleted_keys,
                 "Named repository retention finished");
+        }
+    }
+
+    pub(crate) async fn stored_totals(
+        &self,
+        registry: crate::registry_type::RegistryType,
+    ) -> (usize, usize, u64) {
+        let (mut packages, mut artifacts, mut bytes) = (0, 0, 0);
+        for member in self
+            .members()
+            .filter(|member| member.registry_type() == registry)
+        {
+            let items = member.index.get(registry.as_str(), &member.storage).await;
+            packages += items.iter().filter(|item| item.versions > 0).count();
+            artifacts += items.iter().map(|item| item.versions).sum::<usize>();
+            bytes += items.iter().map(|item| item.size).sum::<u64>();
+        }
+        (packages, artifacts, bytes)
+    }
+
+    pub(crate) async fn refresh_gauges(
+        &self,
+        enabled: &std::collections::HashSet<crate::registry_type::RegistryType>,
+    ) {
+        for registry in [
+            crate::registry_type::RegistryType::Npm,
+            crate::registry_type::RegistryType::PyPI,
+        ] {
+            let (mut packages, mut bytes) = (0, 0);
+            for member in self
+                .members()
+                .filter(|member| enabled.contains(&registry) && member.registry_type() == registry)
+            {
+                let items = member.index.get(registry.as_str(), &member.storage).await;
+                let count = items.iter().filter(|item| item.versions > 0).count();
+                let size = items.iter().map(|item| item.size).sum::<u64>();
+                packages += count;
+                bytes += size;
+                crate::metrics::REPOSITORY_ARTIFACTS
+                    .with_label_values(&[&member.name, registry.as_str()])
+                    .set(items.iter().map(|item| item.versions).sum::<usize>() as i64);
+                crate::metrics::REPOSITORY_STORAGE_BYTES
+                    .with_label_values(&[&member.name, registry.as_str()])
+                    .set(size as i64);
+            }
+            crate::metrics::ARTIFACTS_TOTAL
+                .with_label_values(&[registry.as_str()])
+                .set(packages as i64);
+            crate::metrics::STORAGE_BYTES
+                .with_label_values(&[registry.as_str()])
+                .set(bytes as i64);
         }
     }
 

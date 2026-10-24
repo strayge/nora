@@ -30,6 +30,43 @@ fn group_source(format: &str, owners: &str) -> String {
 }
 
 #[test]
+fn removed_singletons_cannot_reenable_defaults_but_curation_and_format_selection_remain_valid() {
+    let _lock = crate::test_env::env_lock();
+    for source in [
+        "[npm]",
+        "[pypi]",
+        "[npm]\nproxy='https://registry.example'",
+        "[pypi]\nproxies=['https://registry.example']",
+    ] {
+        let error = toml::from_str::<Config>(source).unwrap_err().to_string();
+        assert!(error.contains("[repositories.<name>]"), "{error}");
+    }
+    let default = Config::default();
+    assert!(
+        default.repositories.is_empty()
+            && default.npm.upstream_urls().is_empty()
+            && default.pypi.upstreams().is_empty()
+    );
+    let config=parse("[registries]\nenable=['npm','pypi']\n[curation.npm]\nquarantine='observe'\n[curation.pypi]\nquarantine='enforce'");
+    assert!(config.curation.npm.quarantine.is_some() && config.curation.pypi.quarantine.is_some());
+    assert!(errors(&config).is_empty());
+}
+
+#[test]
+fn a_configured_repository_cannot_silently_enable_a_disabled_format() {
+    let _lock = crate::test_env::env_lock();
+    for format in ["npm", "pypi"] {
+        let config = parse(&format!(
+            "[registries]\nenable=['maven']\n{}",
+            local("disabled", format, "/disabled/")
+        ));
+        assert!(errors(&config)
+            .iter()
+            .any(|error| error.contains("repositories.disabled") && error.contains("disabled")));
+    }
+}
+
+#[test]
 fn plan_example_and_builtins() {
     let _lock = crate::test_env::env_lock();
     let source = r#"

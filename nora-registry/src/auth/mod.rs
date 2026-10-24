@@ -3750,7 +3750,9 @@ mod web_surface_gating_tests {
     #[tokio::test]
     async fn test_opportunistic_basic_auth_on_open_surface() {
         let ctx = create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
-            c.npm.proxy = Some("https://registry.npmjs.org".into());
+            c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(
+                "https://repo.example.com".into(),
+            )];
         });
 
         // Anonymous: proxy_upstreams redacted
@@ -3782,11 +3784,11 @@ mod web_surface_gating_tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["registry"].as_str() == Some("npm"))
-            .expect("npm mount");
+            .find(|m| m["registry"].as_str() == Some("Maven"))
+            .expect("Maven mount");
         assert!(
             !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
-            "authenticated must see populated proxy_upstreams for npm"
+            "authenticated must see populated proxy_upstreams for Maven"
         );
     }
 
@@ -3814,7 +3816,9 @@ mod web_surface_gating_tests {
     #[tokio::test]
     async fn test_opportunistic_bearer_auth_on_open_surface() {
         let ctx = create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
-            c.npm.proxy = Some("https://registry.npmjs.org".into());
+            c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(
+                "https://repo.example.com".into(),
+            )];
         });
 
         let token = ctx
@@ -3841,8 +3845,8 @@ mod web_surface_gating_tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["registry"].as_str() == Some("npm"))
-            .expect("npm mount");
+            .find(|m| m["registry"].as_str() == Some("Maven"))
+            .expect("Maven mount");
         assert!(
             !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
             "bearer-authenticated must see populated proxy_upstreams"

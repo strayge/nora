@@ -12,7 +12,7 @@ use crate::AppState;
 use crate::Storage;
 use axum::{
     extract::{Path, Query, State},
-    response::Json,
+    response::{IntoResponse, Json, Response},
     Extension,
 };
 use serde::{Deserialize, Serialize};
@@ -159,10 +159,20 @@ pub struct MountPoint {
 pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
     // Trigger index rebuild if needed, then get counts
     for reg in state.enabled_registries.iter() {
-        let _ = state.repo_index.get(reg.as_str(), &state.storage).await;
+        if !matches!(reg, RegistryType::Npm | RegistryType::PyPI) {
+            let _ = state.repo_index.get(reg.as_str(), &state.storage).await;
+        }
     }
 
-    let counts = state.repo_index.counts();
+    let mut counts = state.repo_index.counts();
+    for reg in [RegistryType::Npm, RegistryType::PyPI] {
+        let total = if state.enabled_registries.contains(&reg) {
+            state.repositories.stored_totals(reg).await.0
+        } else {
+            0
+        };
+        counts.insert(reg, total);
+    }
     let get = |rt: RegistryType| counts.get(&rt).copied().unwrap_or(0);
     Json(RegistryStats {
         docker: get(RegistryType::Docker),
@@ -209,9 +219,16 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
         }
 
         let name = reg.as_str();
-        let repos = state.repo_index.get(name, &state.storage).await;
-        let size: u64 = repos.iter().map(|r| r.size).sum();
-        let versions: usize = repos.iter().map(|r| r.versions).sum();
+        let (versions, size) = if matches!(reg, RegistryType::Npm | RegistryType::PyPI) {
+            let (_, artifacts, bytes) = state.repositories.stored_totals(*reg).await;
+            (artifacts, bytes)
+        } else {
+            let repos = state.repo_index.get(name, &state.storage).await;
+            (
+                repos.iter().map(|item| item.versions).sum(),
+                repos.iter().map(|item| item.size).sum(),
+            )
+        };
 
         total_storage += size;
         total_artifacts += versions;
@@ -224,6 +241,24 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             size_bytes: size,
         });
 
+        if matches!(reg, RegistryType::Npm | RegistryType::PyPI) {
+            for (repository, definition) in &state.config.repositories {
+                let format = match definition.format() {
+                    crate::config::repositories::RepositoryFormat::Npm => RegistryType::Npm,
+                    crate::config::repositories::RepositoryFormat::Pypi => RegistryType::PyPI,
+                };
+                if format == *reg {
+                    for path in definition.paths() {
+                        mount_points.push(MountPoint {
+                            registry: format!("{repository} ({name})"),
+                            mount_path: path.clone(),
+                            proxy_upstreams: vec![],
+                        });
+                    }
+                }
+            }
+            continue;
+        }
         let proxy_upstreams: Vec<String> = if authenticated {
             match reg {
                 RegistryType::Docker => state
@@ -305,16 +340,28 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
 pub async fn api_list(
     State(state): State<AppState>,
     Path(registry_type): Path<String>,
-) -> Json<Vec<RepoInfo>> {
+) -> Response {
+    if matches!(
+        RegistryType::from_str_opt(&registry_type),
+        Some(RegistryType::Npm | RegistryType::PyPI)
+    ) {
+        return super::repositories::selection_required();
+    }
     let repos = state.repo_index.get(&registry_type, &state.storage).await;
-    Json((*repos).clone())
+    Json((*repos).clone()).into_response()
 }
 
 pub async fn api_detail(
     State(state): State<AppState>,
     Path((registry_type, name)): Path<(String, String)>,
-) -> Json<serde_json::Value> {
-    match RegistryType::from_str_opt(&registry_type) {
+) -> Response {
+    if matches!(
+        RegistryType::from_str_opt(&registry_type),
+        Some(RegistryType::Npm | RegistryType::PyPI)
+    ) {
+        return super::repositories::selection_required();
+    }
+    let result = match RegistryType::from_str_opt(&registry_type) {
         Some(RegistryType::Docker) => {
             let detail = get_docker_detail(&state, &name).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
@@ -328,14 +375,21 @@ pub async fn api_detail(
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         _ => Json(serde_json::json!({})),
-    }
+    };
+    result.into_response()
 }
 
 pub async fn api_search(
     State(state): State<AppState>,
     Path(registry_type): Path<String>,
     Query(params): Query<SearchQuery>,
-) -> axum::response::Html<String> {
+) -> Response {
+    if matches!(
+        RegistryType::from_str_opt(&registry_type),
+        Some(RegistryType::Npm | RegistryType::PyPI)
+    ) {
+        return super::repositories::selection_required();
+    }
     let query = params.q.unwrap_or_default().to_lowercase();
 
     let repos = state.repo_index.get(&registry_type, &state.storage).await;
@@ -387,7 +441,7 @@ pub async fn api_search(
             .join("")
     };
 
-    axum::response::Html(html)
+    axum::response::Html(html).into_response()
 }
 
 pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
@@ -2001,27 +2055,7 @@ fn apply_cpan_release_filter(
 }
 
 fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
-    // Handle both .tar.gz and .whl files
-    let clean_name = name.replace('-', "_");
-
-    if ends_with_ci(filename, ".tar.gz") {
-        // package-1.0.0.tar.gz
-        let base = filename.strip_suffix(".tar.gz")?;
-        let version = base
-            .strip_prefix(&format!("{}-", name))
-            .or_else(|| base.strip_prefix(&format!("{}-", clean_name)))?;
-        Some(version.to_string())
-    } else if ends_with_ci(filename, ".whl") {
-        // package-1.0.0-py3-none-any.whl
-        let parts: Vec<_> = filename.split('-').collect();
-        if parts.len() >= 2 {
-            Some(parts[1].to_string())
-        } else {
-            None
-        }
-    } else {
-        None
-    }
+    nora_registry::pypi_files::parse_pypi_version(name, filename)
 }
 
 pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {

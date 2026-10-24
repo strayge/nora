@@ -122,6 +122,8 @@ async fn context(config: Config, storage: Option<crate::Storage>) -> TestContext
         target.server.public_url = Some("https://nora.example/base".into());
         target.repositories = config.repositories;
         target.circuit_breaker = config.circuit_breaker;
+        target.audit = config.audit;
+        target.curation = config.curation;
     };
     with_named_repositories(match storage {
         Some(storage) => create_test_context_with_storage_and_config(storage, customize),
@@ -271,6 +273,365 @@ async fn mount(
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"core metadata"))
             .mount(server)
             .await;
+    }
+}
+
+#[tokio::test]
+async fn browser_group_views_never_refresh_mutate_or_infer_absence_from_an_uncached_proxy() {
+    let _lock = crate::test_env::env_lock();
+    for format in [Format::Npm, Format::Pypi] {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        mount(format, &a, "pkg", &[("1.0.0", b"body")], true).await;
+        let (storage, counts) = crate::test_helpers::op_counting_storage();
+        let context = context(
+            configuration(format, Some((&a.uri(), &b.uri())), false, ""),
+            Some(storage.clone()),
+        )
+        .await;
+        assert_eq!(
+            send(
+                &context.app,
+                Method::GET,
+                "/api/ui/repositories/all/package/pkg",
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            a.received_requests().await.unwrap().is_empty()
+                && b.received_requests().await.unwrap().is_empty()
+        );
+        assert_eq!(
+            document(format, &context, "/a/", "pkg").await.0,
+            StatusCode::OK
+        );
+        let mut keys = storage.list("").await.unwrap();
+        keys.extend(storage.list_internal("repositories/").await.unwrap());
+        keys.sort();
+        keys.dedup();
+        let mut before = Vec::new();
+        for key in &keys {
+            before.push((key.clone(), storage.get(key).await.unwrap()));
+        }
+        counts.reset();
+        for uri in [
+            "/api/ui/repositories/all/package/pkg",
+            "/ui/repositories/all/package/pkg",
+            "/api/ui/repositories/all",
+        ] {
+            assert_eq!(
+                send(&context.app, Method::GET, uri, "").await.status(),
+                StatusCode::OK,
+                "{format:?}: {uri}"
+            );
+        }
+        assert_eq!(counts.snapshot().get("put").copied().unwrap_or(0), 0);
+        assert_eq!(counts.snapshot().get("delete").copied().unwrap_or(0), 0);
+        let mut after = storage.list("").await.unwrap();
+        after.extend(storage.list_internal("repositories/").await.unwrap());
+        after.sort();
+        after.dedup();
+        assert_eq!(after, keys);
+        for (key, bytes) in before {
+            assert_eq!(storage.get(&key).await.unwrap(), bytes, "{key}");
+        }
+        assert_eq!(a.received_requests().await.unwrap().len(), 1);
+        assert!(b.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn direct_fetch_and_group_cache_audits_record_the_selected_member_and_source() {
+    let _lock = crate::test_env::env_lock();
+    for format in [Format::Npm, Format::Pypi] {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        mount(format, &a, "pkg", &[("1.0.0", b"body")], false).await;
+        let mut config = configuration(format, Some((&a.uri(), &b.uri())), false, "");
+        config.audit.mode = crate::audit::AuditMode::File;
+        let context = context(config, None).await;
+        let (_, metadata) = document(format, &context, "/a/", "pkg").await;
+        let response = send(
+            &context.app,
+            Method::GET,
+            &request_path(url(format, &metadata)),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await.as_ref(), b"body");
+        let member = context.state.repositories.get("a").unwrap();
+        let body = if format == Format::Npm {
+            format!("npm/pkg/tarballs/{}", format.filename("pkg", "1.0.0"))
+        } else {
+            format!("pypi/pkg/{}", format.filename("pkg", "1.0.0"))
+        };
+        let proof = if format == Format::Npm {
+            crate::registry::npm::origin_key(&body)
+        } else {
+            crate::registry::pypi_ready_key_for_body(&body).unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while member.storage.stat(&proof).await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, metadata) = document(format, &context, "/group/", "pkg").await;
+        let response = send(
+            &context.app,
+            Method::GET,
+            &request_path(url(format, &metadata)),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await.as_ref(), b"body");
+        context.state.audit.shutdown().await;
+        let entries: Vec<Value> = std::fs::read_to_string(context.state.audit.path())
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["action"] == "proxy_fetch" || entry["action"] == "cache_hit")
+            .collect();
+        for action in ["proxy_fetch", "cache_hit"] {
+            assert!(
+                entries.iter().any(|entry| entry["action"] == action
+                    && entry["repository"] == "a"
+                    && entry["source_id"] == member.source_id),
+                "{format:?}: {entries:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn direct_and_group_refusals_keep_the_actual_member_and_source() {
+    let _lock = crate::test_env::env_lock();
+    for format in [Format::Npm, Format::Pypi] {
+        for proxy in [false, true] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            let mut config = configuration(
+                format,
+                proxy
+                    .then(|| (a.uri(), b.uri()))
+                    .as_ref()
+                    .map(|(a, b)| (a.as_str(), b.as_str())),
+                false,
+                "",
+            );
+            let policy = tempfile::tempdir().unwrap();
+            let blocklist = policy.path().join("blocklist.json");
+            config.audit.mode = crate::audit::AuditMode::File;
+            if proxy {
+                config.curation.internal_namespaces = vec!["pkg".into()];
+            } else {
+                std::fs::write(&blocklist,serde_json::to_vec(&json!({"version":1,"rules":[{"registry":format.name(),"name":"pkg","version":"*","reason":"blocked"}]})).unwrap()).unwrap();
+                config.curation.mode = crate::config::CurationMode::Enforce;
+                config.curation.blocklist_path = Some(blocklist.to_str().unwrap().into());
+            }
+            let context = context(config, None).await;
+            if !proxy {
+                publish(format, &context, "/a/", "pkg", "1.0.0", b"body", false).await;
+            }
+            for prefix in ["/a/", "/group/"] {
+                let path = if proxy {
+                    format!("{prefix}pkg/")
+                } else if format == Format::Npm {
+                    format!("{prefix}pkg/-/{}", format.filename("pkg", "1.0.0"))
+                } else {
+                    format!("{prefix}pkg/{}", format.filename("pkg", "1.0.0"))
+                };
+                let path = if proxy && format == Format::Npm {
+                    path.trim_end_matches('/').to_owned()
+                } else {
+                    path
+                };
+                let response = send(&context.app, Method::GET, &path, "").await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{format:?} {proxy}: {path}"
+                );
+            }
+            if proxy {
+                for prefix in ["/ui/repositories", "/api/ui/repositories"] {
+                    let response = send(
+                        &context.app,
+                        Method::GET,
+                        &format!("{prefix}/all/package/pkg"),
+                        "",
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+            }
+            context.state.audit.shutdown().await;
+            let member = context.state.repositories.get("a").unwrap();
+            let entries: Vec<Value> = std::fs::read_to_string(context.state.audit.path())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|entry| entry["action"] == "curation_block")
+                .collect();
+            assert_eq!(
+                entries.len(),
+                if proxy { 4 } else { 2 },
+                "{format:?} {proxy}: {entries:?}"
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry["repository"] == "a"
+                        && entry["source_id"] == member.source_id),
+                "{format:?} {proxy}: {entries:?}"
+            );
+            assert!(a.received_requests().await.unwrap().is_empty());
+            assert!(b.received_requests().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inaccessible_local_pypi_inventory_is_not_absence_for_protocol_or_browser_groups() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = crate::test_env::env_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let storage = crate::Storage::new_local(directory.path().to_str().unwrap());
+    let context = context(configuration(Format::Pypi, None, false, ""), Some(storage)).await;
+    publish(Format::Pypi, &context, "/a/", "pkg", "1.0.0", b"a", false).await;
+    publish(Format::Pypi, &context, "/b/", "pkg", "2.0.0", b"b", false).await;
+    let parent = directory.path().join("repositories/a/sources/local/pypi");
+    for (path, mode) in [(parent.clone(), 0), (parent.join("pkg"), 0o400)] {
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let mut statuses = Vec::new();
+        for uri in [
+            "/group/pkg/",
+            "/ui/repositories/all/package/pkg",
+            "/api/ui/repositories/all/package/pkg",
+        ] {
+            statuses.push(send(&context.app, Method::GET, uri, "").await.status());
+        }
+        let inaccessible = std::fs::metadata(
+            parent
+                .join("pkg")
+                .join(Format::Pypi.filename("pkg", "1.0.0")),
+        )
+        .is_err();
+        std::fs::set_permissions(&path, permissions).unwrap();
+        if inaccessible {
+            assert_eq!(
+                statuses,
+                vec![StatusCode::SERVICE_UNAVAILABLE; 3],
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn transfer_time_integrity_refusals_survive_coalescing_and_keep_source_attribution() {
+    let _lock = crate::test_env::env_lock();
+    let format = Format::Pypi;
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    mount(format, &a, "pkg", &[("1.0.0", b"body")], false).await;
+    let policy = tempfile::tempdir().unwrap();
+    let allowlist = policy.path().join("allowlist.json");
+    std::fs::write(
+        &allowlist,
+        r#"{"version":1,"entries":[{"registry":"pypi","name":"pkg","version":"1.0.0"}]}"#,
+    )
+    .unwrap();
+    let mut config = configuration(format, Some((&a.uri(), &b.uri())), false, "");
+    config.audit.mode = crate::audit::AuditMode::File;
+    config.curation.mode = crate::config::CurationMode::Enforce;
+    config.curation.require_integrity = true;
+    config.curation.allowlist_path = Some(allowlist.to_str().unwrap().into());
+    let context = context(config, None).await;
+    for prefix in ["/a/", "/group/"] {
+        let response = send(
+            &context.app,
+            Method::GET,
+            &format!("{prefix}pkg/{}", format.filename("pkg", "1.0.0")),
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()["x-nora-rule"], "allowlist:integrity");
+    }
+    context.state.audit.shutdown().await;
+    let member = context.state.repositories.get("a").unwrap();
+    let entries: Vec<Value> = std::fs::read_to_string(context.state.audit.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|entry| entry["action"] == "curation_block")
+        .collect();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(entries
+        .iter()
+        .all(|entry| entry["repository"] == "a" && entry["source_id"] == member.source_id));
+    let requests = a.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().starts_with("/files/"))
+            .count(),
+        2
+    );
+    assert!(b.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn group_and_browser_catalogues_include_metadata_only_packages_without_crawling_sources() {
+    let _lock = crate::test_env::env_lock();
+    for format in [Format::Npm, Format::Pypi] {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        mount(format, &a, "pkg", &[("1.0.0", b"body")], true).await;
+        let context = context(
+            configuration(format, Some((&a.uri(), &b.uri())), false, ""),
+            None,
+        )
+        .await;
+        for phase in [false, true] {
+            if phase {
+                assert_eq!(
+                    document(format, &context, "/a/", "pkg").await.0,
+                    StatusCode::OK
+                );
+            }
+            for uri in ["/group/", "/api/ui/repositories/all"] {
+                let response = send_with_headers(
+                    &context.app,
+                    Method::GET,
+                    uri,
+                    vec![(
+                        "accept",
+                        "application/vnd.pypi.simple.v1+json, application/json",
+                    )],
+                    "",
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+                assert_eq!(body.contains("\"pkg\""), phase, "{format:?}: {uri}: {body}");
+            }
+            assert_eq!(
+                a.received_requests().await.unwrap().len(),
+                usize::from(phase)
+            );
+            assert!(b.received_requests().await.unwrap().is_empty());
+        }
     }
 }
 

@@ -349,6 +349,13 @@ pub(crate) fn parse_env_warn<T: std::str::FromStr + std::fmt::Display>(
     }
 }
 
+fn removed_repository_table<'de, D, T>(_: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom("[npm] and [pypi] were removed; configure explicit [repositories.<name>] with format, kind and paths (including /npm/ or /simple/ only if wanted)"))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -359,9 +366,17 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub maven: MavenConfig,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_repository_table"
+    )]
     pub npm: NpmConfig,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_repository_table"
+    )]
     pub pypi: PypiConfig,
     #[serde(default)]
     pub docker: DockerConfig,
@@ -728,11 +743,10 @@ impl Config {
         match rt {
             RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
             RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
-            RegistryType::Npm => self.npm.enabled && !self.npm.upstream_urls().is_empty(),
+            RegistryType::Npm | RegistryType::PyPI => self.enabled_registries_quiet().contains(&rt) && self.repositories.values().any(|repository| {
+                matches!(repository, repositories::RepositoryConfig::Proxy(proxy) if match proxy.format { repositories::RepositoryFormat::Npm => rt == RegistryType::Npm, repositories::RepositoryFormat::Pypi => rt == RegistryType::PyPI })
+            }),
             RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
-            RegistryType::PyPI => {
-                self.pypi.enabled && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty())
-            }
             RegistryType::Go => self.go.enabled && self.go.proxy.is_some(),
             RegistryType::Raw => false, // raw file storage has no upstream
             RegistryType::Gems => self.gems.enabled && self.gems.proxy.is_some(),
@@ -873,32 +887,15 @@ impl Config {
         if self.go.proxy_auth.is_some() && std::env::var("NORA_GO_PROXY_AUTH").is_err() {
             tracing::warn!("Go proxy credentials in config.toml are plaintext — consider NORA_GO_PROXY_AUTH env var");
         }
-        // npm
-        if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
-            tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
-        }
-        // npm multi-upstream (#1055): Basic `auth` on an entry is plaintext; Bearer is env-only.
-        for proxy in &self.npm.proxies {
-            if let NpmProxyEntry::Full(p) = proxy {
-                if p.auth.is_some() {
-                    tracing::warn!(
-                        url = %p.url,
-                        "npm upstream credentials in config.toml are plaintext — consider auth_bearer_env"
-                    );
+        for (name, definition) in &self.repositories {
+            if let repositories::RepositoryConfig::Proxy(proxy) = definition {
+                if proxy.auth.is_some() {
+                    let origin = reqwest::Url::parse(&proxy.upstream)
+                        .ok()
+                        .map(|url| url.origin().ascii_serialization())
+                        .unwrap_or_else(|| "invalid origin".into());
+                    tracing::warn!(repository=%name,%origin,"Repository Basic credentials in config.toml are plaintext — protect the configuration file; npm can use auth_bearer_env");
                 }
-            }
-        }
-        // PyPI
-        if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
-            tracing::warn!("PyPI proxy credentials in config.toml are plaintext — consider NORA_PYPI_PROXY_AUTH env var");
-        }
-        // PyPI multi-upstream proxies (#663)
-        for proxy in &self.pypi.proxies {
-            if proxy.auth().is_some() && std::env::var("NORA_PYPI_PROXIES").is_err() {
-                tracing::warn!(
-                    url = %proxy.url(),
-                    "PyPI upstream credentials in config.toml are plaintext — consider NORA_PYPI_PROXIES env var"
-                );
             }
         }
         // Cargo
@@ -972,14 +969,6 @@ impl Config {
                 }
             }
         }
-        // npm: every upstream, private ones included (#1055) — a private registry
-        // host in a served packument is exactly the leak this list exists to catch.
-        for url in self.npm.upstream_urls() {
-            if let Some(host) = extract_host(url) {
-                result.push((RegistryType::Npm.as_str().to_string(), host));
-            }
-        }
-
         for repository in self.repositories.values() {
             if let repositories::RepositoryConfig::Proxy(proxy) = repository {
                 if let Some(host) = reqwest::Url::parse(&proxy.upstream)
@@ -1044,21 +1033,6 @@ impl Config {
                 if let Some(host) = extract_host(entry.url()) {
                     result.push((name.to_string(), host));
                 }
-            }
-        }
-
-        // PyPI upstreams: Vec<PypiProxyEntry> via upstreams() so the multi-upstream
-        // list (#663) AND the legacy single `proxy` are both registered with the
-        // leak detector — otherwise a secondary upstream's host (e.g. an internal
-        // mirror with embedded credentials) would be invisible to leak scanning.
-        for up in self.pypi.upstreams() {
-            if let Some(host) = extract_host(up.url()) {
-                result.push((
-                    crate::registry_type::RegistryType::PyPI
-                        .as_str()
-                        .to_string(),
-                    host,
-                ));
             }
         }
 
@@ -1539,18 +1513,20 @@ impl Config {
                         tracing::info!(path = %fallback, "Loaded config");
                         cfg
                     }
-                    Err(source) if content.contains("repositories") => {
+                    Err(source) => {
                         return Err(ConfigLoadError::InvalidToml {
                             path: fallback.to_string(),
                             source,
                         });
                     }
-                    Err(e) => {
-                        tracing::warn!(path = %fallback, error = %e, "config exists but contains invalid TOML, using defaults");
-                        Config::default()
-                    }
                 },
-                Err(_) => Config::default(),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Config::default(),
+                Err(source) => {
+                    return Err(ConfigLoadError::Unreadable {
+                        path: fallback.to_owned(),
+                        source,
+                    })
+                }
             }
         };
 
@@ -1594,9 +1570,11 @@ impl Config {
                     .map_err(|e| format!("Cannot read {}: {}", path, e))?;
                 Some((path, content))
             }
-            Err(_) => fs::read_to_string(DEFAULT_CONFIG_FILE)
-                .ok()
-                .map(|content| (DEFAULT_CONFIG_FILE.to_string(), content)),
+            Err(_) => match fs::read_to_string(DEFAULT_CONFIG_FILE) {
+                Ok(content) => Some((DEFAULT_CONFIG_FILE.to_string(), content)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("Cannot read {DEFAULT_CONFIG_FILE}: {error}")),
+            },
         };
         // one path for both sources, so neither can skip the unknown-key check
         let mut config: Config = match file {
@@ -1626,6 +1604,25 @@ impl Config {
     /// audit mode, storage mode) has an unrecognized value — typos must not silently
     /// disable security or misconfigure storage.
     fn apply_env_overrides(&mut self) -> Result<(), String> {
+        for key in [
+            "NORA_NPM_ENABLED",
+            "NORA_NPM_PROXY",
+            "NORA_NPM_PROXY_AUTH",
+            "NORA_NPM_PROXY_TIMEOUT",
+            "NORA_NPM_METADATA_TTL",
+            "NORA_NPM_SERVE_STALE",
+            "NORA_NPM_REVALIDATE",
+            "NORA_NPM_IMPORT_EMBEDDED",
+            "NORA_PYPI_ENABLED",
+            "NORA_PYPI_PROXY",
+            "NORA_PYPI_PROXY_AUTH",
+            "NORA_PYPI_PROXIES",
+            "NORA_PYPI_PROXY_TIMEOUT",
+        ] {
+            if env::var_os(key).is_some() {
+                return Err(format!("{key} was removed; use explicit [repositories.<name>] policies and [registries].enable instead"));
+            }
+        }
         // Server + TLS
         self.server.apply_env_overrides();
         self.tls.apply_env_overrides();
@@ -1639,13 +1636,11 @@ impl Config {
         // Registry configs (each handles its own NORA_*_ENABLED + format-specific vars)
         self.docker.apply_env_overrides();
         self.maven.apply_env_overrides();
-        self.npm.apply_env_overrides();
         for repository in self.repositories.values_mut() {
             if let repositories::RepositoryConfig::Proxy(proxy) = repository {
                 proxy.resolve_credentials();
             }
         }
-        self.pypi.apply_env_overrides();
         self.go.apply_env_overrides();
         self.cargo.apply_env_overrides();
         self.raw.apply_env_overrides();
@@ -1713,7 +1708,10 @@ mod tests {
         // The defaults proxy public registries: off by default is announced as implicit.
         match Config::default().curation_mode_notice() {
             Some(CurationModeNotice::Implicit(proxies)) => {
-                assert!(proxies.contains(&RegistryType::Npm), "{proxies:?}");
+                assert!(
+                    !proxies.contains(&RegistryType::Npm) && !proxies.contains(&RegistryType::PyPI),
+                    "{proxies:?}"
+                );
                 assert!(proxies.contains(&RegistryType::Docker), "{proxies:?}");
             }
             other => panic!("default config: {other:?}"),
@@ -2031,25 +2029,30 @@ mod tests {
         std::fs::write(
             &path,
             r#"
-[npm]
-proxies = [
-  "https://registry.npmjs.org",
-  { url = "https://npm.vendor.example", scopes = ["@vendor"], auth_bearer_env = "NORA_TEST_NPM_VENDOR_TOKEN" },
-]
+[repositories.public]
+format = "npm"
+kind = "proxy"
+paths = ["/public/"]
+upstream = "https://registry.npmjs.org"
+[repositories.vendor]
+format = "npm"
+kind = "proxy"
+paths = ["/vendor/"]
+upstream = "https://npm.vendor.example"
+auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
 "#,
         )
         .unwrap();
         let path = path.to_string_lossy().into_owned();
 
-        std::env::set_var("NORA_TEST_NPM_VENDOR_TOKEN", "tok-from-env");
+        std::env::set_var("NORA_NPM_VENDOR_TOKEN", "tok-from-env");
         let loaded = Config::load_from(Some(path.clone()), NO_FALLBACK, false).map(|(c, _)| c);
-        std::env::remove_var("NORA_TEST_NPM_VENDOR_TOKEN");
+        std::env::remove_var("NORA_NPM_VENDOR_TOKEN");
         let config = loaded.expect("a set token loads");
-        let up = config.npm.route("@vendor/a").unwrap();
-        assert_eq!(
-            up.auth.unwrap().header_value().unwrap(),
-            "Bearer tok-from-env"
-        );
+        let repositories::RepositoryConfig::Proxy(proxy) = &config.repositories["vendor"] else {
+            panic!("proxy")
+        };
+        assert_eq!(proxy.auth_bearer.as_ref().unwrap().expose(), "tok-from-env");
         assert!(config
             .upstream_hostnames()
             .contains(&("npm".to_string(), "npm.vendor.example".to_string())));
@@ -2057,16 +2060,8 @@ proxies = [
         // Unset token: the config is rejected at load, not served with silent 401s.
         assert!(Config::load_from(Some(path), NO_FALLBACK, false).is_err());
 
-        let mut bad = Config::default();
-        bad.npm.proxies = vec![
-            NpmProxyEntry::Simple("https://registry.npmjs.org".into()),
-            NpmProxyEntry::Simple("https://mirror.example".into()),
-        ];
-        let (_, errors) = bad.validate_with_config_path(None);
-        assert!(
-            errors.iter().any(|e| e.contains("have no scopes")),
-            "{errors:?}"
-        );
+        assert!(!toml::to_string(&config).unwrap().contains("[npm]"));
+        assert!(config.npm.proxy.is_none());
     }
 
     #[test]
@@ -2120,7 +2115,7 @@ proxies = [
     #[test]
     fn test_npm_config_default() {
         let n = NpmConfig::default();
-        assert_eq!(n.proxy, Some("https://registry.npmjs.org".to_string()));
+        assert!(n.proxy.is_none());
         assert!(n.proxy_auth.is_none());
         assert_eq!(n.proxy_timeout, 30);
         assert_eq!(n.metadata_ttl, 300);
@@ -2129,7 +2124,7 @@ proxies = [
     #[test]
     fn test_pypi_config_default() {
         let p = PypiConfig::default();
-        assert_eq!(p.proxy, Some("https://pypi.org/simple/".to_string()));
+        assert!(p.proxy.is_none());
         assert!(p.proxy_auth.is_none());
         assert_eq!(p.proxy_timeout, 30);
     }
@@ -2440,28 +2435,30 @@ proxies = [
     }
 
     #[test]
-    fn test_env_override_npm() {
+    fn removed_singleton_environment_settings_fail_without_echoing_values() {
         let _lock = env_lock();
-        let mut config = Config::default();
-        std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
-        std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
-        std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
-        std::env::set_var("NORA_NPM_METADATA_TTL", "600");
-        config.apply_env_overrides().unwrap();
-        assert_eq!(
-            config.npm.proxy,
-            Some("https://npm.company.com".to_string())
-        );
-        assert_eq!(
-            crate::secrets::expose_opt(&config.npm.proxy_auth),
-            Some("user:token")
-        );
-        assert_eq!(config.npm.proxy_timeout, 60);
-        assert_eq!(config.npm.metadata_ttl, 600);
-        std::env::remove_var("NORA_NPM_PROXY");
-        std::env::remove_var("NORA_NPM_PROXY_AUTH");
-        std::env::remove_var("NORA_NPM_PROXY_TIMEOUT");
-        std::env::remove_var("NORA_NPM_METADATA_TTL");
+        for key in [
+            "NORA_NPM_ENABLED",
+            "NORA_NPM_PROXY",
+            "NORA_NPM_PROXY_AUTH",
+            "NORA_NPM_PROXY_TIMEOUT",
+            "NORA_NPM_METADATA_TTL",
+            "NORA_NPM_SERVE_STALE",
+            "NORA_NPM_REVALIDATE",
+            "NORA_NPM_IMPORT_EMBEDDED",
+            "NORA_PYPI_ENABLED",
+            "NORA_PYPI_PROXY",
+            "NORA_PYPI_PROXY_AUTH",
+            "NORA_PYPI_PROXIES",
+            "NORA_PYPI_PROXY_TIMEOUT",
+        ] {
+            std::env::set_var(key, "sensitive-test-value");
+            let result = Config::default().apply_env_overrides();
+            std::env::remove_var(key);
+            let error = result.unwrap_err();
+            assert!(error.contains(key) && error.contains("[repositories.<name>]"));
+            assert!(!error.contains("sensitive-test-value"));
+        }
     }
 
     #[test]
@@ -2552,10 +2549,9 @@ proxies = [
         // Defaults should be filled
         assert_eq!(config.storage.path, "data/storage");
         assert_eq!(config.maven.proxies.len(), 1);
-        assert_eq!(
-            config.npm.proxy,
-            Some("https://registry.npmjs.org".to_string())
-        );
+        assert!(config.npm.proxy.is_none());
+        assert!(config.pypi.proxy.is_none());
+        assert!(config.repositories.is_empty());
         assert_eq!(config.docker.upstreams.len(), 1);
         assert!(config.raw.enabled);
         assert!(!config.auth.enabled);
@@ -2913,8 +2909,7 @@ proxies = [
         );
     }
 
-    /// Every key the config reads is not listed: an empty file, the full default config,
-    /// and every secret — secrets are `skip_serializing`, so the round trip cannot see them.
+    /// Public secret fields must remain recognized even though serialization deliberately hides them.
     #[test]
     fn known_keys_are_not_listed() {
         assert!(unknown_keys("").is_empty());
@@ -2941,12 +2936,6 @@ proxies = [
             s3_secret_key = "sk"  # secret
             [curation]
             bypass_token = "t"  # secret
-            [npm]
-            proxy_auth = "u:p"  # secret
-            proxies = [{ url = "https://npm.example", scopes = ["@x"], auth = "u:p" }]  # secret
-            [pypi]
-            proxy_auth = "u:p"  # secret
-            proxies = [{ url = "https://pypi.example", auth = "u:p" }]  # secret
             [maven]
             proxies = [{ url = "https://maven.example", auth = "u:p" }]  # secret
             [[docker.upstreams]]
@@ -2989,7 +2978,10 @@ proxies = [
                 let p = e.unwrap().path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") {
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && !p.ends_with("registry/npm.rs")
+                    && !p.ends_with("registry/pypi.rs")
+                {
                     let src = std::fs::read_to_string(&p).unwrap();
                     in_source += src
                         .lines()
@@ -3015,8 +3007,6 @@ proxies = [
         let content = r#"
             [maven]
             proxies = ["https://m1.example", { url = "https://m2.example", auht = "u:p" }]
-            [pypi]
-            proxies = [{ url = "https://p.example", auht = "u:p" }]
             [rpm.proxies]
             fedora = { url = "https://r.example", auht = "u:p" }
             [deb.proxies]
@@ -3027,7 +3017,6 @@ proxies = [
             [
                 "deb.proxies.debian.atuh",
                 "maven.proxies.1.auht",
-                "pypi.proxies.0.auht",
                 "rpm.proxies.fedora.auht",
             ]
         );
@@ -3041,8 +3030,6 @@ proxies = [
             r#"
             [maven]
             proxies = ["https://m1.example", { url = "https://m2.example", auth = "u:p" }]
-            [pypi]
-            proxies = ["https://p1.example", { url = "https://p2.example", auth = "u:p" }]
             [rpm.proxies]
             fedora = "https://r1.example"
             epel = { url = "https://r2.example", auth = "u:p" }
@@ -3071,19 +3058,7 @@ proxies = [
             MavenProxyEntry::Simple(_)
         ));
         assert!(matches!(config.maven.proxies[1], MavenProxyEntry::Full(_)));
-        let pypi: Vec<_> = config
-            .pypi
-            .proxies
-            .iter()
-            .map(|p| (p.url(), p.auth()))
-            .collect();
-        assert_eq!(
-            pypi,
-            [
-                ("https://p1.example", None),
-                ("https://p2.example", Some("u:p"))
-            ]
-        );
+
         assert_eq!(config.rpm.proxies["fedora"].url(), "https://r1.example");
         assert_eq!(config.rpm.proxies["fedora"].auth(), None);
         assert_eq!(config.rpm.proxies["epel"].url(), "https://r2.example");
@@ -3184,6 +3159,26 @@ proxies = [
 
     /// The working-directory `config.toml` (no `NORA_CONFIG_PATH`) is held to the same
     /// rule at start. (On reload both sources share one code path; see the reload test.)
+    #[test]
+    fn a_present_invalid_fallback_never_discards_security_settings_for_defaults() {
+        let _lock = env_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for source in [
+            "[auth]\nenabled=true\n[npm]\nproxy='https://registry.example'",
+            "[auth]\nenabled=true\n[pypi]\nproxy='https://registry.example'",
+            "[auth]\nenabled = !invalid",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            for strict in [false, true] {
+                assert!(matches!(
+                    Config::load_from(None, path.to_str().unwrap(), strict),
+                    Err(ConfigLoadError::InvalidToml { .. })
+                ));
+            }
+        }
+    }
+
     #[test]
     fn fallback_config_file_is_held_to_the_same_rule() {
         let _lock = env_lock();
@@ -4190,7 +4185,7 @@ proxies = [
         let _lock = env_lock();
         // #1098: the #741 rule covers a per-registry value too, and names it.
         let mut config = npm_hosted_only();
-        config.npm.proxy = Some("https://registry.npmjs.org".to_string());
+        config.repositories = parse_config("[repositories.npm]\nformat='npm'\nkind='proxy'\npaths=['/npm/']\nupstream='https://registry.npmjs.org'\n").unwrap().0.repositories;
         config.curation.npm.min_release_age = Some("3d".to_string());
         let (_, errors) = config.validate_with_config_path(None);
         assert!(
@@ -4360,11 +4355,9 @@ proxies = [
         vec![
             (RegistryType::Docker, "[docker]\nenabled = true\n[[docker.upstreams]]\nurl = \"https://registry-1.docker.io\"\n", none),
             (RegistryType::Maven, "[maven]\nenabled = true\nproxies = [\"https://repo1.maven.org/maven2\"]\n", none),
-            (RegistryType::Npm, "[npm]\nenabled = true\nproxy = \"https://registry.npmjs.org\"\n", |c| c.npm.proxies.clear()),
-            (RegistryType::Npm, "[npm]\nenabled = true\nproxies = [\"https://registry.npmjs.org\"]\n", |c| c.npm.proxy = None),
+            (RegistryType::Npm, "[repositories.npm]\nformat = \"npm\"\nkind = \"proxy\"\npaths = [\"/npm/\"]\nupstream = \"https://registry.npmjs.org\"\n", none),
             (RegistryType::Cargo, "[cargo]\nenabled = true\nproxy = \"https://index.crates.io\"\n", none),
-            (RegistryType::PyPI, "[pypi]\nenabled = true\nproxy = \"https://pypi.org/simple/\"\n", |c| c.pypi.proxies.clear()),
-            (RegistryType::PyPI, "[pypi]\nenabled = true\nproxies = [\"https://pypi.org/simple/\"]\n", |c| c.pypi.proxy = None),
+            (RegistryType::PyPI, "[repositories.pypi]\nformat = \"pypi\"\nkind = \"proxy\"\npaths = [\"/simple/\"]\nupstream = \"https://pypi.org/simple/\"\n", none),
             (RegistryType::Go, "[go]\nenabled = true\nproxy = \"https://proxy.golang.org\"\n", none),
             (RegistryType::Gems, "[gems]\nenabled = true\nproxy = \"https://rubygems.org\"\n", none),
             (RegistryType::Terraform, "[terraform]\nenabled = true\nproxy = \"https://registry.terraform.io\"\n", none),
@@ -4383,10 +4376,14 @@ proxies = [
         match rt {
             RegistryType::Docker => (c.docker.enabled, c.docker.upstreams) = (true, vec![]),
             RegistryType::Maven => (c.maven.enabled, c.maven.proxies) = (true, vec![]),
-            RegistryType::Npm => (c.npm.enabled, c.npm.proxy, c.npm.proxies) = (true, None, vec![]),
+            RegistryType::Npm => {
+                c.npm.enabled = true;
+                c.repositories.clear();
+            }
             RegistryType::Cargo => (c.cargo.enabled, c.cargo.proxy) = (true, None),
             RegistryType::PyPI => {
-                (c.pypi.enabled, c.pypi.proxy, c.pypi.proxies) = (true, None, vec![])
+                c.pypi.enabled = true;
+                c.repositories.clear();
             }
             RegistryType::Go => (c.go.enabled, c.go.proxy) = (true, None),
             RegistryType::Gems => (c.gems.enabled, c.gems.proxy) = (true, None),
@@ -4408,9 +4405,15 @@ proxies = [
         match rt {
             RegistryType::Docker => c.docker.enabled = false,
             RegistryType::Maven => c.maven.enabled = false,
-            RegistryType::Npm => c.npm.enabled = false,
+            RegistryType::Npm => {
+                c.npm.enabled = false;
+                c.repositories.clear();
+            }
             RegistryType::Cargo => c.cargo.enabled = false,
-            RegistryType::PyPI => c.pypi.enabled = false,
+            RegistryType::PyPI => {
+                c.pypi.enabled = false;
+                c.repositories.clear();
+            }
             RegistryType::Go => c.go.enabled = false,
             RegistryType::Gems => c.gems.enabled = false,
             RegistryType::Terraform => c.terraform.enabled = false,
@@ -4608,10 +4611,7 @@ proxies = [
         }
     }
 
-    /// The verdict on a registry's own value does not depend on how the registry is
-    /// enabled: NORA_REGISTRIES_ENABLE, [registries].enable and its own flag give the same
-    /// answer, for the registry on and off (the first two used to be judged by the flags'
-    /// defaults, before the enable-set was applied).
+    /// General enable-selection must govern age validation; disabled named repositories are configuration conflicts rather than hidden active routes.
     #[test]
     fn a_per_registry_min_release_age_is_judged_by_the_registries_the_server_mounts() {
         let _lock = env_lock();
@@ -4633,7 +4633,11 @@ proxies = [
             } else {
                 "raw"
             };
+            let named = matches!(rt, RegistryType::Npm | RegistryType::PyPI);
             for way in [EnableWay::Env, EnableWay::Section, EnableWay::Flag] {
+                if named && matches!(way, EnableWay::Flag) {
+                    continue;
+                }
                 for on in [true, false] {
                     let flag = |v: bool| section.replacen("\n", &format!("\nenabled = {v}\n"), 1);
                     let (toml, env) = match (way, on) {
@@ -4656,6 +4660,13 @@ proxies = [
                     };
                     let case = format!("{rt} {way:?} on={on}: {toml} env={env:?}");
                     match load_toml(&toml, env.as_deref()) {
+                        Err(errors) if named && !on => {
+                            assert!(
+                                errors.iter().any(|error| error.starts_with("repositories.")
+                                    && error.contains("disabled")),
+                                "{case}: {errors:?}"
+                            );
+                        }
                         Err(errors) => {
                             assert!(on, "{case}: refused although {rt} is off: {errors:?}");
                             assert!(
@@ -4731,18 +4742,9 @@ proxies = [
         }
         // Control: hf off, the same global value starts.
         assert!(load_toml(hf, Some("all")).is_ok());
-        // #741: every per-registry flag off in the file, NORA_REGISTRIES_ENABLE=all mounts
-        // the proxies, so a global value without a quarantine is refused.
-        let mut all_off = String::new();
-        for rt in RegistryType::all() {
-            let section = match rt {
-                RegistryType::PubDart => "pub_dart".to_string(),
-                _ => rt.as_str().to_string(),
-            };
-            all_off.push_str(&format!("[{section}]\nenabled = false\n"));
-        }
-        all_off.push_str("[curation]\nmin_release_age = \"3d\"\n");
-        let errors = load_toml(&all_off, Some("all")).expect_err("the proxies are mounted");
+        // The environment enable-set overrides the file, so mounted proxies still require a quarantine.
+        let all_off = "[registries]\nenable = []\n[curation]\nmin_release_age = \"3d\"\n";
+        let errors = load_toml(all_off, Some("all")).expect_err("the proxies are mounted");
         assert!(
             errors
                 .iter()
@@ -5849,11 +5851,17 @@ proxies = [
             [storage]
             path = "/tmp/nora-test"
 
-            [[pypi.proxies]]
-            url = "https://pypi.org/simple"
+            [repositories.public-pypi]
+            format = "pypi"
+            kind = "proxy"
+            paths = ["/public-pypi/"]
+            upstream = "https://pypi.org/simple"
 
-            [[pypi.proxies]]
-            url = "https://internal-nexus.corp/pypi"
+            [repositories.private-pypi]
+            format = "pypi"
+            kind = "proxy"
+            paths = ["/private-pypi/"]
+            upstream = "https://internal-nexus.corp/pypi"
             auth = "secret-token"
         "#;
         let config: Config = toml::from_str(toml).unwrap();

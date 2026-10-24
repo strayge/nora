@@ -6,6 +6,7 @@ set -euo pipefail
 # Exit code 0 = all passed, non-zero = failures.
 
 NORA_BIN="${NORA_BIN:-./target/release/nora}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${NORA_TEST_PORT:-14000}"
 BASE="http://localhost:${PORT}"
 STORAGE_DIR=$(mktemp -d)
@@ -49,6 +50,7 @@ echo ""
 NORA_HOST=127.0.0.1 \
 NORA_PORT=$PORT \
 NORA_STORAGE_PATH="$STORAGE_DIR" \
+NORA_CONFIG_PATH="$SCRIPT_DIR/repositories/smoke.toml" \
 NORA_RATE_LIMIT_ENABLED=false \
 NORA_PUBLIC_URL="$BASE" \
 "$NORA_BIN" serve &
@@ -99,7 +101,7 @@ check "npm scoped package @babel/parser" \
 PUBLISH_RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Content-Type: application/json" \
     -d '{"name":"smoke-test-pkg","versions":{"1.0.0":{"name":"smoke-test-pkg","version":"1.0.0","dist":{}}},"dist-tags":{"latest":"1.0.0"},"_attachments":{"smoke-test-pkg-1.0.0.tgz":{"data":"dGVzdA==","content_type":"application/octet-stream"}}}' \
-    "$BASE/npm/smoke-test-pkg")
+    "$BASE/npm-local/smoke-test-pkg")
 if [ "$PUBLISH_RESULT" = "201" ]; then
     pass "npm publish returns 201"
 else
@@ -110,7 +112,7 @@ fi
 DUPE_RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Content-Type: application/json" \
     -d '{"name":"smoke-test-pkg","versions":{"1.0.0":{"name":"smoke-test-pkg","version":"1.0.0","dist":{}}},"dist-tags":{"latest":"1.0.0"},"_attachments":{"smoke-test-pkg-1.0.0.tgz":{"data":"dGVzdA==","content_type":"application/octet-stream"}}}' \
-    "$BASE/npm/smoke-test-pkg")
+    "$BASE/npm-local/smoke-test-pkg")
 if [ "$DUPE_RESULT" = "409" ]; then
     pass "npm version immutability (409 on duplicate)"
 else
@@ -121,7 +123,7 @@ fi
 MISMATCH_RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Content-Type: application/json" \
     -d '{"name":"evil-pkg","versions":{"1.0.0":{}},"_attachments":{"a.tgz":{"data":"dGVzdA=="}}}' \
-    "$BASE/npm/lodash")
+    "$BASE/npm-local/lodash")
 if [ "$MISMATCH_RESULT" = "400" ]; then
     pass "npm name mismatch rejected (400)"
 else
@@ -132,7 +134,7 @@ fi
 TRAVERSAL_RESULT=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
     -H "Content-Type: application/json" \
     -d '{"name":"test-pkg","versions":{"1.0.0":{}},"_attachments":{"../../etc/passwd":{"data":"dGVzdA=="}}}' \
-    "$BASE/npm/test-pkg")
+    "$BASE/npm-local/test-pkg")
 if [ "$TRAVERSAL_RESULT" = "400" ]; then
     pass "npm path traversal rejected (400)"
 else
@@ -173,15 +175,12 @@ check "OpenAPI docs" \
 
 # Dashboard stats — check npm count > 0 after proxy fetches
 sleep 1
-STATS=$(curl -sf "$BASE/ui/api/stats" 2>/dev/null || echo "{}")
+STATS=$(curl -sf "$BASE/api/ui/stats" 2>/dev/null || echo "{}")
 NPM_COUNT=$(echo "$STATS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('npm',0))" 2>/dev/null || echo "0")
 if [ "$NPM_COUNT" -gt 0 ] 2>/dev/null; then
     pass "Dashboard npm count > 0 (got $NPM_COUNT)"
 else
-    # Known issue: repo_index rebuild for npm proxy-cached packages
-    # is not triggered by the npm handler (missing invalidate call).
-    # Tracked separately — do not block smoke suite on this.
-    echo "  WARN: Dashboard npm count is $NPM_COUNT (known issue, skipping)"
+    fail "Dashboard must count the explicitly configured npm members (got $NPM_COUNT)"
 fi
 
 echo ""

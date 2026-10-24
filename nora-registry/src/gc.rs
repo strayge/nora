@@ -162,6 +162,47 @@ pub async fn run_gc(
     npm_is_proxy: bool,
     proxy_cache_max_bytes: u64,
 ) -> GcResult {
+    run_gc_inner(
+        storage,
+        publish_locks,
+        dry_run,
+        grace_secs,
+        npm_is_proxy,
+        proxy_cache_max_bytes,
+        true,
+    )
+    .await
+}
+
+/// Retained singleton namespaces belong to the operator, not to any named repository.
+pub async fn run_root_gc(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    dry_run: bool,
+    grace_secs: u64,
+    proxy_cache_max_bytes: u64,
+) -> GcResult {
+    run_gc_inner(
+        storage,
+        publish_locks,
+        dry_run,
+        grace_secs,
+        false,
+        proxy_cache_max_bytes,
+        false,
+    )
+    .await
+}
+
+async fn run_gc_inner(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    dry_run: bool,
+    grace_secs: u64,
+    npm_is_proxy: bool,
+    proxy_cache_max_bytes: u64,
+    include_package_roots: bool,
+) -> GcResult {
     let start = Instant::now();
     info!(
         "Starting garbage collection (dry_run={}, grace_secs={})",
@@ -178,14 +219,23 @@ pub async fn run_gc(
     all_orphans.extend(docker_result.orphans);
 
     // Checksum orphan detection (Maven, npm, PyPI)
-    let checksum_result = detect_checksum_orphans(storage).await;
+    let prefixes: &[&str] = if include_package_roots {
+        &["maven/", "npm/", "pypi/"]
+    } else {
+        &["maven/"]
+    };
+    let checksum_result = detect_checksum_orphans(storage, prefixes).await;
     total_candidates += checksum_result.total;
     all_orphans.extend(checksum_result.orphans);
 
-    // npm cache provenance sidecars (internal prefix, hidden from list())
-    let origin_result = detect_origin_orphans(storage).await;
-    total_candidates += origin_result.total;
-    all_orphans.extend(origin_result.orphans);
+    if include_package_roots {
+        let origin_result = detect_origin_orphans(storage).await;
+        total_candidates += origin_result.total;
+        all_orphans.extend(origin_result.orphans);
+        let ready_result = detect_pypi_ready_orphans(storage).await;
+        total_candidates += ready_result.total;
+        all_orphans.extend(ready_result.orphans);
+    }
 
     // Go incomplete version detection
     let go_result = detect_go_incomplete_versions(storage).await;
@@ -252,6 +302,11 @@ pub async fn run_gc(
         // under a same-key write.
         let lock = crate::acquire_publish_lock(publish_locks, key);
         let _guard = lock.lock().await;
+        if let Some(body) = crate::registry::pypi_body_key_for_ready(key) {
+            if !pypi_body_missing(storage, &body).await {
+                continue;
+            }
+        }
         if storage.delete(key).await.is_ok() {
             deleted += 1;
             bytes_freed += meta.size;
@@ -281,8 +336,11 @@ pub async fn run_gc(
 
     // Metadata phantom cleanup (npm/PyPI) — acquires per-key publish_lock
     // to prevent lost-update race with concurrent publish (#529).
-    let metadata_phantoms_removed =
-        detect_and_clean_metadata_phantoms(storage, publish_locks, dry_run, npm_is_proxy).await;
+    let metadata_phantoms_removed = if include_package_roots {
+        detect_and_clean_metadata_phantoms(storage, publish_locks, dry_run, npm_is_proxy).await
+    } else {
+        0
+    };
     if metadata_phantoms_removed > 0 {
         if !dry_run {
             GC_METADATA_PHANTOMS.inc_by(metadata_phantoms_removed as u64);
@@ -673,11 +731,39 @@ async fn detect_origin_orphans(storage: &Storage) -> DetectionResult {
     DetectionResult { total, orphans }
 }
 
-async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
-    let mut checksums: Vec<String> = Vec::new();
+async fn pypi_body_missing(storage: &Storage, body: &str) -> bool {
+    match storage.exists(body).await {
+        Ok(exists) => !exists,
+        Err(error) => {
+            tracing::warn!(%error,key=body,"GC kept PyPI companions because body absence could not be confirmed");
+            false
+        }
+    }
+}
 
-    // Scan Maven, npm, PyPI prefixes for checksum sidecar files
-    for prefix in &["maven/", "npm/", "pypi/"] {
+async fn detect_pypi_ready_orphans(storage: &Storage) -> DetectionResult {
+    let keys = storage
+        .list_internal(crate::registry::PYPI_READY_PREFIX)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!(%error,"GC: listing PyPI readiness proofs failed");
+            Vec::new()
+        });
+    let total = keys.len();
+    let mut orphans = Vec::new();
+    for key in keys {
+        if let Some(body) = crate::registry::pypi_body_key_for_ready(&key) {
+            if pypi_body_missing(storage, &body).await {
+                orphans.push(key);
+            }
+        }
+    }
+    DetectionResult { total, orphans }
+}
+
+async fn detect_checksum_orphans(storage: &Storage, prefixes: &[&str]) -> DetectionResult {
+    let mut checksums: Vec<String> = Vec::new();
+    for prefix in prefixes {
         let keys = storage.list(prefix).await.unwrap_or_else(|e| {
             tracing::error!("GC: storage.list({}) failed: {}", prefix, e);
             Vec::new()
@@ -695,7 +781,12 @@ async fn detect_checksum_orphans(storage: &Storage) -> DetectionResult {
     for checksum_key in &checksums {
         if let Some(primary) = primary_key_for_sidecar(checksum_key) {
             // If the primary artifact doesn't exist, the checksum is orphaned
-            if storage.stat(primary).await.is_none() {
+            let missing = if primary.starts_with("pypi/") {
+                pypi_body_missing(storage, primary).await
+            } else {
+                storage.stat(primary).await.is_none()
+            };
+            if missing {
                 orphans.push(checksum_key.clone());
             }
         }
@@ -1319,6 +1410,116 @@ mod tests {
 
     fn test_publish_locks() -> PublishLocks {
         Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn root_gc_preserves_singletons_and_member_gc_keeps_metadata_only_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "npm/old/old.tgz.sha256",
+            "pypi/old/missing.whl.sha256",
+            "maven/missing.jar.sha256",
+        ] {
+            root.put(key, b"checksum").await.unwrap();
+        }
+        run_root_gc(&root, &test_publish_locks(), false, 0, 0).await;
+        assert!(root.stat("npm/old/old.tgz.sha256").await.is_some());
+        assert!(root.stat("pypi/old/missing.whl.sha256").await.is_some());
+        assert!(root.stat("maven/missing.jar.sha256").await.is_none());
+        let member = root.scoped("repositories/a/sources/local").unwrap();
+        let sidecar = "pypi/demo/demo-1.0-py3-none-any.whl.metadata";
+        let live = crate::registry::pypi_ready_key_for_body(sidecar).unwrap();
+        let orphan =
+            crate::registry::pypi_ready_key_for_body("pypi/demo/missing-1.whl.metadata").unwrap();
+        member.put(sidecar, b"metadata").await.unwrap();
+        member.put(&live, b"proof").await.unwrap();
+        member.put(&orphan, b"proof").await.unwrap();
+        run_gc(&member, &test_publish_locks(), false, 0, false, 0).await;
+        assert!(member.stat(&live).await.is_some());
+        assert!(member.stat(&orphan).await.is_none());
+        assert!(member
+            .stat("pypi/demo/demo-1.0-py3-none-any.whl")
+            .await
+            .is_none());
+        assert!(root.stat("npm/old/old.tgz.sha256").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn gc_preserves_pypi_proofs_and_pins_when_body_head_or_listing_is_unavailable() {
+        let (root, counts) = crate::test_helpers::op_counting_storage();
+        let member = root.scoped("repositories/a/sources/local").unwrap();
+        let body = "pypi/demo/demo-1.whl";
+        let checksum = format!("{body}.sha256");
+        let ready = crate::registry::pypi_ready_key_for_body(body).unwrap();
+        member.put(body, b"body").await.unwrap();
+        member.put(&checksum, b"pin").await.unwrap();
+        member.put(&ready, b"proof").await.unwrap();
+        counts.fail_stats_to(Some(&format!("repositories/a/sources/local/{body}")));
+        assert!(member.stat(body).await.is_none());
+        run_gc(&member, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(member.get(&ready).await.unwrap().as_ref(), b"proof");
+        assert_eq!(member.get(&checksum).await.unwrap().as_ref(), b"pin");
+        counts.fail_reads_to(Some("repositories/a/sources/local/pypi/"));
+        run_gc(&member, &test_publish_locks(), false, 0, false, 0).await;
+        assert_eq!(member.get(&ready).await.unwrap().as_ref(), b"proof");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_keeps_pypi_companions_when_the_local_body_directory_is_inaccessible() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let body = "pypi/demo/demo-1.whl";
+        let checksum = format!("{body}.sha256");
+        let ready = crate::registry::pypi_ready_key_for_body(body).unwrap();
+        storage.put(body, b"body").await.unwrap();
+        storage.put(&checksum, b"pin").await.unwrap();
+        storage.put(&ready, b"proof").await.unwrap();
+        let project = dir.path().join("pypi");
+        let permissions = std::fs::metadata(&project).unwrap().permissions();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0)).unwrap();
+        let inaccessible = std::fs::metadata(dir.path().join(body)).is_err();
+        let existence = storage.exists(body).await;
+        let result = run_gc(&storage, &test_publish_locks(), false, 0, false, 0).await;
+        std::fs::set_permissions(&project, permissions).unwrap();
+        if inaccessible {
+            assert!(existence.is_err());
+        }
+        assert_eq!(result.deleted, 0);
+        assert_eq!(storage.get(body).await.unwrap().as_ref(), b"body");
+        assert_eq!(storage.get(&checksum).await.unwrap().as_ref(), b"pin");
+        assert_eq!(storage.get(&ready).await.unwrap().as_ref(), b"proof");
+    }
+
+    #[tokio::test]
+    async fn gc_rechecks_readiness_after_a_concurrent_publication_holds_the_ready_lock() {
+        let (root, counts) = crate::test_helpers::op_counting_storage();
+        let member = root.scoped("repositories/a/sources/local").unwrap();
+        let body = "pypi/demo/demo-1.0-py3-none-any.whl";
+        let ready = crate::registry::pypi_ready_key_for_body(body).unwrap();
+        member.put(&ready, b"old orphan proof").await.unwrap();
+        let locks = test_publish_locks();
+        let lock = crate::acquire_publish_lock(&locks, &ready);
+        let guard = lock.lock().await;
+        counts.reset();
+        let storage = member.clone();
+        let task_locks = locks.clone();
+        let gc =
+            tokio::spawn(async move { run_gc(&storage, &task_locks, false, 0, false, 0).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while counts.snapshot().get("stat").copied().unwrap_or(0) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        member.put(body, b"new distribution").await.unwrap();
+        member.put(&ready, b"new proof").await.unwrap();
+        drop(guard);
+        assert_eq!(gc.await.unwrap().deleted, 0);
+        assert_eq!(member.get(&ready).await.unwrap().as_ref(), b"new proof");
     }
 
     #[test]

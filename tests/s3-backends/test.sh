@@ -120,6 +120,8 @@ test_backend() {
     http_code=$(curl -s -o /dev/null -w "%{http_code}" "${base}/npm/@babel/parser")
     if [ "$http_code" = "200" ]; then
         pass "${name}: npm proxy @babel/parser"
+    elif [ "$http_code" = "404" ]; then
+        fail "${name}: configured npm alias returned 404; verify named repository configuration"
     else
         # Some environments lack internet access for proxy
         skip "${name}: npm proxy @babel/parser (HTTP ${http_code}, may need internet)"

@@ -1,13 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! PyPI registry — PEP 503 (Simple HTML) + PEP 691 (JSON) + twine upload.
-//!
-//! Implements:
-//!   GET  /simple/                     — package index (HTML or JSON)
-//!   GET  /simple/{name}/              — package versions (HTML or JSON)
-//!   GET  /simple/{name}/{filename}    — download file
-//!   POST /simple/                     — twine upload (multipart/form-data)
+//! PyPI Simple HTML/JSON and Core Metadata at explicit repository aliases; only local repositories accept twine uploads.
 
 mod cache;
 mod group;
@@ -16,6 +10,102 @@ mod named;
 mod transfer;
 pub(crate) use group::routes_at as group_routes_at;
 pub(crate) use transfer::Transfer;
+
+pub(crate) fn canonical_project_name(name: &str) -> Option<String> {
+    let name = normalize_name(name);
+    model::valid_name(&name).then_some(name)
+}
+
+pub(crate) async fn stored_package_presence(
+    state: &AppState,
+    name: &str,
+) -> crate::repositories::groups::Lookup<(), Box<Response>> {
+    use crate::repositories::groups::Lookup;
+    let unavailable = || {
+        Lookup::Failure(Box::new((StatusCode::SERVICE_UNAVAILABLE,"Source selection requires trusted stored metadata; refresh through the package client endpoint").into_response()))
+    };
+    if !named::is_proxy(state) {
+        let prefix = format!("pypi/{name}/");
+        return match state.storage.list(&prefix).await {
+            Ok(keys)
+                if keys.iter().any(|key| {
+                    key.strip_prefix(&prefix)
+                        .is_some_and(is_valid_pypi_filename)
+                }) =>
+            {
+                Lookup::Present(())
+            }
+            Ok(_) => Lookup::Absent,
+            Err(_) => unavailable(),
+        };
+    }
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        name,
+    ) {
+        return Lookup::Failure(Box::new(response));
+    }
+    match named::stored(state, name).await {
+        Ok(Some(snapshot)) if snapshot.project.is_some() => Lookup::Present(()),
+        Ok(Some(snapshot))
+            if crate::registry::transport::policy(state).is_some_and(|policy| {
+                crate::cache_ttl::is_within_ttl(
+                    snapshot.fetched_at,
+                    i64::try_from(policy.metadata_ttl).unwrap_or(i64::MAX),
+                )
+            }) =>
+        {
+            Lookup::Absent
+        }
+        _ => unavailable(),
+    }
+}
+
+pub(crate) async fn known_packages(state: &AppState) -> Result<Vec<String>, StatusCode> {
+    if named::is_proxy(state) {
+        return named::known_projects(state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let keys = state
+        .storage
+        .list("pypi/")
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(keys
+        .iter()
+        .filter_map(|key| {
+            let (name, file) = key.strip_prefix("pypi/")?.split_once('/')?;
+            (model::valid_name(name) && is_valid_pypi_filename(file)).then_some(name.to_owned())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+pub(crate) const READY_PREFIX: &str = cache::READY;
+
+pub(crate) fn ready_key_for_body(key: &str) -> Option<String> {
+    let (name, filename) = key.strip_prefix("pypi/")?.split_once('/')?;
+    if name.is_empty()
+        || filename.contains('/')
+        || nora_registry::pypi_files::served_extension(
+            filename.strip_suffix(".metadata").unwrap_or(filename),
+        )
+        .is_none()
+    {
+        return None;
+    }
+    Some(cache::ready_key(name, filename))
+}
+
+pub(crate) fn body_key_for_ready(key: &str) -> Option<String> {
+    Some(format!(
+        "pypi/{}",
+        key.strip_prefix(READY_PREFIX)?.strip_suffix(".json")?
+    ))
+}
 
 pub(crate) fn cleanup_proxy_temp_dir(data: &str) {
     transfer::cleanup(data);
@@ -51,8 +141,12 @@ const PEP691_JSON: &str = "application/vnd.pypi.simple.v1+json";
 #[derive(Clone)]
 struct PypiMount(String);
 
+#[cfg(test)]
 pub fn routes() -> Router<AppState> {
-    routes_at("/simple/", true)
+    routes_at("/simple/", true).layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("sandbox"),
+    ))
 }
 
 /// The mounted prefix is request context, not part of the repository's stored identity.
@@ -572,9 +666,7 @@ async fn download_file(
             crate::registry_type::RegistryType::PyPI,
             "CACHE",
         ));
-        state
-            .audit
-            .log(AuditEntry::new("cache_hit", "proxy", "", "pypi", ""));
+        state.log_audit(AuditEntry::new("cache_hit", "proxy", "", "pypi", ""));
 
         if let Some(resp) = crate::digest_quarantine::proxy_gate_dated(
             &state.digest_store,
@@ -682,9 +774,7 @@ async fn download_file(
                     crate::registry_type::RegistryType::PyPI,
                     "PROXY",
                 ));
-                state
-                    .audit
-                    .log(AuditEntry::new("proxy_fetch", "proxy", "", "pypi", ""));
+                state.log_audit(AuditEntry::new("proxy_fetch", "proxy", "", "pypi", ""));
 
                 // Cache in background + compute hash, invalidate AFTER write
                 let storage = state.storage.clone();
@@ -850,6 +940,9 @@ async fn upload(
 
     // TOCTOU protection: lock per file to prevent concurrent uploads
     let file_key = format!("pypi/{}/{}", normalized, filename);
+    // Retention retires all companions under this lock before taking individual file locks.
+    let ready_lock = state.publish_lock(&cache::ready_key(&normalized, &filename));
+    let _ready_guard = ready_lock.lock().await;
     let lock = state.publish_lock(&file_key);
     let _guard = lock.lock().await;
 
@@ -878,7 +971,7 @@ async fn upload(
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
-    state.audit.log(AuditEntry::new(
+    state.log_audit(AuditEntry::new(
         "push",
         crate::auth::audit_actor(&user),
         &artifact,

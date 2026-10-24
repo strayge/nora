@@ -235,7 +235,6 @@ async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> 
     println!("nora import assess — source: {host}");
     println!("{:<32} {:<12} {:<12} notes", "REPO", "FORMAT", "COMPAT");
     let mut full = 0usize;
-    let mut partial = 0usize;
     let mut unsupported = 0usize;
     for repo in &repos {
         let (compat, note) = match layout::normalize_format(&repo.format) {
@@ -243,12 +242,19 @@ async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> 
                 let c = layout::compat(rt);
                 match c {
                     layout::Compat::Full => full += 1,
-                    layout::Compat::Partial => partial += 1,
                     layout::Compat::Unsupported => unsupported += 1,
                 }
                 let note = match c {
                     layout::Compat::Full => "",
-                    layout::Compat::Partial => "tarballs only; metadata regenerated",
+                    layout::Compat::Unsupported
+                        if matches!(
+                            rt,
+                            crate::registry_type::RegistryType::Npm
+                                | crate::registry_type::RegistryType::PyPI
+                        ) =>
+                    {
+                        "named targets unsupported — run will refuse; publish with npm/twine"
+                    }
                     layout::Compat::Unsupported => "no NORA import layout — will be skipped",
                 };
                 (format!("{c:?}"), note)
@@ -270,7 +276,7 @@ async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> 
         );
     }
     println!(
-        "\n{} repo(s): {full} full, {partial} partial, {unsupported} unsupported",
+        "\n{} repo(s): {full} full, {unsupported} unsupported",
         repos.len()
     );
 
@@ -313,18 +319,26 @@ async fn run_import(
         args.allow_private_cidrs,
     )?;
 
-    // Resume + temp state are LOCAL filesystem (ADR-2), co-located with the
-    // storage root so the local-backend commit is a same-fs atomic rename.
-    let state_root = std::path::PathBuf::from(&config.storage.path);
-    let temp_dir = state_root.join(".nora-import").join("tmp");
-    let resume = resume::ResumeStore::open(&state_root, &args.url).await?;
-
     let opts = transfer::TransferOpts {
         dry_run: args.dry_run,
         allow_sha1: args.allow_sha1,
     };
 
     let repos = filter_repos(source.list_repositories().await?, &args.repos);
+    for repo in &repos {
+        if matches!(
+            layout::normalize_format(&repo.format),
+            Some(
+                crate::registry_type::RegistryType::Npm | crate::registry_type::RegistryType::PyPI
+            )
+        ) {
+            return Err(format!("repository {} uses npm/PyPI: import into named local repositories is unsupported; publish with npm or twine to an explicitly configured local alias instead",repo.name));
+        }
+    }
+    // Refused targets must not create journals or temporary state.
+    let state_root = std::path::PathBuf::from(&config.storage.path);
+    let temp_dir = state_root.join(".nora-import").join("tmp");
+    let resume = resume::ResumeStore::open(&state_root, &args.url).await?;
     let mut result = ImportResult::default();
     for repo in &repos {
         if resume.is_repo_done(&repo.name) {
@@ -721,6 +735,50 @@ mod integration_tests {
     }
 
     const MAVEN_KEY: &str = "maven/com/example/foo/1.0/foo-1.0.jar";
+
+    #[tokio::test]
+    async fn named_import_refusal_does_not_create_resume_or_other_storage_state() {
+        let _lock = crate::test_env::env_lock();
+        for format in ["npm", "pypi"] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/repositories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!([{"key":"named-source","type":"LOCAL","packageType":format}]),
+                ))
+                .mount(&server)
+                .await;
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::storage::Storage::new_local(directory.path().to_str().unwrap());
+            let before: Vec<_> = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            let mut config = crate::config::Config::default();
+            config.storage.path = directory.path().to_str().unwrap().into();
+            let args = RunArgs {
+                source: SourceKind::Artifactory,
+                url: server.uri(),
+                repos: vec![],
+                dry_run: false,
+                concurrency: 1,
+                json: true,
+                with_permissions: false,
+                grant_write: false,
+                allow_private_cidrs: true,
+                allow_sha1: false,
+            };
+            let error = run_import(args, &storage, &config).await.unwrap_err();
+            assert!(error.contains("named local repositories"));
+            let after: Vec<_> = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(after, before);
+            assert!(!directory.path().join(".nora-import").exists());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
 
     #[tokio::test]
     async fn artifactory_import_commits_pins_and_resumes() {
@@ -1314,15 +1372,22 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn import_repo_skips_unsupported_layout() {
+    async fn import_repo_rejects_named_targets_without_writing_singleton_keys() {
         let h = harness("ir-skip").await;
         let src = FakeSource {
             arts: vec![("some-package".into(), b"x".to_vec())],
             stream_err: false,
         };
-        let res = run_repo(&src, crate::registry_type::RegistryType::Npm, &h, false).await;
-        assert_eq!(res.skipped, 1);
-        assert_eq!(res.imported, 0);
+        for format in [
+            crate::registry_type::RegistryType::Npm,
+            crate::registry_type::RegistryType::PyPI,
+        ] {
+            let res = run_repo(&src, format, &h, false).await;
+            assert_eq!(res.failed, 1);
+            assert_eq!(res.imported, 0);
+        }
+        assert!(h.storage.list("npm/").await.unwrap().is_empty());
+        assert!(h.storage.list("pypi/").await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -120,6 +120,12 @@ pub async fn run_mirror(
     json_output: bool,
     client: &reqwest::Client,
 ) -> Result<(), String> {
+    if matches!(
+        format,
+        MirrorFormat::Npm { .. } | MirrorFormat::Yarn { .. } | MirrorFormat::Pip { .. }
+    ) {
+        return Err("npm/PyPI mirror targets must be explicit named aliases; this mirror command does not support named targets. Use npm install or pip download with the configured repository URL instead".into());
+    }
     // Health check
     let health_url = format!("{}/health", registry.trim_end_matches('/'));
     match client.get(&health_url).send().await {

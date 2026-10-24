@@ -44,6 +44,7 @@ pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
 pub use hf::routes as hf_routes;
 pub use maven::routes as maven_routes;
+#[cfg(test)]
 pub use npm::routes as npm_routes;
 
 // Storage-key builders reused by `nora import` so imported keys are
@@ -55,8 +56,17 @@ pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub(crate) use pypi::cleanup_proxy_temp_dir as cleanup_pypi_proxy_temp_dir;
 pub(crate) use pypi::group_routes_at as pypi_group_routes_at;
+#[cfg(test)]
 pub use pypi::routes as pypi_routes;
 pub(crate) use pypi::routes_at as pypi_routes_at;
+pub(crate) use pypi::{
+    body_key_for_ready as pypi_body_key_for_ready, ready_key_for_body as pypi_ready_key_for_body,
+    READY_PREFIX as PYPI_READY_PREFIX,
+};
+pub(crate) use pypi::{
+    canonical_project_name as canonical_pypi_project, known_packages as known_pypi_packages,
+    stored_package_presence as stored_pypi_package_presence,
+};
 pub(crate) use pypi::{
     ProjectSnapshot as PypiSnapshot, RefreshProgress as PypiRefresh, Transfer as PypiTransfer,
 };

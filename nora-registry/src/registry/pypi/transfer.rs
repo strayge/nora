@@ -74,6 +74,7 @@ struct Failure {
     status: StatusCode,
     headers: Arc<HeaderMap>,
     body: Bytes,
+    refusal: Option<Arc<crate::curation::CurationRefusal>>,
 }
 impl Failure {
     async fn response(response: Response) -> Self {
@@ -83,6 +84,11 @@ impl Failure {
                 status: parts.status,
                 headers: Arc::new(parts.headers),
                 body,
+                refusal: parts
+                    .extensions
+                    .get::<crate::curation::CurationRefusal>()
+                    .cloned()
+                    .map(Arc::new),
             },
             Err(_) => Self::status(StatusCode::INTERNAL_SERVER_ERROR),
         }
@@ -92,6 +98,7 @@ impl Failure {
             status,
             headers: Arc::new(HeaderMap::new()),
             body: Bytes::new(),
+            refusal: None,
         }
     }
     async fn error(error: ProxyError) -> Self {
@@ -103,6 +110,9 @@ impl Failure {
     fn into_response(self) -> Response {
         let mut response = (self.status, self.body).into_response();
         *response.headers_mut() = self.headers.as_ref().clone();
+        if let Some(refusal) = self.refusal {
+            response.extensions_mut().insert(refusal.as_ref().clone());
+        }
         response
     }
 }
@@ -376,7 +386,7 @@ fn record_serve(state: &AppState, name: &str, filename: &str, cached: bool) {
         RegistryType::PyPI,
         if cached { "CACHE" } else { "PROXY" },
     ));
-    state.audit.log(AuditEntry::new(
+    state.log_audit(AuditEntry::new(
         if cached { "cache_hit" } else { "proxy_fetch" },
         "proxy",
         "",

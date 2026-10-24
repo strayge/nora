@@ -351,7 +351,7 @@ fn overlaps(a: &str, b: &str) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-/// Validate against the enabled non-catalogue routes; legacy npm/PyPI aliases are exempt.
+/// Explicit aliases must not overlap another active endpoint or silently enable a disabled format.
 pub(super) fn problems(config: &Config) -> (Vec<String>, Vec<String>) {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
@@ -364,7 +364,8 @@ pub(super) fn problems(config: &Config) -> (Vec<String>, Vec<String>) {
         "/api/",
         "/api-docs/",
     ];
-    for registry in config.enabled_registries_quiet() {
+    let enabled = config.enabled_registries_quiet();
+    for registry in enabled.iter().copied() {
         if !matches!(registry, RegistryType::Npm | RegistryType::PyPI) {
             reserved.push(registry.mount_point());
         }
@@ -374,6 +375,13 @@ pub(super) fn problems(config: &Config) -> (Vec<String>, Vec<String>) {
     }
     for (name, repository) in &config.repositories {
         let label = format!("repositories.{name}");
+        let registry = match repository.format() {
+            RepositoryFormat::Npm => RegistryType::Npm,
+            RepositoryFormat::Pypi => RegistryType::PyPI,
+        };
+        if !enabled.contains(&registry) {
+            errors.push(format!("{label}: format {} is disabled; enable it in [registries].enable or remove this repository", registry.as_str()));
+        }
         if !safe_name(name) {
             errors.push(format!(
                 "{label}: expected a safe lowercase repository path-segment identity"

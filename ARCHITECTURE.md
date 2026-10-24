@@ -188,7 +188,7 @@ nora/
 │   ├── retention.rs         # Retention policies (keep-N, max-age)
 │   ├── backup.rs            # Backup/restore (tar.gz)
 │   ├── migrate.rs           # Storage migration (local ↔ s3)
-│   ├── mirror/              # Pre-fetch CLI (nora mirror npm/docker)
+│   ├── mirror/              # Pre-fetch CLI for supported explicit targets
 │   │
 │   ├── health.rs            # /health endpoint (per-registry health)
 │   ├── metrics.rs           # /metrics endpoint (Prometheus format) + leak detection
@@ -379,8 +379,9 @@ Go, Raw) default to enabled for backward compatibility. The 10 newer
 formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, CPAN, RPM, Debian,
 Hugging Face) default to disabled; Hugging Face is not part of `all` either —
 only named (`NORA_HF_ENABLED=true`). Any combination is valid — you can run
-NORA with only Docker and PyPI by setting `NORA_MAVEN_ENABLED=false`, `NORA_NPM_ENABLED=false`,
-etc. The `RegistryType::all()` iterator and `enabled_registries()` method
+NORA with only Docker and PyPI using `NORA_REGISTRIES_ENABLE=docker,pypi`.
+npm/PyPI additionally require explicit named repository definitions; enabling their
+format does not create a default repository or HTTP alias. The `RegistryType::all()` iterator and `enabled_registries()` method
 let subsystems (health, metrics, UI) auto-discover which formats are
 active.
 

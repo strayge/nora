@@ -127,6 +127,14 @@ pub trait StorageBackend: Send + Sync {
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn stat(&self, key: &str) -> Option<FileMeta>;
+    /// Destructive maintenance must distinguish absence from an unavailable backend.
+    async fn exists(&self, key: &str) -> Result<bool> {
+        match self.get_reader(key).await {
+            Ok(_) => Ok(true),
+            Err(StorageError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
     /// List keys under `prefix` together with their size/mtime.
     ///
     /// Returns the metadata the listing already carries instead of forcing a
@@ -548,6 +556,16 @@ impl Storage {
 
     pub fn backend_name(&self) -> &'static str {
         self.inner.backend_name()
+    }
+
+    /// Unlike `stat`, an I/O failure is not evidence that destructive cleanup is safe.
+    pub async fn exists(&self, key: &str) -> Result<bool> {
+        validate_storage_key(key)?;
+        let result = self.inner.exists(key).await;
+        STORAGE_OPERATIONS
+            .with_label_values(&["exists", if result.is_ok() { "ok" } else { "error" }])
+            .inc();
+        result
     }
 
     /// The recorded SHA-256 pin for a storage key, or `None` when the object
@@ -1664,6 +1682,7 @@ mod tests {
     const KEY_METHODS: &[&str] = &[
         "copy",
         "delete",
+        "exists",
         "get",
         "get_range",
         "get_reader",
@@ -1705,6 +1724,7 @@ mod tests {
                 let checks = [
                     ("put", refused(&s.put(key, b"x").await)),
                     ("get", refused(&s.get(key).await)),
+                    ("exists", refused(&s.exists(key).await)),
                     ("get_verified", refused(&s.get_verified(key).await)),
                     ("get_reader", refused(&s.get_reader(key).await)),
                     ("get_range", refused(&s.get_range(key, 0, 0).await)),

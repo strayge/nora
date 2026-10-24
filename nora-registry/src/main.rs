@@ -238,15 +238,13 @@ async fn gc_pass(
     repo_index: &RepoIndex,
     dry_run: bool,
     grace_secs: u64,
-    npm_is_proxy: bool,
     proxy_cache_max_bytes: u64,
 ) -> gc::GcResult {
-    let result = gc::run_gc(
+    let result = gc::run_root_gc(
         storage,
         publish_locks,
         dry_run,
         grace_secs,
-        npm_is_proxy,
         proxy_cache_max_bytes,
     )
     .await;
@@ -300,12 +298,24 @@ async fn retention_pass(
     dry_run: bool,
     audit: &AuditLog,
 ) -> retention::RetentionResult {
-    let result = retention::run_retention(storage, publish_locks, signer, rules, dry_run).await;
+    let result =
+        retention::run_root_retention(storage, publish_locks, signer, rules, dry_run).await;
+    record_retention_result(&result, repo_index, dry_run, audit, None);
+    result
+}
+
+fn record_retention_result(
+    result: &retention::RetentionResult,
+    repo_index: &RepoIndex,
+    dry_run: bool,
+    audit: &AuditLog,
+    repository: Option<&repositories::Repository>,
+) {
     if !dry_run && result.deleted_keys > 0 {
         repo_index.invalidate_all();
     }
     if result.planned > 0 {
-        audit.log(audit::AuditEntry::new(
+        let mut entry = audit::AuditEntry::new(
             if dry_run {
                 "retention-dry-run"
             } else {
@@ -313,7 +323,9 @@ async fn retention_pass(
             },
             "scheduler",
             &format!("{} versions", result.planned),
-            "*",
+            repository
+                .map(|member| member.registry_type().as_str())
+                .unwrap_or("*"),
             &if dry_run {
                 // Nothing was deleted: the bytes are what an applied pass would free.
                 format!(
@@ -326,9 +338,12 @@ async fn retention_pass(
                     result.deleted_keys, result.bytes_freed, result.duration_secs
                 )
             },
-        ));
+        );
+        if let Some(repository) = repository {
+            entry = entry.in_repository(&repository.name, Some(&repository.source_id));
+        }
+        audit.log(entry);
     }
-    result
 }
 
 /// Set `nora_artifacts_total` and the per-registry `nora_storage_bytes` from the
@@ -341,15 +356,26 @@ async fn refresh_artifact_gauges(
     storage: &Storage,
     enabled: &HashSet<RegistryType>,
 ) {
-    for rt in enabled {
+    for rt in enabled
+        .iter()
+        .filter(|rt| !matches!(rt, RegistryType::Npm | RegistryType::PyPI))
+    {
         let _ = repo_index.get(rt.as_str(), storage).await;
     }
-    for (rt, count) in repo_index.counts() {
+    for (rt, count) in repo_index
+        .counts()
+        .into_iter()
+        .filter(|(rt, _)| !matches!(rt, RegistryType::Npm | RegistryType::PyPI))
+    {
         metrics::ARTIFACTS_TOTAL
             .with_label_values(&[rt.as_str()])
             .set(count as i64);
     }
-    for (rt, bytes) in repo_index.sizes() {
+    for (rt, bytes) in repo_index
+        .sizes()
+        .into_iter()
+        .filter(|(rt, _)| !matches!(rt, RegistryType::Npm | RegistryType::PyPI))
+    {
         metrics::STORAGE_BYTES
             .with_label_values(&[rt.as_str()])
             .set(bytes as i64);
@@ -431,6 +457,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn log_audit(&self, mut entry: audit::AuditEntry) {
+        if let Some(repository) = &self.repository {
+            entry = entry.in_repository(&repository.name, Some(&repository.source_id));
+        }
+        self.audit.log(entry);
+    }
+
     /// Load a snapshot of the current curation engine (lock-free read via ArcSwap).
     pub fn curation(&self) -> arc_swap::Guard<Arc<ReloadableConfig>> {
         self.reloadable.load()
@@ -1093,12 +1126,11 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Grace applies to manual GC too: `nora gc --apply` is often run while
             // traffic is live, when in-flight pushes are most likely (#584).
-            let mut result = gc::run_gc(
+            let mut result = gc::run_root_gc(
                 &storage,
                 &cli_publish_locks,
                 dry_run,
                 config.gc.grace_secs,
-                !config.npm.upstream_urls().is_empty(),
                 config.gc.proxy_cache_max_bytes,
             )
             .await;
@@ -1157,7 +1189,7 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Dry-run: plans only, no deletions and no index regeneration —
             // no signer needed.
-            let mut result = retention::run_retention(
+            let mut result = retention::run_root_retention(
                 &storage,
                 &cli_publish_locks,
                 None,
@@ -1189,7 +1221,7 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             if !yes {
                 // Show plan first, require --yes to execute
-                let mut result = retention::run_retention(
+                let mut result = retention::run_root_retention(
                     &storage,
                     &cli_publish_locks,
                     None,
@@ -1223,7 +1255,7 @@ async fn main() {
                 // same key the server would, or clients start failing
                 // verification after a CLI retention pass.
                 let signer = build_signer(&config, &config.enabled_registries());
-                let mut result = retention::run_retention(
+                let mut result = retention::run_root_retention(
                     &storage,
                     &cli_publish_locks,
                     signer.as_deref(),
@@ -2089,6 +2121,28 @@ mod rate_limited_routes_tests {
         assert!(sandboxed(&get));
     }
 
+    #[tokio::test]
+    async fn production_builtins_never_mount_implicit_npm_or_pypi_repositories() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|_| {});
+        assert!(ctx.state.enabled_registries.contains(&RegistryType::Npm));
+        assert!(ctx.state.enabled_registries.contains(&RegistryType::PyPI));
+        let app = registry_routes(&ctx.state.enabled_registries).with_state(ctx.state.clone());
+        for uri in ["/npm/", "/npm/pkg", "/simple/", "/simple/pkg/"] {
+            assert_eq!(
+                crate::test_helpers::send(
+                    &app,
+                    axum::http::Method::GET,
+                    uri,
+                    axum::body::Body::empty()
+                )
+                .await
+                .status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{uri}"
+            );
+        }
+    }
+
     // Registry routes are limited by the upload_* settings and only by
     // them; auth routes by auth_* and general_*. Bursts differ (auth 1, upload 2, general 3), one
     // request a second, so the first refusal tells which limiter answered.
@@ -2444,8 +2498,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
     };
 
-    let registry_routes = registry_routes(&state.enabled_registries, &state.config)
-        .merge(state.repositories.routes(&state));
+    let registry_routes =
+        registry_routes(&state.enabled_registries).merge(state.repositories.routes(&state));
     let app_routes = if rate_limit_enabled {
         let (routes, enforced) = rate_limited_routes(
             auth::token_routes(),
@@ -2562,7 +2616,6 @@ async fn run_server(mut config: Config, storage: Storage) {
         let publish_locks = state.publish_locks.clone();
         let dry_run = state.config.gc.dry_run;
         let grace_secs = state.config.gc.grace_secs;
-        let npm_is_proxy = !state.config.npm.upstream_urls().is_empty();
         let proxy_cache_max_bytes = state.config.gc.proxy_cache_max_bytes;
         let repo_index = state.repo_index.clone();
         let repository_state = state.clone();
@@ -2583,7 +2636,6 @@ async fn run_server(mut config: Config, storage: Storage) {
                         &repo_index,
                         dry_run,
                         grace_secs,
-                        npm_is_proxy,
                         proxy_cache_max_bytes,
                     )
                     .await;
@@ -2743,11 +2795,18 @@ async fn run_server(mut config: Config, storage: Storage) {
                 // full physical footprint; per-registry is summed artifact size.
                 // A panic in an index builder must not end this loop: it also flushes
                 // tokens and expires upload sessions.
-                let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(
-                    &metrics_state.repo_index,
-                    &metrics_state.storage,
-                    &metrics_state.enabled_registries,
-                ))
+                let gauges = std::panic::AssertUnwindSafe(async {
+                    refresh_artifact_gauges(
+                        &metrics_state.repo_index,
+                        &metrics_state.storage,
+                        &metrics_state.enabled_registries,
+                    )
+                    .await;
+                    metrics_state
+                        .repositories
+                        .refresh_gauges(&metrics_state.enabled_registries)
+                        .await;
+                })
                 .catch_unwind()
                 .await;
                 if let Err(e) = gauges {
@@ -3040,26 +3099,7 @@ fn build_curation_engine(config: &Config) -> Result<curation::CurationEngine, St
 
 /// The routes of the enabled registries — one assembly for the server and the tests, so a test
 /// reaches every route a client does (the NuGet aliases included).
-fn registry_routes(enabled: &HashSet<RegistryType>, config: &Config) -> Router<AppState> {
-    let replaced = |mount: &str| {
-        config
-            .repositories
-            .values()
-            .filter(|repository| {
-                let format = match repository.format() {
-                    config::repositories::RepositoryFormat::Npm => RegistryType::Npm,
-                    config::repositories::RepositoryFormat::Pypi => RegistryType::PyPI,
-                };
-                enabled.contains(&format)
-                    && !matches!(repository, config::repositories::RepositoryConfig::Group(_))
-            })
-            .any(|repository| {
-                repository
-                    .paths()
-                    .iter()
-                    .any(|prefix| prefix.starts_with(mount) || mount.starts_with(prefix))
-            })
-    };
+fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
     let mut registry_routes = Router::new();
     for reg in enabled {
         match reg {
@@ -3069,14 +3109,8 @@ fn registry_routes(enabled: &HashSet<RegistryType>, config: &Config) -> Router<A
             RegistryType::Maven => {
                 registry_routes = registry_routes.merge(registry::maven_routes())
             }
-            RegistryType::Npm if !replaced("/npm/") => {
-                registry_routes = registry_routes.merge(registry::npm_routes())
-            }
             RegistryType::Cargo => {
                 registry_routes = registry_routes.merge(registry::cargo_routes())
-            }
-            RegistryType::PyPI if !replaced("/simple/") => {
-                registry_routes = registry_routes.merge(registry::pypi_routes())
             }
             RegistryType::Npm | RegistryType::PyPI => {}
             RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
@@ -3486,7 +3520,7 @@ mod cleanup_pass_tests {
         let storage = rpm_cache(dir.path(), 5).await;
         let index = RepoIndex::new();
         assert_eq!(counted(&index, &storage, "rpm").await, 5);
-        let result = gc_pass(&storage, &locks(), &index, false, 0, false, 300).await;
+        let result = gc_pass(&storage, &locks(), &index, false, 0, 300).await;
         assert_eq!(result.proxy_cache_eviction.evicted_files, 2);
         assert_eq!(counted(&index, &storage, "rpm").await, 3);
     }
@@ -3497,7 +3531,7 @@ mod cleanup_pass_tests {
         let storage = rpm_cache(dir.path(), 5).await;
         let index = RepoIndex::new();
         assert_eq!(counted(&index, &storage, "rpm").await, 5);
-        let result = gc_pass(&storage, &locks(), &index, true, 0, false, 300).await;
+        let result = gc_pass(&storage, &locks(), &index, true, 0, 300).await;
         assert_eq!(
             result.proxy_cache_eviction.evicted_files, 2,
             "what would go"
@@ -3734,7 +3768,7 @@ mod cleanup_pass_tests {
         assert_eq!(bytes_gauge(RegistryType::Rpm), 600);
 
         // A GC pass evicts the proxy cache down to 300 bytes.
-        let result = gc_pass(&storage, &locks(), &index, false, 0, false, 300).await;
+        let result = gc_pass(&storage, &locks(), &index, false, 0, 300).await;
         assert_eq!(result.proxy_cache_eviction.evicted_files, 3);
         refresh_artifact_gauges(&index, &storage, &enabled).await;
         assert_eq!(

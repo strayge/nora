@@ -74,6 +74,10 @@ pub struct AuditEntry {
     pub artifact: String,
     pub registry: String,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 
 impl AuditEntry {
@@ -85,7 +89,15 @@ impl AuditEntry {
             artifact: artifact.to_string(),
             registry: registry.to_string(),
             detail: detail.to_string(),
+            repository: None,
+            source_id: None,
         }
+    }
+
+    pub(crate) fn in_repository(mut self, name: &str, source: Option<&str>) -> Self {
+        self.repository = Some(name.to_owned());
+        self.source_id = source.map(str::to_owned);
+        self
     }
 }
 
@@ -253,6 +265,32 @@ impl AuditLog {
     }
 }
 
+#[derive(Clone)]
+struct RepositoryAttribution {
+    repository: String,
+    source_id: String,
+}
+
+/// Group aliases are not the source that produced a member's curation refusal.
+pub(crate) fn attribute_refusal(
+    state: &crate::AppState,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    if response
+        .extensions()
+        .get::<crate::curation::CurationRefusal>()
+        .is_some()
+    {
+        if let Some(repository) = &state.repository {
+            response.extensions_mut().insert(RepositoryAttribution {
+                repository: repository.name.clone(),
+                source_id: repository.source_id.clone(),
+            });
+        }
+    }
+    response
+}
+
 /// Records each download curation refused: a refusal leaves its handler as a
 /// `CurationRefusal` response extension, and this layer — inside auth, so it knows the
 /// caller — writes one `curation_block` entry for it. One layer covers every refusal site
@@ -267,12 +305,23 @@ pub async fn curation_refusal_middleware(
         .extensions()
         .get::<crate::auth::AuthenticatedUser>()
         .map_or_else(|| "anonymous".to_string(), |user| user.0.clone());
+    let repository = state
+        .config
+        .repositories
+        .iter()
+        .find(|(_, definition)| {
+            definition.paths().iter().any(|path| {
+                request.uri().path().starts_with(path)
+                    || request.uri().path() == path.trim_end_matches('/')
+            })
+        })
+        .map(|(name, _)| name.clone());
     let response = next.run(request).await;
     if let Some(refusal) = response
         .extensions()
         .get::<crate::curation::CurationRefusal>()
     {
-        state.audit.log(AuditEntry::new(
+        let mut entry = AuditEntry::new(
             "curation_block",
             &actor,
             &format!(
@@ -282,7 +331,19 @@ pub async fn curation_refusal_middleware(
             ),
             &refusal.registry,
             &format!("{}: {}", refusal.rule, refusal.reason),
-        ));
+        );
+        if let Some(source) = response.extensions().get::<RepositoryAttribution>() {
+            entry = entry.in_repository(&source.repository, Some(&source.source_id));
+        } else if let Some(name) = &repository {
+            entry = entry.in_repository(
+                name,
+                state
+                    .repositories
+                    .get(name)
+                    .map(|member| member.source_id.as_str()),
+            );
+        }
+        state.audit.log(entry);
     }
     response
 }

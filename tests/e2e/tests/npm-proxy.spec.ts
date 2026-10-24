@@ -14,7 +14,8 @@ test.describe('npm Proxy', () => {
     const version = metadata.versions['5.4.1'];
     expect(version).toBeDefined();
     expect(version.dist.tarball).not.toContain('registry.npmjs.org');
-    expect(version.dist.tarball).toContain('/npm/chalk/-/chalk-5.4.1.tgz');
+    expect(version.dist.tarball).toContain('/npm/-/source/');
+    expect(version.dist.tarball).toContain('/chalk/-/chalk-5.4.1.tgz');
   });
 
   test('scoped package @babel/parser works', async ({ request }) => {
@@ -30,16 +31,15 @@ test.describe('npm Proxy', () => {
 
     const firstVersion = metadata.versions[versions[0]];
     if (firstVersion?.dist?.tarball) {
-      expect(firstVersion.dist.tarball).toContain('/npm/@babel/parser/-/');
+      expect(firstVersion.dist.tarball).toContain('/npm/-/source/');
+      expect(firstVersion.dist.tarball).toContain('/@babel/parser/-/');
       expect(firstVersion.dist.tarball).not.toContain('registry.npmjs.org');
     }
   });
 
   test('tarball download returns gzip data', async ({ request }) => {
-    // Ensure metadata is cached first
-    await request.get('/npm/chalk');
-
-    const response = await request.get('/npm/chalk/-/chalk-5.4.1.tgz');
+    const metadata = await (await request.get('/npm/chalk')).json();
+    const response = await request.get(metadata.versions['5.4.1'].dist.tarball);
     expect(response.ok()).toBeTruthy();
     expect(response.headers()['content-type']).toBe('application/octet-stream');
 
@@ -70,7 +70,7 @@ test.describe('npm Proxy', () => {
       },
     };
 
-    const response = await request.put(`/npm/${pkgName}`, {
+    const response = await request.put(`/npm-local/${pkgName}`, {
       data: publishBody,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -93,13 +93,13 @@ test.describe('npm Proxy', () => {
       _attachments: { [`${pkgName}-1.0.0.tgz`]: { data: 'dGVzdA==' } },
     };
 
-    await request.put(`/npm/${pkgName}`, {
+    await request.put(`/npm-local/${pkgName}`, {
       data: body,
       headers: { 'Content-Type': 'application/json' },
     });
 
     // Publish same version again
-    const response = await request.put(`/npm/${pkgName}`, {
+    const response = await request.put(`/npm-local/${pkgName}`, {
       data: body,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -107,7 +107,7 @@ test.describe('npm Proxy', () => {
   });
 
   test('npm publish rejects name mismatch (400)', async ({ request }) => {
-    const response = await request.put('/npm/legitimate-pkg', {
+    const response = await request.put('/npm-local/legitimate-pkg', {
       data: {
         name: 'evil-pkg',
         versions: { '1.0.0': {} },
@@ -119,7 +119,7 @@ test.describe('npm Proxy', () => {
   });
 
   test('npm publish rejects path traversal filename (400)', async ({ request }) => {
-    const response = await request.put('/npm/safe-pkg', {
+    const response = await request.put('/npm-local/safe-pkg', {
       data: {
         name: 'safe-pkg',
         versions: { '1.0.0': {} },

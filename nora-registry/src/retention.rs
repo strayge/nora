@@ -649,35 +649,34 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
         tracing::error!("Failed to list pypi/ keys: {}", e);
         Vec::new()
     });
-    let mut packages: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-
-    for key in &all_keys {
-        if let Some(rest) = key.strip_prefix("pypi/") {
-            // Skip checksums and metadata.json — metadata is the package index,
-            // not a version artifact. Deleting it makes the package undiscoverable.
-            if !ends_with_ci(key, ".sha256")
-                && !ends_with_ci(key, ".sha1")
-                && !ends_with_ci(key, ".md5")
-                && !ends_with_ci(key, ".sha512")
-                && !ends_with_ci(key, "/metadata.json")
-            {
-                let pkg = rest.split('/').next().unwrap_or("");
-                if !pkg.is_empty() {
-                    packages
-                        .entry(pkg.to_string())
-                        .or_default()
-                        .push(key.clone());
-                }
-            }
+    let mut packages: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, Vec<String>>,
+    > = std::collections::BTreeMap::new();
+    for key in all_keys {
+        let Some((pkg, filename)) = key
+            .strip_prefix("pypi/")
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            continue;
+        };
+        let parent = filename.strip_suffix(".metadata").unwrap_or(filename);
+        if pkg.is_empty()
+            || filename.contains('/')
+            || nora_registry::pypi_files::served_extension(parent).is_none()
+        {
+            continue;
         }
+        packages
+            .entry(pkg.to_owned())
+            .or_default()
+            .entry(parent.to_owned())
+            .or_default()
+            .push(key);
     }
-
-    // Hash markers live outside `pypi/`, one directory per file:
-    // `pypi-sha256/<project>/<filename>/<sha256>`. A retired file takes them with it.
     let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
-    let marker_keys = storage.list(marker_root).await.unwrap_or_else(|e| {
-        tracing::error!("Failed to list {} keys: {}", marker_root, e);
+    let marker_keys = storage.list(marker_root).await.unwrap_or_else(|error| {
+        tracing::error!(%error,"Failed to list PyPI hash markers");
         Vec::new()
     });
     let mut markers: std::collections::HashMap<&str, Vec<String>> =
@@ -690,29 +689,36 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
             markers.entry(file).or_default().push(marker.clone());
         }
     }
-
     let mut result = Vec::new();
-    for (pkg, file_keys) in &packages {
+    for (pkg, files) in packages {
         let mut entries = Vec::new();
-        for key in file_keys {
-            let filename = key.rsplit('/').next().unwrap_or("");
-            let (modified, size) = aggregate_meta(storage, std::slice::from_ref(key)).await;
-            let mut keys = vec![key.clone()];
-            let hash_key = format!("{}.sha256", key);
-            if storage.stat(&hash_key).await.is_some() {
-                keys.push(hash_key);
+        for (filename, bodies) in files {
+            let (modified, size) = aggregate_meta(storage, &bodies).await;
+            let mut keys = bodies.clone();
+            for body in bodies {
+                let checksum = format!("{body}.sha256");
+                if storage.stat(&checksum).await.is_some() {
+                    keys.push(checksum);
+                }
+                if let Some(ready) = crate::registry::pypi_ready_key_for_body(&body) {
+                    if storage.stat(&ready).await.is_some() {
+                        keys.push(ready);
+                    }
+                }
             }
-            if let Some(file_markers) = markers.get(format!("{pkg}/{filename}").as_str()) {
-                keys.extend(file_markers.iter().cloned());
+            for file in [filename.clone(), format!("{filename}.metadata")] {
+                if let Some(file_markers) = markers.get(format!("{pkg}/{file}").as_str()) {
+                    keys.extend(file_markers.iter().cloned());
+                }
             }
             entries.push(VersionEntry {
-                name: filename.to_string(),
+                name: filename,
                 keys,
                 modified,
                 size,
             });
         }
-        result.push((format!("pypi:{}", pkg), entries));
+        result.push((format!("pypi:{pkg}"), entries));
     }
     result
 }
@@ -849,6 +855,28 @@ pub async fn run_retention(
     rules: &[RetentionRule],
     dry_run: bool,
 ) -> RetentionResult {
+    run_retention_inner(storage, publish_locks, signer, rules, dry_run, true).await
+}
+
+/// Singleton bytes are retained for operator-managed cleanup, never adopted by a named repository.
+pub async fn run_root_retention(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    signer: Option<&crate::signing::RepoSigner>,
+    rules: &[RetentionRule],
+    dry_run: bool,
+) -> RetentionResult {
+    run_retention_inner(storage, publish_locks, signer, rules, dry_run, false).await
+}
+
+async fn run_retention_inner(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    signer: Option<&crate::signing::RepoSigner>,
+    rules: &[RetentionRule],
+    dry_run: bool,
+    include_package_roots: bool,
+) -> RetentionResult {
     let start = Instant::now();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -859,8 +887,10 @@ pub async fn run_retention(
     let mut all_groups: Vec<(String, Vec<VersionEntry>)> = Vec::new();
     all_groups.extend(collect_maven_versions(storage).await);
     all_groups.extend(collect_docker_versions(storage).await);
-    all_groups.extend(collect_npm_versions(storage).await);
-    all_groups.extend(collect_pypi_versions(storage).await);
+    if include_package_roots {
+        all_groups.extend(collect_npm_versions(storage).await);
+        all_groups.extend(collect_pypi_versions(storage).await);
+    }
     all_groups.extend(collect_cargo_versions(storage).await);
     all_groups.extend(collect_go_versions(storage).await);
     all_groups.extend(collect_rpm_versions(storage).await);
@@ -920,15 +950,51 @@ pub async fn run_retention(
                 ));
             }
             for plan in &plans {
+                let mut ready_guards = Vec::new();
+                if let Some(name) = group_name.strip_prefix("pypi:") {
+                    for file in [
+                        plan.version_name.clone(),
+                        format!("{}.metadata", plan.version_name),
+                    ] {
+                        if let Some(ready) =
+                            crate::registry::pypi_ready_key_for_body(&format!("pypi/{name}/{file}"))
+                        {
+                            let guard = crate::acquire_publish_lock(publish_locks, &ready)
+                                .lock_owned()
+                                .await;
+                            ready_guards.push((ready, guard));
+                        }
+                    }
+                }
+                let mut invalidated = true;
+                for (ready, _) in &ready_guards {
+                    let existed = storage.stat(ready).await.is_some();
+                    match storage.delete(ready).await {
+                        Ok(()) => total_deleted_keys += usize::from(existed),
+                        Err(crate::storage::StorageError::NotFound) => {}
+                        Err(error) => {
+                            tracing::warn!(%error,key=%ready,"Retention kept PyPI bodies because readiness could not be invalidated");
+                            invalidated = false;
+                            break;
+                        }
+                    }
+                }
+                if !invalidated {
+                    continue;
+                }
                 for key in &plan.keys {
-                    // Serialize with concurrent publish to prevent deleting
-                    // an artifact that is being referenced by a new publish.
+                    if group_name.starts_with("pypi:")
+                        && key.starts_with(crate::registry::PYPI_READY_PREFIX)
+                    {
+                        continue;
+                    }
                     let lock = crate::acquire_publish_lock(publish_locks, key);
                     let _guard = lock.lock().await;
                     if storage.delete(key).await.is_ok() {
                         total_deleted_keys += 1;
                     }
                 }
+                drop(ready_guards);
                 total_bytes += plan.size;
                 info!(
                     group = %group_name,
@@ -2438,6 +2504,120 @@ mod format_retention_tests {
             .collect();
         versions.sort();
         versions
+    }
+
+    #[tokio::test]
+    async fn pypi_retention_invalidates_proofs_published_after_collection_before_deleting_bodies() {
+        let (root, counts) = crate::test_helpers::op_counting_storage();
+        let storage = root.scoped("repositories/a/sources/local").unwrap();
+        let body = "pypi/demo/demo-1.0-py3-none-any.whl";
+        let ready = crate::registry::pypi_ready_key_for_body(body).unwrap();
+        storage.put(body, b"body").await.unwrap();
+        let locks: PublishLocks = std::sync::Arc::default();
+        let lock = crate::acquire_publish_lock(&locks, &ready);
+        let guard = lock.lock().await;
+        counts.reset();
+        let target = storage.clone();
+        let target_locks = locks.clone();
+        let task = tokio::spawn(async move {
+            run_retention(
+                &target,
+                &target_locks,
+                None,
+                &[rule("pypi", None, Some(0), None)],
+                false,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while counts.snapshot().get("stat").copied().unwrap_or(0) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        storage.put(&ready, b"new proof").await.unwrap();
+        drop(guard);
+        let result = task.await.unwrap();
+        assert_eq!(result.deleted_keys, 2);
+        assert!(storage.stat(body).await.is_none());
+        assert!(storage.stat(&ready).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pypi_retention_keeps_bodies_when_a_readiness_proof_cannot_be_invalidated() {
+        let (root, counts) = crate::test_helpers::op_counting_storage();
+        let storage = root.scoped("repositories/a/sources/local").unwrap();
+        let body = "pypi/demo/demo-1.0-py3-none-any.whl";
+        let ready = crate::registry::pypi_ready_key_for_body(body).unwrap();
+        storage.put(body, b"body").await.unwrap();
+        storage.put(&ready, b"proof").await.unwrap();
+        counts.fail_deletes_to(Some(&format!("repositories/a/sources/local/{ready}")));
+        let result = run_retention(
+            &storage,
+            &std::sync::Arc::default(),
+            None,
+            &[rule("pypi", None, Some(0), None)],
+            false,
+        )
+        .await;
+        assert_eq!(result.deleted_keys, 0);
+        assert_eq!(result.bytes_freed, 0);
+        assert!(storage.stat(body).await.is_some());
+        assert!(storage.stat(&ready).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pypi_retention_pairs_sidecars_and_proofs_without_inventing_extra_distributions() {
+        let root = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        let storage = root.scoped("repositories/a/sources/local").unwrap();
+        let bodies = [
+            "pypi/demo/demo-1.0-py3-none-any.whl",
+            "pypi/demo/demo-1.0-py3-none-any.whl.metadata",
+            "pypi/demo/demo-2.0-py3-none-any.whl.metadata",
+        ];
+        storage.put("pypi/demo/metadata.json", b"{}").await.unwrap();
+        for body in bodies {
+            storage.put(body, b"body").await.unwrap();
+            storage
+                .put(
+                    &crate::registry::pypi_ready_key_for_body(body).unwrap(),
+                    b"proof",
+                )
+                .await
+                .unwrap();
+        }
+        let groups = collect_pypi_versions(&storage).await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 2);
+        for entry in &groups[0].1 {
+            assert!(!entry.name.ends_with(".metadata"));
+        }
+        let first = groups[0]
+            .1
+            .iter()
+            .find(|entry| entry.name == "demo-1.0-py3-none-any.whl")
+            .unwrap();
+        assert!(first.keys.contains(&bodies[0].into()) && first.keys.contains(&bodies[1].into()));
+        let result = run_retention(
+            &storage,
+            &std::sync::Arc::default(),
+            None,
+            &[rule("pypi", None, Some(0), None)],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2);
+        for body in bodies {
+            assert!(storage.stat(body).await.is_none());
+            assert!(storage
+                .stat(&crate::registry::pypi_ready_key_for_body(body).unwrap())
+                .await
+                .is_none());
+        }
+        assert!(storage.stat("pypi/demo/metadata.json").await.is_some());
     }
 
     /// A retired PyPI file takes its hash markers with it; a surviving file keeps its own.

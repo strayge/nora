@@ -116,12 +116,10 @@ htpasswd -Bc /etc/nora/users.htpasswd admin
 
 ### 3.3. Проксирование внешних репозиториев
 
+npm и PyPI настраиваются только явными `[repositories.<name>]` в TOML: `format`, `kind` (`local`, `proxy`, `group`), `paths`, а для прокси — `upstream` и политики TLS/тайм-аутов/сохранения файлов. Неявных публичных upstream и URL нет. Старые `[npm]`, `[pypi]` и их переменные окружения отклоняются. См. [настройку именованных репозиториев](../docs/repositories.md). `NORA_REGISTRIES_ENABLE` по-прежнему включает форматы, но не создаёт репозитории.
+
 | Переменная | Описание | По умолчанию |
 |-----------|----------|--------------|
-| `NORA_NPM_PROXY` | URL npm-реестра | `https://registry.npmjs.org` |
-| `NORA_NPM_PROXY_AUTH` | Учётные данные (`user:pass`) | — |
-| `NORA_NPM_METADATA_TTL` | TTL кэша метаданных (секунды) | `300` |
-| `NORA_PYPI_PROXY` | URL PyPI-реестра | `https://pypi.org/simple/` |
 | `NORA_MAVEN_PROXIES` | Список Maven-репозиториев через запятую | `https://repo1.maven.org/maven2` |
 | `NORA_DOCKER_PROXIES` | Docker-реестры (quick start), формат: `url\|auth,url2` | `https://registry-1.docker.io` |
 
@@ -299,9 +297,9 @@ nora migrate --from local --to s3              # Выполнение
 | Протокол | Endpoint | Описание |
 |----------|----------|----------|
 | Docker / OCI | `/v2/` | Docker Registry V2 API |
-| npm | `/npm/` | npm-реестр (прокси + публикация) |
+| npm | Настроенный alias | Именованные local/proxy/group; публикация только в local |
 | Maven | `/maven2/` | Maven-репозиторий |
-| PyPI | `/simple/` | Python Simple API (PEP 503) |
+| PyPI | Настроенный alias | Simple API; `/simple/` существует только при явной настройке |
 | Cargo | `/cargo/` | Cargo-реестр |
 | Helm | `/v2/` (OCI) | Helm-чарты через OCI-протокол |
 | Raw | `/raw/` | Произвольные файлы |
@@ -324,8 +322,8 @@ journalctl -u nora --no-pager -n 50
 ### Прокси-кэш не работает
 
 1. Проверьте доступность внешнего реестра: `curl https://registry.npmjs.org/lodash`.
-2. Убедитесь, что переменная `NORA_NPM_PROXY` задана корректно.
-3. При использовании приватного реестра укажите `NORA_NPM_PROXY_AUTH`.
+2. Проверьте `upstream`, `metadata_timeout`, TLS и `save_files` в нужном `[repositories.<name>]` с `kind='proxy'`.
+3. Для приватного upstream используйте `auth` (Basic) либо npm-only `auth_bearer_env`; группы наследуют политики выбранного участника. Не помещайте секреты в URL.
 
 ### Ошибка целостности (Integrity check failed)
 

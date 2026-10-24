@@ -239,6 +239,18 @@ pub static ARTIFACTS_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to create ARTIFACTS_TOTAL metric at startup")
 });
 
+pub static REPOSITORY_ARTIFACTS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!("nora_repository_artifacts", "Stored distribution files in configured member namespaces; groups have no separate inventory", &["repository","format"]).expect("repository artifact metric")
+});
+pub static REPOSITORY_STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "nora_repository_storage_bytes",
+        "Logical stored artifact bytes in configured member namespaces",
+        &["repository", "format"]
+    )
+    .expect("repository storage metric")
+});
+
 /// Circuit breaker state per registry (0=closed, 1=open, 2=half_open)
 pub static CIRCUIT_BREAKER_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(

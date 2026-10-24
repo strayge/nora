@@ -67,7 +67,7 @@ export interface DashboardContract {
   hasActivityLog: boolean;
 }
 
-// --- Registry Contracts ---
+// --- Unchanged format pages; named npm/PyPI use the repository browser. ---
 
 export const REGISTRIES: RegistryContract[] = [
   {
@@ -90,30 +90,6 @@ export const REGISTRIES: RegistryContract[] = [
       installSectionLabel: 'Pull Command',
       installCommandPattern: /docker pull .+\/.+/,
       tableColumnHeaders: ['Tag', 'Size', 'Created'],
-      hasMetadataPanel: false,
-      hasClickableVersionRows: false,
-    },
-  },
-  {
-    slug: 'npm',
-    displayName: 'npm Registry',
-    sidebarName: 'npm',
-    list: {
-      slug: 'npm',
-      title: 'npm Registry',
-      columnHeaders: ['Name', 'Versions', 'Size', 'Updated'],
-      countColumnLabel: 'Versions',
-      isHierarchical: false,
-      hasSearch: true,
-      searchEndpoint: '/api/ui/npm/search',
-    },
-    detail: {
-      slug: 'npm',
-      breadcrumbRootText: 'npm',
-      hasInstallCommand: true,
-      installSectionLabel: 'Install Command',
-      installCommandPattern: /npm install .+ --registry .+\/npm/,
-      tableColumnHeaders: ['Versions', 'Size', 'Published'],
       hasMetadataPanel: false,
       hasClickableVersionRows: false,
     },
@@ -161,30 +137,6 @@ export const REGISTRIES: RegistryContract[] = [
       hasInstallCommand: true,
       installSectionLabel: 'Install Command',
       installCommandPattern: /cargo add .+/,
-      tableColumnHeaders: ['Versions', 'Size', 'Published'],
-      hasMetadataPanel: false,
-      hasClickableVersionRows: false,
-    },
-  },
-  {
-    slug: 'pypi',
-    displayName: 'PyPI Repository',
-    sidebarName: 'PyPI',
-    list: {
-      slug: 'pypi',
-      title: 'PyPI Repository',
-      columnHeaders: ['Name', 'Versions', 'Size', 'Updated'],
-      countColumnLabel: 'Versions',
-      isHierarchical: false,
-      hasSearch: true,
-      searchEndpoint: '/api/ui/pypi/search',
-    },
-    detail: {
-      slug: 'pypi',
-      breadcrumbRootText: 'PyPI Repository',
-      hasInstallCommand: true,
-      installSectionLabel: 'Install Command',
-      installCommandPattern: /pip install .+ --index-url .+\/simple/,
       tableColumnHeaders: ['Versions', 'Size', 'Published'],
       hasMetadataPanel: false,
       hasClickableVersionRows: false,
@@ -389,12 +341,6 @@ export const REGISTRIES: RegistryContract[] = [
     list: {
       slug: 'rpm',
       title: 'RPM (yum/dnf)',
-    slug: 'deb',
-    displayName: 'Debian (APT)',
-    sidebarName: 'Debian',
-    list: {
-      slug: 'deb',
-      title: 'Debian (APT)',
       columnHeaders: ['Name', 'Items', 'Size', 'Updated'],
       countColumnLabel: 'Items',
       isHierarchical: false,
@@ -407,6 +353,22 @@ export const REGISTRIES: RegistryContract[] = [
       hasInstallCommand: true,
       installSectionLabel: 'Install Command',
       installCommandPattern: /dnf config-manager .+/,
+      tableColumnHeaders: ['Items', 'Size', 'Published'],
+      hasMetadataPanel: false,
+      hasClickableVersionRows: false,
+    },
+  },
+  {
+    slug: 'deb',
+    displayName: 'Debian (APT)',
+    sidebarName: 'Debian',
+    list: {
+      slug: 'deb',
+      title: 'Debian (APT)',
+      columnHeaders: ['Name', 'Items', 'Size', 'Updated'],
+      countColumnLabel: 'Items',
+      isHierarchical: false,
+      hasSearch: true,
       searchEndpoint: '/api/ui/deb/search',
     },
     detail: {
@@ -449,5 +411,11 @@ export function getRegistry(slug: string): RegistryContract {
 /** All registry slugs */
 export const ALL_SLUGS = REGISTRIES.map((r) => r.slug);
 
-/** Sidebar nav labels — short names shown in sidebar for all registries + Dashboard */
-export const SIDEBAR_LABELS = ['Dashboard', ...REGISTRIES.map((r) => r.sidebarName)];
+/** Sidebar labels include the named-repository chooser and all enabled formats. */
+export const SIDEBAR_LABELS = [
+  'Dashboard',
+  'Repositories',
+  'npm',
+  'PyPI',
+  ...REGISTRIES.map((r) => r.sidebarName),
+];

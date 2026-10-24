@@ -4,7 +4,6 @@
 use crate::config::UpstreamAuth;
 use crate::secrets::{expose_opt, ProtectedString};
 use serde::{Deserialize, Serialize};
-use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpmConfig {
@@ -12,7 +11,7 @@ pub struct NpmConfig {
     pub enabled: bool,
     /// Single upstream — the back-compat path (`NORA_NPM_PROXY`, old TOML).
     /// Used only when `proxies` is empty; see [`NpmConfig::route`].
-    #[serde(default = "default_npm_proxy")]
+    #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default, skip_serializing)]
     pub proxy_auth: Option<ProtectedString>,
@@ -147,19 +146,11 @@ fn is_valid_scope(scope: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-._~".contains(&b))
 }
 
-/// Default npm upstream. Single source for both the serde field-default and the
-/// `Default` impl, so the "table present without `proxy`" path and the "table
-/// omitted" path produce the same upstream (they diverged before — `#[serde(default)]`
-/// on an `Option` yields `None`, silently disabling proxying when `[npm]` is present).
-fn default_npm_proxy() -> Option<String> {
-    Some("https://registry.npmjs.org".to_string())
-}
-
 impl Default for NpmConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            proxy: default_npm_proxy(),
+            proxy: None,
             proxy_auth: None,
             proxies: Vec::new(),
             proxy_timeout: 30,
@@ -284,53 +275,6 @@ impl NpmConfig {
         }
         (warnings, errors)
     }
-
-    pub(in crate::config) fn apply_env_overrides(&mut self) {
-        if let Ok(val) = env::var("NORA_NPM_ENABLED") {
-            self.enabled = val.to_lowercase() == "true" || val == "1";
-        }
-        if let Ok(val) = env::var("NORA_NPM_PROXY") {
-            self.proxy = if val.is_empty() { None } else { Some(val) };
-        }
-        if let Ok(val) = env::var("NORA_NPM_PROXY_AUTH") {
-            self.proxy_auth = if val.is_empty() {
-                None
-            } else {
-                Some(ProtectedString::new(val))
-            };
-        }
-        if let Ok(val) = env::var("NORA_NPM_PROXY_TIMEOUT") {
-            super::super::parse_env_warn("NORA_NPM_PROXY_TIMEOUT", &val, &mut self.proxy_timeout);
-        }
-        if let Ok(val) = env::var("NORA_NPM_METADATA_TTL") {
-            super::super::parse_env_warn("NORA_NPM_METADATA_TTL", &val, &mut self.metadata_ttl);
-        }
-        if let Ok(val) = env::var("NORA_NPM_SERVE_STALE") {
-            self.serve_stale = !matches!(val.as_str(), "false" | "0");
-        }
-        if let Ok(val) = env::var("NORA_NPM_REVALIDATE") {
-            self.revalidate = !matches!(val.as_str(), "false" | "0");
-        }
-        if let Ok(val) = env::var("NORA_NPM_IMPORT_EMBEDDED") {
-            self.import_embedded = val
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
-        }
-        // Bearer tokens are read once, here; validation rejects a missing one.
-        for entry in &mut self.proxies {
-            if let NpmProxyEntry::Full(p) = entry {
-                if let Some(var) = &p.auth_bearer_env {
-                    p.auth_bearer = env::var(var)
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .map(ProtectedString::new);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -415,8 +359,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_single_proxy_keeps_working_with_basic_auth() {
+    fn an_explicit_protocol_upstream_preserves_basic_auth() {
         let mut c = NpmConfig::default();
+        assert!(c.upstream_urls().is_empty());
+        c.proxy = Some("https://registry.npmjs.org".into());
         c.proxy_auth = Some(ProtectedString::from("user:pass"));
         let up = c.route("@vendor/a").unwrap();
         assert_eq!(up.url, "https://registry.npmjs.org");

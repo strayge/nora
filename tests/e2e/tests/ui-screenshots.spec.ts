@@ -2,7 +2,7 @@
  * Visual Regression Tests for NORA Registry UI
  *
  * Uses Playwright's toHaveScreenshot() for pixel-level comparison.
- * Baselines are committed to git — they ARE the visual contract.
+ * Optional pixel checks require reviewed baselines for the current environment.
  *
  * First run:  npx playwright test ui-screenshots --update-snapshots
  * Later runs: npx playwright test ui-screenshots
@@ -61,8 +61,8 @@ test('detail: docker', async ({ page }) => {
 });
 
 test('detail: npm', async ({ page }) => {
-  await page.goto(`/ui/npm/${seed.npm.name}`);
-  await page.waitForSelector('#install-cmd', { state: 'visible' });
+  await page.goto(`/ui/repositories/${seed.npm.repository}/package/${seed.npm.name}`);
+  await page.getByRole('button', { name: 'Copy command' }).first().waitFor({ state: 'visible' });
   await expect(page).toHaveScreenshot('detail-npm.png', {
     maxDiffPixelRatio: 0.01,
   });

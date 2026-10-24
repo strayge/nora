@@ -405,27 +405,24 @@ async fn build_cargo_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     Some(to_sorted_vec(crates))
 }
 
-/// `pypi/<package>/dates.json`: the release dates NORA keeps for a package, not a file of it.
-fn is_pypi_dates_record(rest: &str) -> bool {
-    rest.split_once('/')
-        .is_some_and(|(_, file)| file == "dates.json")
-}
-
 async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "pypi/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    let mut metadata_packages = std::collections::HashSet::new();
 
     for (key, meta) in &keys {
         if let Some(rest) = key.strip_prefix("pypi/") {
             let parts: Vec<_> = rest.split('/').collect();
-            if parts.len() >= 2 {
+            if parts.len() == 2 {
                 let name = parts[0].to_string();
+                if parts[1].strip_suffix(".metadata").is_some_and(|parent| {
+                    nora_registry::pypi_files::served_extension(parent).is_some()
+                }) {
+                    metadata_packages.insert(name.clone());
+                }
                 let entry = packages.entry(name).or_insert((0, 0, 0));
-                // Count only real distribution files — a checksum sidecar
-                // (`<file>.sha256`) and the release-date record (`dates.json`) are not
-                // artifacts (#588). Their bytes still count toward size so the total
-                // matches on-disk du.
-                if !crate::gc::is_checksum_sidecar(key) && !is_pypi_dates_record(rest) {
+                // Core Metadata, checksum and date companions are not extra distributions.
+                if nora_registry::pypi_files::served_extension(parts[1]).is_some() {
                     entry.0 += 1;
                 }
 
@@ -437,8 +434,8 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
         }
     }
 
-    // A package NORA holds only the release dates of has no artifact to list.
-    packages.retain(|_, entry| entry.0 > 0);
+    // Metadata-only caches consume bytes without becoming extra distributions or packages.
+    packages.retain(|name, entry| entry.0 > 0 || metadata_packages.contains(name));
     Some(to_sorted_vec(packages))
 }
 
@@ -989,7 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pypi_index_excludes_checksum_sidecars_from_count() {
+    async fn pypi_index_excludes_checksums_core_metadata_and_indexes_from_distribution_count() {
         let (_d, s) = temp_storage();
         s.put("pypi/six/six-1.16.0-py3-none-any.whl", &[0u8; 100])
             .await
@@ -998,12 +995,24 @@ mod tests {
             .await
             .unwrap();
 
+        s.put("pypi/six/six-1.16.0-py3-none-any.whl.metadata", b"core")
+            .await
+            .unwrap();
+        s.put("pypi/six/metadata.json", b"{}").await.unwrap();
+        s.put("pypi/metadata-only/metadata-only-1.0.whl.metadata", b"core")
+            .await
+            .unwrap();
         let repos = build_pypi_index(&s).await.expect("index built");
-        assert_eq!(repos.len(), 1);
-        // ONE artifact, not two — the .sha256 sidecar is not an artifact (#588).
-        assert_eq!(repos[0].versions, 1, "checksum sidecar must not be counted");
-        // ...but its bytes still count toward size, so size == on-disk du.
-        assert_eq!(repos[0].size, 100 + 8);
+        assert_eq!(repos.len(), 2);
+        let six = repos.iter().find(|entry| entry.name == "six").unwrap();
+        assert_eq!(six.versions, 1);
+        assert_eq!(six.size, 100 + 8 + 4 + 2);
+        let metadata = repos
+            .iter()
+            .find(|entry| entry.name == "metadata-only")
+            .unwrap();
+        assert_eq!(metadata.versions, 0);
+        assert_eq!(metadata.size, 4);
     }
 
     #[tokio::test]
@@ -1017,12 +1026,12 @@ mod tests {
             .unwrap();
         // A package NORA holds only the release dates of (a refused download).
         s.put("pypi/other/dates.json", b"{}").await.unwrap();
-        // A file named like the record but deeper is still a file.
+        // Nested records are not distribution filenames either.
         s.put("pypi/deep/sub/dates.json", &[0u8; 5]).await.unwrap();
 
         let repos = build_pypi_index(&s).await.expect("index built");
         let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["deep", "six"], "{names:?}");
+        assert_eq!(names, ["six"], "{names:?}");
         let six = repos.iter().find(|r| r.name == "six").unwrap();
         assert_eq!(six.versions, 1, "dates.json is not an artifact");
         assert_eq!(six.size, 100 + 10, "its bytes still count toward size");

@@ -120,7 +120,7 @@ async fn publications_and_aliases_are_isolated_and_keep_the_public_base_path() {
 }
 
 #[tokio::test]
-async fn explicit_legacy_and_cross_format_aliases_replace_only_conflicting_routes() {
+async fn explicit_aliases_never_activate_unconfigured_singleton_routes() {
     let _lock = crate::test_env::env_lock();
     for prefix in ["/simple/", "/npm/"] {
         let context = with_named_repositories(create_test_context_with_config(|cfg| {
@@ -153,15 +153,39 @@ async fn explicit_legacy_and_cross_format_aliases_replace_only_conflicting_route
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
     let context = with_named_repositories(create_test_context_with_config(local_config)).await;
-    publish(&context, "/simple/", b"legacy").await;
-    let response = send(
-        &context.app,
-        Method::GET,
-        &format!("/simple/pkg/{FILE}"),
-        "",
-    )
-    .await;
-    assert_eq!(body_bytes(response).await.as_ref(), b"legacy");
+    context
+        .state
+        .storage
+        .put(&format!("pypi/pkg/{FILE}"), b"legacy")
+        .await
+        .unwrap();
+    assert_eq!(
+        send(&context.app, Method::POST, "/simple/", "")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            &context.app,
+            Method::GET,
+            &format!("/simple/pkg/{FILE}"),
+            ""
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        context
+            .state
+            .storage
+            .get(&format!("pypi/pkg/{FILE}"))
+            .await
+            .unwrap()
+            .as_ref(),
+        b"legacy"
+    );
     assert!(context
         .state
         .repositories
@@ -311,6 +335,10 @@ async fn disabled_named_formats_do_not_mount_or_suppress_other_formats() {
         send(&context.app, Method::GET, "/npm/-/whoami", "")
             .await
             .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&context.app, Method::GET, "/v2/", "").await.status(),
         StatusCode::OK
     );
 }

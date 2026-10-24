@@ -338,7 +338,8 @@ jobs:
 
       - name: Start NORA
         run: |
-          NORA_STORAGE_PATH=/tmp/nora-data ./target/release/nora &
+          NORA_CONFIG_PATH="$PWD/tests/repositories/smoke.toml" \
+            NORA_STORAGE_PATH=/tmp/nora-data ./target/release/nora &
           for i in $(seq 1 15); do
             curl -sf http://localhost:4000/health && break || sleep 2
           done
@@ -366,9 +367,8 @@ jobs:
 
       - name: npm — verify registry endpoint
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/npm/lodash)
-          echo "npm endpoint returned: $STATUS"
-          [ "$STATUS" != "000" ] && echo "npm endpoint OK" || (echo "npm endpoint unreachable" && exit 1)
+          curl -sf http://localhost:4000/npm/lodash | jq -e '.name == "lodash"'
+          echo "Explicit npm group endpoint OK"
 
       - name: Maven — deploy and download artifact
         run: |

@@ -51,8 +51,114 @@ impl MetadataRefresh {
     }
 }
 
+pub(crate) fn valid_package_name(name: &str) -> bool {
+    matches!(classify_metadata_path(name), MetadataPath::Packument { name: parsed } if parsed==name)
+        && crate::validation::validate_storage_key(&format!("npm/{name}")).is_ok()
+}
+
+pub(crate) async fn stored_package_presence(
+    state: &AppState,
+    name: &str,
+) -> crate::repositories::groups::Lookup<(), Box<Response>> {
+    use crate::repositories::groups::Lookup;
+    let unavailable = || {
+        Lookup::Failure(Box::new((StatusCode::SERVICE_UNAVAILABLE,"Source selection requires trusted stored metadata; refresh through the package client endpoint").into_response()))
+    };
+    let Some(repository) = &state.repository else {
+        return unavailable();
+    };
+    if matches!(
+        repository.definition,
+        crate::config::repositories::RepositoryConfig::Local(_)
+    ) {
+        return match published_state(&state.storage, name).await {
+            Published::Yes(_) => Lookup::Present(()),
+            Published::No => Lookup::Absent,
+            Published::Unknown => unavailable(),
+        };
+    }
+    if let Some(response) = crate::curation::check_namespace_isolation(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        name,
+    ) {
+        return Lookup::Failure(Box::new(response));
+    }
+    let key = upstream_packument_key(name);
+    if !cached_copy_trusted(state, name, &key, name, None).await {
+        return unavailable();
+    }
+    let Ok(bytes) = state.storage.get(&key).await else {
+        return unavailable();
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(document)
+            if document["name"].as_str() == Some(name) && document["versions"].is_object() =>
+        {
+            Lookup::Present(())
+        }
+        _ => unavailable(),
+    }
+}
+
+pub(crate) async fn known_packages(state: &AppState) -> Result<Vec<String>, StatusCode> {
+    let mut names: std::collections::BTreeSet<String> = state
+        .repo_index
+        .get("npm", &state.storage)
+        .await
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let proxy = state.repository.as_ref().is_some_and(|repository| {
+        matches!(
+            repository.definition,
+            crate::config::repositories::RepositoryConfig::Proxy(_)
+        )
+    });
+    let template = if proxy {
+        upstream_packument_key("")
+    } else {
+        published_packument_key("")
+    };
+    let suffix = template
+        .strip_prefix("npm/")
+        .expect("npm metadata key prefix");
+    for key in state
+        .storage
+        .list("npm/")
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    {
+        let Some(name) = key
+            .strip_prefix("npm/")
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if !valid_package_name(name) || !cached_copy_trusted(state, name, &key, name, None).await {
+            continue;
+        }
+        let data = state
+            .storage
+            .get(&key)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let document: serde_json::Value =
+            serde_json::from_slice(&data).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if document["name"].as_str() != Some(name) || !document["versions"].is_object() {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        names.insert(name.to_owned());
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(test)]
 pub fn routes() -> Router<AppState> {
-    routes_at("/npm/", true)
+    routes_at("/npm/", true).layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("sandbox"),
+    ))
 }
 
 pub(crate) fn routes_at(prefix: &str, publish: bool) -> Router<AppState> {
@@ -236,9 +342,7 @@ async fn handle_npm_post(
     .await
     {
         Ok((code, resp_body, resp_ct)) => {
-            state
-                .audit
-                .log(AuditEntry::new("proxy_fetch", "proxy", "", "npm", "audit"));
+            state.log_audit(AuditEntry::new("proxy_fetch", "proxy", "", "npm", "audit"));
             let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
             let ct = resp_ct
                 .as_deref()
@@ -721,9 +825,7 @@ async fn handle_request(
             crate::registry_type::RegistryType::Npm,
             "CACHE",
         ));
-        state
-            .audit
-            .log(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
+        state.log_audit(AuditEntry::new("cache_hit", "proxy", "", "npm", ""));
         let digest_origin = state
             .repository
             .as_ref()
@@ -829,9 +931,7 @@ async fn handle_request(
                     crate::registry_type::RegistryType::Npm,
                     "PROXY",
                 ));
-                state
-                    .audit
-                    .log(AuditEntry::new("proxy_fetch", "proxy", "", "npm", ""));
+                state.log_audit(AuditEntry::new("proxy_fetch", "proxy", "", "npm", ""));
 
                 let data_to_serve = data;
                 if save_files {
@@ -2133,7 +2233,7 @@ async fn handle_publish(
             StatusCode::CONFLICT,
             // npm shows a registry error's `error` field, not a plain-text body.
             axum::Json(serde_json::json!({ "error": format!(
-                "{metadata_key} holds a packument with no record of where it came from: an upstream package cached by NORA 1.3.3 or older, or a package published to NORA 0.9.3 or older. Publishing over it would import its versions as published ones. If it is a cache, delete {metadata_key} and publish again; if it is your own package, set NORA_NPM_IMPORT_EMBEDDED={package_name} and publish again."
+                "{metadata_key} holds a packument with no trusted origin. Publishing over it would import its versions as published ones. Restore trusted published state from a backup, or verify the contents and perform operator-managed cleanup before publishing the original package to an explicit local alias. Automatic legacy adoption is unsupported."
             ) })),
         )
             .into_response();
@@ -2313,7 +2413,7 @@ async fn handle_publish(
     }
 
     state.metrics.record_upload("npm");
-    state.audit.log(AuditEntry::new(
+    state.log_audit(AuditEntry::new(
         "push",
         crate::auth::audit_actor(&user),
         &package_name,
@@ -8434,7 +8534,7 @@ mod published_and_upstream_keys {
         let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
         assert!(
             text.contains("npm/corp-lib/metadata.json")
-                && text.contains("NORA_NPM_IMPORT_EMBEDDED=corp-lib"),
+                && text.contains("operator-managed cleanup"),
             "{text}"
         );
         assert!(ctx
@@ -8539,7 +8639,7 @@ mod published_and_upstream_keys {
     #[test]
     fn the_published_key_is_reached_only_from_the_published_side() {
         let source = include_str!("npm.rs");
-        let production = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        let production = &source[..source.find("\n#[cfg(test)]\nmod ").unwrap()];
         let mut current = "";
         let mut literal_in: Vec<String> = Vec::new();
         let mut published_callers = std::collections::BTreeSet::new();
@@ -8580,6 +8680,7 @@ mod published_and_upstream_keys {
             published_callers.into_iter().collect::<Vec<_>>(),
             [
                 "handle_publish",
+                "known_packages",
                 "load_published_packument",
                 "packument_key_for_reading",
                 "published_state",

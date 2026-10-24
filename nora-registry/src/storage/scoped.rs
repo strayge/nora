@@ -87,6 +87,10 @@ impl StorageBackend for ScopedBackend {
         self.inner.stat(&self.key(key).ok()?).await
     }
 
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(&self.key(key)?).await
+    }
+
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }

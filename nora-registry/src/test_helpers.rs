@@ -438,8 +438,25 @@ pub async fn with_named_repositories(mut context: TestContext) -> TestContext {
 }
 
 fn router_for_state(state: &AppState) -> Router {
-    let registry_routes = crate::registry_routes(&state.enabled_registries, &state.config)
-        .merge(state.repositories.routes(state));
+    let mut registry_routes =
+        crate::registry_routes(&state.enabled_registries).merge(state.repositories.routes(state));
+    // Historical handler fixtures use unscoped storage explicitly; production never mounts these routes.
+    if state.config.repositories.is_empty() {
+        let mut legacy = Router::new();
+        if state
+            .enabled_registries
+            .contains(&crate::registry_type::RegistryType::Npm)
+        {
+            legacy = legacy.merge(crate::registry::npm_routes());
+        }
+        if state
+            .enabled_registries
+            .contains(&crate::registry_type::RegistryType::PyPI)
+        {
+            legacy = legacy.merge(crate::registry::pypi_routes());
+        }
+        registry_routes = registry_routes.merge(legacy);
+    }
     let public_routes = Router::new()
         .merge(crate::health::routes())
         .merge(crate::metrics::routes());
@@ -540,6 +557,8 @@ pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
     failed_write_prefix: parking_lot::RwLock<Option<String>>,
     failed_read_prefix: parking_lot::RwLock<Option<String>>,
+    failed_delete_prefix: parking_lot::RwLock<Option<String>>,
+    failed_stat_prefix: parking_lot::RwLock<Option<String>>,
 }
 
 impl OpCounts {
@@ -551,6 +570,28 @@ impl OpCounts {
     /// Failed package reads must not masquerade as confirmed absence during selection.
     pub fn fail_reads_to(&self, prefix: Option<&str>) {
         *self.failed_read_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    pub fn fail_deletes_to(&self, prefix: Option<&str>) {
+        *self.failed_delete_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    pub fn fail_stats_to(&self, prefix: Option<&str>) {
+        *self.failed_stat_prefix.write() = prefix.map(str::to_owned);
+    }
+
+    fn check_delete(&self, key: &str) -> crate::storage::Result<()> {
+        if self
+            .failed_delete_prefix
+            .read()
+            .as_ref()
+            .is_some_and(|prefix| key.starts_with(prefix))
+        {
+            return Err(crate::storage::StorageError::Network(
+                "injected delete failure".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn check_read(&self, key: &str) -> crate::storage::Result<()> {
@@ -663,6 +704,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
         self.counts.hit("delete");
+        self.counts.check_delete(key)?;
         self.inner.delete(key).await
     }
 
@@ -672,8 +714,33 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.list(prefix).await
     }
 
+    async fn exists(&self, key: &str) -> crate::storage::Result<bool> {
+        self.counts.hit("stat");
+        if self
+            .counts
+            .failed_stat_prefix
+            .read()
+            .as_ref()
+            .is_some_and(|prefix| key.starts_with(prefix))
+        {
+            return Err(crate::storage::StorageError::Io(std::io::Error::other(
+                "injected existence failure",
+            )));
+        }
+        self.inner.exists(key).await
+    }
+
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
         self.counts.hit("stat");
+        if self
+            .counts
+            .failed_stat_prefix
+            .read()
+            .as_ref()
+            .is_some_and(|prefix| key.starts_with(prefix))
+        {
+            return None;
+        }
         self.inner.stat(key).await
     }
 

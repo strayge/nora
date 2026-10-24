@@ -238,6 +238,13 @@ async fn backup_round_trip_preserves_hidden_identity_provenance_and_pins() {
         .put(record, b"source-specific record")
         .await
         .unwrap();
+    let extra=[(format!("{file}.metadata"),b"Metadata-Version: 2.3\n".to_vec()),
+        (crate::registry::pypi_ready_key_for_body(file).unwrap(),serde_json::to_vec(&serde_json::json!({"source_id":member.source_id,"size":8,"hashes":{"sha256":"proof"}})).unwrap()),
+        (crate::registry::pypi_ready_key_for_body(&format!("{file}.metadata")).unwrap(),br#"{"parent_binding":"bound","size":22}"#.to_vec()),
+        (".nora-pypi-index/pkg.json".into(),br#"{"schema":2,"name":"pkg","quarantined":false,"project":{"status":{"status":"deprecated","reason":"retained"}}}"#.to_vec())];
+    for (key, data) in &extra {
+        member.storage.put(key, data).await.unwrap();
+    }
     let archive_dir = tempfile::tempdir().unwrap();
     let archive = archive_dir.path().join("backup.tar.gz");
     crate::backup::create_backup(&root, &archive).await.unwrap();
@@ -256,6 +263,13 @@ async fn backup_round_trip_preserves_hidden_identity_provenance_and_pins() {
         copy.storage.get(record).await.unwrap().as_ref(),
         b"source-specific record"
     );
+    for (key, data) in &extra {
+        assert_eq!(
+            copy.storage.get(key).await.unwrap().as_ref(),
+            data.as_slice()
+        );
+        assert_eq!(copy.storage.pin(key).await, member.storage.pin(key).await);
+    }
     assert!(restored
         .list("")
         .await
@@ -276,6 +290,13 @@ async fn backup_round_trip_preserves_hidden_identity_provenance_and_pins() {
         copy.storage.get(record).await.unwrap().as_ref(),
         b"source-specific record"
     );
+    for (key, data) in &extra {
+        assert_eq!(
+            copy.storage.get(key).await.unwrap().as_ref(),
+            data.as_slice()
+        );
+        assert_eq!(copy.storage.pin(key).await, member.storage.pin(key).await);
+    }
 }
 
 #[tokio::test]
@@ -306,9 +327,28 @@ async fn manual_maintenance_previews_include_members_without_creating_namespaces
         .put("pypi/pkg/pkg-1.tar.gz.sha256", b"orphan")
         .await
         .unwrap();
+    let legacy = [
+        (
+            "npm/old/metadata.json",
+            br#"{"versions":{"1.0.0":{}}}"#.as_slice(),
+        ),
+        (
+            "npm/old/old-1.0.0.tgz.sha256",
+            b"legacy checksum".as_slice(),
+        ),
+        ("pypi/pkg/pkg-0.tar.gz", b"legacy distribution".as_slice()),
+        ("pypi/pkg/missing.whl.sha256", b"legacy orphan".as_slice()),
+        (
+            ".nora-pypi-ready/pkg/missing.whl.json",
+            b"legacy proof".as_slice(),
+        ),
+    ];
+    for (key, bytes) in legacy {
+        root.put(key, bytes).await.unwrap();
+    }
     cfg.gc.grace_secs = 0;
     let locks = Arc::default();
-    let mut result = crate::gc::run_gc(&root, &locks, true, 0, false, 0).await;
+    let mut result = crate::gc::run_root_gc(&root, &locks, true, 0, 0).await;
     catalogue.extend_gc(&cfg, true, &mut result).await;
     assert_eq!(result.orphaned, 1);
     assert!(result.orphan_keys[0].starts_with("local:"));
@@ -317,7 +357,7 @@ async fn manual_maintenance_previews_include_members_without_creating_namespaces
         .stat("pypi/pkg/pkg-1.tar.gz.sha256")
         .await
         .is_some());
-    let mut result = crate::gc::run_gc(&root, &locks, false, 0, false, 0).await;
+    let mut result = crate::gc::run_root_gc(&root, &locks, false, 0, 0).await;
     catalogue.extend_gc(&cfg, false, &mut result).await;
     assert_eq!(result.deleted, 1);
     local
@@ -334,15 +374,73 @@ async fn manual_maintenance_previews_include_members_without_creating_namespaces
         exclude_tags: Vec::new(),
     }];
     let mut result =
-        crate::retention::run_retention(&root, &locks, None, &cfg.retention.rules, true).await;
+        crate::retention::run_root_retention(&root, &locks, None, &cfg.retention.rules, true).await;
     catalogue.extend_retention(&cfg, true, &mut result).await;
     assert_eq!(result.planned, 1);
     assert!(result.plans[0].0.starts_with("local:"));
     assert!(local.storage.stat("pypi/pkg/pkg-1.tar.gz").await.is_some());
     let mut result =
-        crate::retention::run_retention(&root, &locks, None, &cfg.retention.rules, false).await;
+        crate::retention::run_root_retention(&root, &locks, None, &cfg.retention.rules, false)
+            .await;
     catalogue.extend_retention(&cfg, false, &mut result).await;
     assert_eq!(result.deleted_keys, 1);
+    for (key, bytes) in legacy {
+        assert_eq!(root.get(key).await.unwrap().as_ref(), bytes, "{key}");
+    }
+}
+
+#[tokio::test]
+async fn scheduled_member_maintenance_still_retires_only_its_scoped_artifacts_and_companions() {
+    let _lock = crate::test_env::env_lock();
+    let configured = config();
+    let context = crate::test_helpers::with_named_repositories(
+        crate::test_helpers::create_test_context_with_config(move |c| {
+            c.repositories = configured.repositories;
+            c.gc.enabled = true;
+            c.gc.grace_secs = 0;
+            c.retention.enabled = true;
+            c.retention.rules = vec![crate::config::RetentionRule {
+                registry: "pypi".into(),
+                name_glob: None,
+                keep_last: Some(0),
+                older_than_days: None,
+                include_tags: vec![],
+                exclude_tags: vec![],
+            }];
+        }),
+    )
+    .await;
+    let member = context.state.repositories.get("local").unwrap();
+    let orphan = "pypi/demo/missing.whl.sha256";
+    member.storage.put(orphan, b"orphan").await.unwrap();
+    context.state.repositories.gc(&context.state).await;
+    assert!(member.storage.stat(orphan).await.is_none());
+    let bodies = [
+        "pypi/demo/demo-1.0-py3-none-any.whl",
+        "pypi/demo/demo-1.0-py3-none-any.whl.metadata",
+    ];
+    for body in bodies {
+        member.storage.put(body, b"body").await.unwrap();
+        member
+            .storage
+            .put(
+                &crate::registry::pypi_ready_key_for_body(body).unwrap(),
+                b"proof",
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(member.index.get("pypi", &member.storage).await.len(), 1);
+    context.state.repositories.retain(&context.state).await;
+    for body in bodies {
+        assert!(member.storage.stat(body).await.is_none());
+        assert!(member
+            .storage
+            .stat(&crate::registry::pypi_ready_key_for_body(body).unwrap())
+            .await
+            .is_none());
+    }
+    assert!(member.index.get("pypi", &member.storage).await.is_empty());
 }
 
 #[tokio::test]
@@ -356,6 +454,7 @@ async fn same_upstream_repositories_remain_independent_and_retained_sources_are_
     proxy.paths = vec!["/another/".into()];
     cfg.repositories.insert("another".into(), second);
     let first = RepositoryCatalogue::open(&cfg, &root).await.unwrap();
+    assert!(first.retained_namespaces(&root).await.unwrap().is_empty());
     let key = "pypi/pkg/pkg-1.tar.gz";
     first
         .get("remote")

@@ -36,7 +36,11 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
                 r.downloads,
                 r.uploads,
                 r.size_bytes,
-                &format!("/ui/{}", r.name),
+                &if matches!(r.name.as_str(), "npm" | "pypi") {
+                    format!("/ui/repositories?format={}", r.name)
+                } else {
+                    format!("/ui/{}", r.name)
+                },
                 t,
             )
         })

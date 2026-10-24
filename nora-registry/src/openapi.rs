@@ -1504,10 +1504,89 @@ fn swagger_ui_file(name: &str) -> Response {
     }
 }
 
-/// `/api-docs`: the Swagger UI page (`/api-docs` redirects to `/api-docs/`), the files it
-/// loads, and the OpenAPI document at `/api-docs/openapi.json`.
+/// Template protocol paths are mounted only at explicit aliases, with writes limited to locals.
+fn configured_spec(state: &AppState) -> utoipa::openapi::OpenApi {
+    let mut spec = ApiDoc::openapi();
+    let templates = spec.paths.paths.clone();
+    spec.paths.paths.retain(|path, item| {
+        !path.starts_with("/npm/")
+            && !path.starts_with("/simple/")
+            && ![
+                item.get.as_ref(),
+                item.put.as_ref(),
+                item.post.as_ref(),
+                item.delete.as_ref(),
+                item.patch.as_ref(),
+                item.head.as_ref(),
+                item.options.as_ref(),
+                item.trace.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|operation| {
+                operation
+                    .tags
+                    .iter()
+                    .flatten()
+                    .filter_map(|tag| crate::registry_type::RegistryType::from_str_opt(tag))
+                    .any(|format| !state.enabled_registries.contains(&format))
+            })
+    });
+    for (repository, definition) in &state.config.repositories {
+        let (prefix, format) = match definition.format() {
+            crate::config::repositories::RepositoryFormat::Npm => {
+                ("/npm", crate::registry_type::RegistryType::Npm)
+            }
+            crate::config::repositories::RepositoryFormat::Pypi => {
+                ("/simple", crate::registry_type::RegistryType::PyPI)
+            }
+        };
+        if !state.enabled_registries.contains(&format) {
+            continue;
+        }
+        for (path, template) in &templates {
+            let Some(suffix) = path.strip_prefix(prefix) else {
+                continue;
+            };
+            for (alias_index, alias) in definition.paths().iter().enumerate() {
+                let mut item = template.clone();
+                if !matches!(
+                    definition,
+                    crate::config::repositories::RepositoryConfig::Local(_)
+                ) {
+                    item.put = None;
+                    item.post = None;
+                    item.delete = None;
+                    item.patch = None;
+                }
+                for operation in [
+                    &mut item.get,
+                    &mut item.put,
+                    &mut item.post,
+                    &mut item.delete,
+                    &mut item.patch,
+                    &mut item.head,
+                    &mut item.options,
+                    &mut item.trace,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(id) = &operation.operation_id {
+                        operation.operation_id = Some(format!("{repository}_{alias_index}_{id}"));
+                    }
+                }
+                spec.paths
+                    .paths
+                    .insert(format!("{}{suffix}", alias.trim_end_matches('/')), item);
+            }
+        }
+    }
+    spec
+}
+
+/// The served document follows the same explicit aliases as the protocol router.
 pub fn routes() -> Router<AppState> {
-    let spec = ApiDoc::openapi();
     Router::new()
         .route("/api-docs", get(|| async { Redirect::to("/api-docs/") }))
         .route(
@@ -1516,10 +1595,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/api-docs/openapi.json",
-            get(move || {
-                let spec = spec.clone();
-                async move { Json(spec) }
-            }),
+            get(
+                |axum::extract::State(state): axum::extract::State<AppState>| async move {
+                    Json(configured_spec(&state))
+                },
+            ),
         )
         .route(
             "/api-docs/{file}",
@@ -1531,6 +1611,62 @@ pub fn routes() -> Router<AppState> {
 mod tests {
     use super::ApiDoc;
     use utoipa::OpenApi;
+
+    #[tokio::test]
+    async fn served_spec_has_only_explicit_named_aliases_and_local_write_operations() {
+        let context = crate::test_helpers::create_test_context_with_config(|config| {
+            config.repositories=toml::from_str::<crate::config::Config>("[repositories.local]\nformat='npm'\nkind='local'\npaths=['/hosted/','/hosted-alias/']\n[repositories.all]\nformat='npm'\nkind='group'\npaths=['/all/']\nmembers=['local']\n[repositories.python]\nformat='pypi'\nkind='proxy'\npaths=['/python/']\nupstream='https://pypi.org/simple/'\n").unwrap().repositories;
+        });
+        let spec = serde_json::to_value(super::configured_spec(&context.state)).unwrap();
+        let paths = &spec["paths"];
+        assert!(paths.get("/npm/{name}").is_none() && paths.get("/simple/").is_none());
+        for prefix in ["/hosted/", "/hosted-alias/"] {
+            assert!(paths[format!("{prefix}{{name}}")]["put"].is_object());
+        }
+        assert!(
+            paths["/all/{name}"]["get"].is_object() && paths["/all/{name}"].get("put").is_none()
+        );
+        assert!(paths["/python/"]["get"].is_object() && paths["/python/"].get("post").is_none());
+        assert!(paths["/v2/"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn alias_operations_have_unique_ids_and_do_not_overlap_disabled_mount_templates() {
+        let context = crate::test_helpers::create_test_context_with_config(|config| {
+            let parsed:crate::config::Config=toml::from_str("[registries]\nenable=['npm']\n[repositories.remote]\nformat='npm'\nkind='proxy'\npaths=['/maven2/','/another/']\nupstream='https://registry.example'\n").unwrap();
+            config.repositories = parsed.repositories;
+            config.registries = parsed.registries;
+        });
+        let spec = serde_json::to_value(super::configured_spec(&context.state)).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/maven2/{name}") && !paths.contains_key("/maven2/{path}"));
+        assert!(!paths.contains_key("/v2/"));
+        assert!(paths["/maven2/{name}"].get("put").is_none());
+        let mut ids = std::collections::BTreeSet::new();
+        let mut shapes = std::collections::BTreeSet::new();
+        for (path, item) in paths {
+            assert!(
+                shapes.insert(
+                    path.split('/')
+                        .map(
+                            |segment| if segment.starts_with('{') && segment.ends_with('}') {
+                                "{}"
+                            } else {
+                                segment
+                            }
+                        )
+                        .collect::<Vec<_>>()
+                        .join("/")
+                ),
+                "equivalent path: {path}"
+            );
+            for operation in item.as_object().unwrap().values() {
+                if let Some(id) = operation.get("operationId").and_then(|id| id.as_str()) {
+                    assert!(ids.insert(id), "duplicate operation ID: {id}");
+                }
+            }
+        }
+    }
 
     /// Swagger UI comes from the files in `ui/static/swagger-ui/`, embedded in the binary,
     /// as `utoipa-swagger-ui` served them before: `/api-docs` redirects to the page, each
@@ -1573,7 +1709,10 @@ mod tests {
         assert_eq!(header(&resp, "content-type"), "application/json");
         let spec: serde_json::Value =
             serde_json::from_slice(&body_bytes(resp).await).expect("the spec is JSON");
-        assert_eq!(spec, serde_json::to_value(ApiDoc::openapi()).unwrap());
+        assert_eq!(
+            spec,
+            serde_json::to_value(super::configured_spec(&ctx.state)).unwrap()
+        );
 
         for path in [
             "/api-docs/swagger-ui-bundle.js.map",

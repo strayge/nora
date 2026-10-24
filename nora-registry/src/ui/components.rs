@@ -155,6 +155,14 @@ pub fn sidebar_dark_with_registries(
             true,
         ),
         (
+            None,
+            "repositories",
+            "/ui/repositories",
+            t.nav_repositories,
+            r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7h7l2 2h9v11H3V7z"/>"#,
+            true,
+        ),
+        (
             Some(RegistryType::Docker),
             "docker",
             "/ui/docker",
@@ -333,7 +341,7 @@ pub fn sidebar_dark_with_registries(
 
     let dashboard_html: String = nav_items
         .iter()
-        .filter(|(id, _, _, _, _)| *id == "dashboard")
+        .filter(|(id, _, _, _, _)| matches!(*id, "dashboard" | "repositories"))
         .map(|(id, href, label, icon, is_stroke)| {
             render_nav_item(id, href, label, icon, *is_stroke)
         })
@@ -341,7 +349,7 @@ pub fn sidebar_dark_with_registries(
 
     let registries_html: String = nav_items
         .iter()
-        .filter(|(id, _, _, _, _)| *id != "dashboard")
+        .filter(|(id, _, _, _, _)| !matches!(*id, "dashboard" | "repositories"))
         .map(|(id, href, label, icon, is_stroke)| {
             render_nav_item(id, href, label, icon, *is_stroke)
         })

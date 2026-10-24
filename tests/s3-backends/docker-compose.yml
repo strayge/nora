@@ -108,6 +108,9 @@ services:
       NORA_STORAGE_S3_SECRET_KEY: minioadmin
       NORA_RATE_LIMIT_ENABLED: "false"
       NORA_PUBLIC_URL: http://localhost:15001
+      NORA_CONFIG_PATH: /etc/nora/repositories.toml
+    volumes:
+      - ../repositories/smoke.toml:/etc/nora/repositories.toml:ro
     ports:
       - "15001:5000"
 
@@ -128,6 +131,9 @@ services:
       NORA_STORAGE_S3_REGION: us-east-1
       NORA_RATE_LIMIT_ENABLED: "false"
       NORA_PUBLIC_URL: http://localhost:15002
+      NORA_CONFIG_PATH: /etc/nora/repositories.toml
+    volumes:
+      - ../repositories/smoke.toml:/etc/nora/repositories.toml:ro
     ports:
       - "15002:5000"
 
@@ -153,8 +159,10 @@ services:
       NORA_STORAGE_S3_REGION: garage
       NORA_RATE_LIMIT_ENABLED: "false"
       NORA_PUBLIC_URL: http://localhost:15003
+      NORA_CONFIG_PATH: /etc/nora/repositories.toml
     volumes:
       - garage-creds:/creds:ro
+      - ../repositories/smoke.toml:/etc/nora/repositories.toml:ro
     ports:
       - "15003:5000"
 

@@ -54,11 +54,8 @@ fn registry_of(key: &str) -> &str {
     key.split_once(':').map_or(key, |(registry, _)| registry)
 }
 
-/// Breaker keys whose `nora_circuit_breaker_state` series is exported at
-/// startup (#441): one per configured upstream for the formats keyed per
-/// upstream (Docker, PyPI, npm), the format name for every other format. A format
-/// keyed per upstream gets no format-named series — it would sit at 0 (closed)
-/// forever while the real state moves on the per-upstream series.
+/// Named npm/PyPI series use configured repository/source identities, never default URLs.
+/// Docker keeps per-upstream keys; other formats retain their format-level series.
 pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> {
     let mut keys = Vec::new();
     for rt in RegistryType::all() {
@@ -70,20 +67,7 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
                     .iter()
                     .map(|up| upstream_key(rt.as_str(), &up.url)),
             ),
-            RegistryType::PyPI => keys.extend(
-                config
-                    .pypi
-                    .upstreams()
-                    .iter()
-                    .map(|up| upstream_key(rt.as_str(), up.url())),
-            ),
-            RegistryType::Npm => keys.extend(
-                config
-                    .npm
-                    .upstream_urls()
-                    .into_iter()
-                    .map(|url| upstream_key(rt.as_str(), url)),
-            ),
+            RegistryType::PyPI | RegistryType::Npm => {}
             _ => keys.push(rt.as_str().to_string()),
         }
     }
@@ -1089,12 +1073,11 @@ mod tests {
         assert!(cb.health_snapshot("py").is_none(), "format matched whole");
     }
 
-    /// Startup series: per configured upstream for Docker, PyPI and npm, the format
-    /// name for the rest — never a format-named series that cannot move.
+    /// Startup series must match the runtime breaker identity without exposing named upstream URLs.
     #[test]
     fn initial_gauge_keys_follow_the_breaker_keys() {
         let mut config = crate::config::Config::default();
-        config.pypi.proxy = Some("https://pypi.org/simple/".into());
+        config.repositories=toml::from_str::<crate::config::Config>("[repositories.npm]\nformat='npm'\nkind='proxy'\npaths=['/npm/']\nupstream='https://registry.npmjs.org'\n[repositories.python]\nformat='pypi'\nkind='proxy'\npaths=['/simple/']\nupstream='https://pypi.org/simple/'\n").unwrap().repositories;
         config.docker.upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".into(),
             auth: None,
@@ -1102,9 +1085,14 @@ mod tests {
             prefix: None,
         }];
         let keys = initial_gauge_keys(&config);
-        assert!(keys.contains(&"pypi:https://pypi.org/simple".to_string()));
         assert!(keys.contains(&"docker:https://registry-1.docker.io".to_string()));
-        assert!(keys.contains(&"npm:https://registry.npmjs.org".to_string()));
+        for (name, format) in [("npm", RegistryType::Npm), ("python", RegistryType::PyPI)] {
+            let source = crate::repositories::source_id(&config.repositories[name]).unwrap();
+            assert!(keys.contains(&repository_key(format, name, &source)));
+        }
+        assert!(!keys
+            .iter()
+            .any(|key| key.contains("registry.npmjs.org") || key.contains("pypi.org")));
         assert!(
             keys.contains(&"cargo".to_string()),
             "formats without per-upstream keys"
