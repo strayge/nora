@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The NORA Authors
+// Copyright (c) 2026 strayge
 // SPDX-License-Identifier: MIT
 
 use super::local_index_cost_tests::{upload_body, BOUNDARY};

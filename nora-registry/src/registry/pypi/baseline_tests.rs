@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The NORA Authors
+// Copyright (c) 2026 strayge
 // SPDX-License-Identifier: MIT
 
 //! Characterize the singleton transfer paths before named repository integration.

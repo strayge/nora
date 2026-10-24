@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 The NORA Authors
+# Copyright (c) 2026 strayge
 # SPDX-License-Identifier: MIT
 
 """Measure a real process: bounded streaming, stalled fallback, graceful drain and SIGKILL recovery."""

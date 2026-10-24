@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The NORA Authors
+// Copyright (c) 2026 strayge
 // SPDX-License-Identifier: MIT
 
 //! Public URLs are rendered separately from the source's distribution metadata.

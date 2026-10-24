@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The NORA Authors
+// Copyright (c) 2026 strayge
 // SPDX-License-Identifier: MIT
 
 //! The pre-cutover catalogue: configuration only, independent of legacy routes.

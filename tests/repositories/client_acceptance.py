@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 The NORA Authors
+# Copyright (c) 2026 strayge
 # SPDX-License-Identifier: MIT
 
 """Exercise real clients against isolated temporary repositories, never user configuration."""
