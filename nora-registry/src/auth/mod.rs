@@ -2789,6 +2789,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
             repository: ctx.state.repository.clone(),
             repository_mount: ctx.state.repository_mount.clone(),
             metadata_deadline: ctx.state.metadata_deadline,
+            background_tasks: ctx.state.background_tasks.clone(),
+            background_cancel: ctx.state.background_cancel.clone(),
             storage: ctx.state.storage.clone(),
             config: ctx.state.config.clone(),
             enabled_registries: ctx.state.enabled_registries.clone(),

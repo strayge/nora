@@ -116,7 +116,7 @@ struct FetchGuard<T> {
     map: SlotMap<T>,
     key: String,
     slot: Arc<Slot<T>>,
-    registry: &'static str,
+    registry: Option<&'static str>,
 }
 
 impl<T> Drop for FetchGuard<T> {
@@ -135,9 +135,11 @@ impl<T> Drop for FetchGuard<T> {
           // rest re-check `result` (None on leader failure/cancel) and fall
           // through to their own fetch.
         self.slot.ready.notify_waiters();
-        crate::metrics::PROXY_INFLIGHT
-            .with_label_values(&[self.registry])
-            .dec();
+        if let Some(registry) = self.registry {
+            crate::metrics::PROXY_INFLIGHT
+                .with_label_values(&[registry])
+                .dec();
+        }
     }
 }
 
@@ -203,7 +205,7 @@ where
                     map: Arc::clone(&self.map),
                     key: key.to_string(),
                     slot: Arc::clone(&slot),
-                    registry,
+                    registry: Some(registry),
                 };
                 let out = fetch().await;
                 // Publish BEFORE the guard drops so a follower woken by the
@@ -289,7 +291,7 @@ where
                         map: Arc::clone(&self.map),
                         key: key.to_string(),
                         slot: Arc::clone(&slot),
-                        registry,
+                        registry: Some(registry),
                     };
                     let (value, own) = fetch().await?; // `guard` drops on `None`
                     slot.publish(value.clone());
@@ -334,6 +336,21 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Recovery eligibility must reserve a whole source without counting a second fetch.
+    pub fn try_lease(&self, key: &str) -> Option<Lease<T>> {
+        match self.elect(key) {
+            Role::Follower(_) => None,
+            Role::Leader(slot) => Some(Lease {
+                _guard: FetchGuard {
+                    map: Arc::clone(&self.map),
+                    key: key.to_owned(),
+                    slot,
+                    registry: None,
+                },
+            }),
         }
     }
 
@@ -394,6 +411,16 @@ mod tests {
 
     fn budget() -> Duration {
         Duration::from_secs(5)
+    }
+
+    #[test]
+    fn source_reservations_are_exclusive_and_release_on_drop() {
+        let map: InflightMap<u64> = InflightMap::new();
+        let lease = map.try_lease("source").unwrap();
+        assert!(map.try_lease("source").is_none());
+        assert!(map.try_lease("other-source").is_some());
+        drop(lease);
+        assert!(map.try_lease("source").is_some());
     }
 
     /// M concurrent callers on the same key → `fetch` runs exactly once; the

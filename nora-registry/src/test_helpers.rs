@@ -379,6 +379,8 @@ fn build_context_full(
         repository: None,
         repository_mount: None,
         metadata_deadline: None,
+        background_tasks: tokio_util::task::TaskTracker::new(),
+        background_cancel: tokio_util::sync::CancellationToken::new(),
         storage,
         config: Arc::new(config),
         enabled_registries: enabled_registries.clone(),

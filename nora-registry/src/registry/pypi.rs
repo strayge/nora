@@ -11,6 +11,7 @@
 
 mod model;
 mod named;
+pub(crate) use named::{Progress as RefreshProgress, Snapshot as ProjectSnapshot};
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
@@ -82,24 +83,32 @@ async fn list_packages(
     Extension(mount): Extension<PypiMount>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let keys = match state.storage.list("pypi/").await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = ?e, "pypi: failed to list storage for packages");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let mut pkg_list: Vec<String> = if named::is_proxy(&state) {
+        match named::known_projects(&state).await {
+            Ok(names) => names,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
-    };
-    let mut packages = std::collections::HashSet::new();
-
-    for key in keys {
-        if let Some(pkg) = key.strip_prefix("pypi/").and_then(|k| k.split('/').next()) {
-            if !pkg.is_empty() {
-                packages.insert(pkg.to_string());
+    } else {
+        let keys = match state.storage.list("pypi/").await {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::error!(error = ?error, "pypi: failed to list storage for packages");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        let mut packages = std::collections::HashSet::new();
+        for key in keys {
+            if let Some(pkg) = key
+                .strip_prefix("pypi/")
+                .and_then(|key| key.split('/').next())
+            {
+                if !pkg.is_empty() {
+                    packages.insert(pkg.to_owned());
+                }
             }
         }
-    }
-
-    let mut pkg_list: Vec<_> = packages.into_iter().collect();
+        packages.into_iter().collect()
+    };
     pkg_list.sort();
 
     if wants_json(&headers) {
@@ -393,7 +402,6 @@ async fn download_file(
     let named_snapshot = match named::prepare_download(
         &state,
         &normalized,
-        &key,
         state.config.server.trust_upstream_dates || release_age_applies(&state),
     )
     .await
@@ -428,6 +436,15 @@ async fn download_file(
         }
     }
 
+    let named_snapshot = match named::complete_download(&state, &normalized, named_snapshot).await {
+        Ok(view) => view,
+        Err(response) => return *response,
+    };
+    let cache_eligible = match &named_snapshot {
+        Some(view) => named::cache_eligible(&state, view, &filename, &key).await,
+        None => true,
+    };
+
     // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
     // Docker-only wiring). Resolved once; applied at each serve point below.
     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -450,7 +467,8 @@ async fn download_file(
     // ranged. A partial read cannot be hashed, so neither the quarantine gate nor the
     // curation integrity check can run on it: the range serve stands down while
     // quarantine holds artifacts or an integrity rule applies to the file.
-    if headers.contains_key(header::RANGE)
+    if cache_eligible
+        && headers.contains_key(header::RANGE)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
         && !crate::curation::integrity_applies(
             &state.curation().curation_engine,
@@ -484,7 +502,12 @@ async fn download_file(
 
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let cached = if cache_eligible {
+        state.storage.get_verified(&key).await.ok()
+    } else {
+        None
+    };
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -557,25 +580,16 @@ async fn download_file(
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
         let file_url = if named::is_proxy(&state) {
-            let fetched;
-            let snapshot = if let Some(snapshot) = &named_snapshot {
-                snapshot
-            } else {
-                fetched = match named::fetch(&state, &normalized).await {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => return named::failure(error),
-                };
-                &fetched
+            let Some(view) = &named_snapshot else {
+                return StatusCode::BAD_GATEWAY.into_response();
             };
-            if named::quarantined(snapshot) {
-                return StatusCode::FORBIDDEN.into_response();
+            if view.offline {
+                return StatusCode::BAD_GATEWAY.into_response();
             }
-            let Some(file) = snapshot
-                .project
-                .files
-                .iter()
-                .find(|file| file.filename == filename)
-            else {
+            let Some(project) = &view.snapshot.project else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let Some(file) = project.files.iter().find(|file| file.filename == filename) else {
                 return StatusCode::NOT_FOUND.into_response();
             };
             file.url.clone()
@@ -3847,6 +3861,8 @@ mod baseline_tests;
 mod repositories_tests;
 #[cfg(test)]
 mod rich_tests;
+#[cfg(test)]
+mod snapshot_tests;
 
 #[cfg(test)]
 mod upstream_failure_cases {

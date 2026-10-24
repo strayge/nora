@@ -52,6 +52,7 @@ pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 pub(crate) use pypi::routes_at as pypi_routes_at;
+pub(crate) use pypi::{ProjectSnapshot as PypiSnapshot, RefreshProgress as PypiRefresh};
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
 pub use raw::routes as raw_routes;
@@ -205,7 +206,7 @@ pub(crate) fn nora_base_url(state: &AppState) -> String {
     state.config.server.public_base_url()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum ProxyError {
     NotFound,
@@ -1016,6 +1017,7 @@ async fn proxy_fetch_conditional_client(
         auth,
         validators,
         None,
+        false,
         |response| async {
             response
                 .bytes()
@@ -1037,6 +1039,7 @@ async fn proxy_fetch_conditional_extract<T, F, Fut>(
     auth: Option<UpstreamAuth<'_>>,
     validators: &Validators,
     extra_headers: Option<(&str, &str)>,
+    extract_not_modified: bool,
     extract: F,
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
@@ -1068,11 +1071,11 @@ where
             match client.send(request).await {
                 Ok(response) => {
                     let status = response.status();
-                    if status == reqwest::StatusCode::NOT_MODIFIED {
+                    if status == reqwest::StatusCode::NOT_MODIFIED && !extract_not_modified {
                         cb.record_success(&cb_key, probe);
                         return Ok(Revalidation::NotModified);
                     }
-                    if status.is_success() {
+                    if status.is_success() || status == reqwest::StatusCode::NOT_MODIFIED {
                         let new_validators = Validators {
                             etag: header_string(&response, header::ETAG),
                             last_modified: header_string(&response, header::LAST_MODIFIED),

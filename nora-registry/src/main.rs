@@ -379,6 +379,8 @@ pub struct AppState {
     pub(crate) repository: Option<Arc<repositories::Repository>>,
     pub(crate) repository_mount: Option<Arc<str>>,
     pub(crate) metadata_deadline: Option<tokio::time::Instant>,
+    pub(crate) background_tasks: tokio_util::task::TaskTracker,
+    pub(crate) background_cancel: tokio_util::sync::CancellationToken,
     pub storage: Storage,
     pub config: Arc<Config>,
     pub enabled_registries: Arc<HashSet<RegistryType>>,
@@ -2410,6 +2412,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         repository: None,
         repository_mount: None,
         metadata_deadline: None,
+        background_tasks: tokio_util::task::TaskTracker::new(),
+        background_cancel: tokio_util::sync::CancellationToken::new(),
         storage,
         config: Arc::new(config),
         enabled_registries,
@@ -2808,12 +2812,25 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Signal background schedulers to stop and wait for them (#306)
     cancel_token.cancel();
+    state.background_tasks.close();
+    if tokio::time::timeout(drain, state.background_tasks.wait())
+        .await
+        .is_err()
+    {
+        warn!("Repository background work exceeded shutdown drain; cancelling unfinished work");
+        state.background_cancel.cancel();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.background_tasks.wait(),
+        )
+        .await;
+    }
     if !scheduler_handles.is_empty() {
         info!("Waiting for background schedulers to finish (10s timeout)...");
         let join_all = futures::future::join_all(scheduler_handles);
         // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout,
-        // the JoinHandles are dropped which cancels the spawned tasks — this is
-        // intentional since we're shutting down and don't need their results.
+        // dropping JoinHandles only stops waiting; the runtime owns the tasks
+        // until they observe cancellation or the process exits.
         if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
             .await
             .is_err()

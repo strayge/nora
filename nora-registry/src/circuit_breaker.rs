@@ -264,7 +264,8 @@ impl BreakerInner {
 
 /// Per-registry circuit breaker registry.
 ///
-/// All methods are no-ops when `config.enabled == false`.
+/// Disabled enforcement never rejects requests or changes gauges. Named sources
+/// retain bounded availability observations for cache-only recovery.
 pub(crate) struct CircuitBreakerRegistry {
     config: CircuitBreakerConfig,
     breakers: RwLock<HashMap<String, BreakerInner>>,
@@ -328,6 +329,37 @@ impl CircuitBreakerRegistry {
             failure_count: breaker.failures,
             last_failure_seconds_ago: breaker.last_failure.map(|t| t.elapsed().as_secs()),
         })
+    }
+
+    /// Cached-only policy needs observations, not a second outage state machine.
+    pub(crate) fn source_unavailable(&self, key: &str) -> bool {
+        self.breakers
+            .read()
+            .get(key)
+            .is_some_and(|breaker| breaker.failures > 0 || breaker.state != BreakerState::Closed)
+    }
+
+    /// Background recovery follows the same cooldown even without request enforcement.
+    pub(crate) fn recovery_due(&self, key: &str) -> bool {
+        let breakers = self.breakers.read();
+        let Some(breaker) = breakers.get(key) else {
+            return false;
+        };
+        if breaker.failures == 0 && breaker.state == BreakerState::Closed {
+            return false;
+        }
+        let reset = self.reset_timeout_for(key);
+        if !self.config.enabled || breaker.state == BreakerState::Open {
+            return breaker
+                .last_failure
+                .is_none_or(|time| time.elapsed().as_secs() >= reset);
+        }
+        breaker.state != BreakerState::HalfOpen
+            || !breaker.half_open_in_flight
+            || (reset > 0
+                && breaker
+                    .half_open_started
+                    .is_none_or(|time| time.elapsed().as_secs() >= reset))
     }
 
     /// Every breaker key recorded so far, sorted. Tests use it to pin the key
@@ -467,6 +499,14 @@ impl CircuitBreakerRegistry {
     /// the matching `check()`; a superseded ("lost") probe's report is fenced.
     pub(crate) fn record_success(&self, registry: &str, token: ProbeToken) {
         if !self.config.enabled {
+            if registry
+                .split_once(':')
+                .is_some_and(|(_, scope)| scope.starts_with("repository:"))
+            {
+                if let Some(breaker) = self.breakers.write().get_mut(registry) {
+                    breaker.failures = 0;
+                }
+            }
             return;
         }
 
@@ -543,6 +583,17 @@ impl CircuitBreakerRegistry {
     /// cannot re-open or ghost-increment a breaker a newer probe now owns.
     pub(crate) fn record_failure(&self, registry: &str, token: ProbeToken) {
         if !self.config.enabled {
+            if registry
+                .split_once(':')
+                .is_some_and(|(_, scope)| scope.starts_with("repository:"))
+            {
+                let mut breakers = self.breakers.write();
+                let breaker = breakers
+                    .entry(registry.to_owned())
+                    .or_insert_with(BreakerInner::new);
+                breaker.failures = breaker.failures.saturating_add(1);
+                breaker.last_failure = Some(Instant::now());
+            }
             return;
         }
 
@@ -617,6 +668,30 @@ mod tests {
             reset_timeout: 30,
             overrides: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn disabled_named_observations_never_enable_enforcement_or_legacy_tracking() {
+        let cb = CircuitBreakerRegistry::new(disabled_config());
+        let key = "pypi:repository:disabled-observation:abc";
+        for _ in 0..8 {
+            cb.record_failure(key, ProbeToken::BACKGROUND);
+        }
+        cb.record_failure("pypi:https://legacy.example", ProbeToken::BACKGROUND);
+        assert_eq!(cb.keys(), vec![key]);
+        assert!(!cb.is_enabled());
+        assert!(cb.check(key).is_ok());
+        assert_eq!(cb.health_snapshot(key).unwrap().status, "closed");
+        assert_eq!(CIRCUIT_BREAKER_STATE.with_label_values(&[key]).get(), 0);
+        assert!(cb.source_unavailable(key));
+        assert!(!cb.recovery_due(key));
+        cb.record_alive(key, ProbeToken::BACKGROUND);
+        assert_eq!(cb.health_snapshot(key).unwrap().failure_count, 8);
+        cb.expire_open_for_test(key);
+        assert!(cb.recovery_due(key));
+        cb.record_success(key, ProbeToken::BACKGROUND);
+        assert!(!cb.source_unavailable(key));
+        assert!(!cb.recovery_due(key));
     }
 
     #[test]

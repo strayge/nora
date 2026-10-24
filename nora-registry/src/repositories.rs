@@ -29,11 +29,12 @@ pub(crate) struct Repository {
     pub source_id: String,
     pub storage: Storage,
     pub transport: Option<crate::registry::transport::RepositoryTransport>,
-    pub pypi_snapshots: parking_lot::RwLock<BTreeMap<String, Bytes>>,
+    pub pypi_snapshots: parking_lot::RwLock<BTreeMap<String, Arc<crate::registry::PypiSnapshot>>>,
     config: Arc<Config>,
     index: Arc<RepoIndex>,
     locks: PublishLocks,
     coalesce: InflightMap<Bytes>,
+    pub pypi_refreshes: InflightMap<tokio::sync::watch::Receiver<crate::registry::PypiRefresh>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +152,7 @@ impl RepositoryCatalogue {
                     index: Arc::new(RepoIndex::new()),
                     locks: Arc::default(),
                     coalesce: InflightMap::new(),
+                    pypi_refreshes: InflightMap::new(),
                 }),
             );
         }

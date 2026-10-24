@@ -11,7 +11,7 @@ use axum::http::Method;
 use wiremock::matchers::{header as upstream_header, header_regex, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const FILE: &str = "pkg-1.0-py3-none-any.whl";
+pub(super) const FILE: &str = "pkg-1.0-py3-none-any.whl";
 const ACCEPT: &str = "application/vnd.pypi.simple.v1+json, text/html;q=0.1";
 
 fn config(config: &mut Config, upstream: &str) {
@@ -24,13 +24,14 @@ format="pypi"
 kind="proxy"
 paths=["/python/", "/alias/"]
 upstream="{upstream}/simple"
+metadata_ttl=0
 "#
     ))
     .unwrap()
     .repositories;
 }
 
-async fn context(
+pub(super) async fn context(
     upstream: &str,
     storage: Option<crate::storage::Storage>,
     customize: impl FnOnce(&mut Config),
@@ -46,7 +47,7 @@ async fn context(
     .await
 }
 
-fn document(upstream: &str, status: &str) -> serde_json::Value {
+pub(super) fn document(upstream: &str, status: &str) -> serde_json::Value {
     serde_json::json!({"meta":{"api-version":"1.4"}, "name":"pkg", "versions":["1.0", "2.0"],
         "project-status":{"status":status, "reason":"source reason"},
         "files":[{"filename":FILE,"url":format!("{upstream}/files/{FILE}"),
@@ -55,7 +56,7 @@ fn document(upstream: &str, status: &str) -> serde_json::Value {
             "size":4,"upload-time":"2020-01-02T03:04:05Z"}]})
 }
 
-async fn mount(server: &MockServer, status: &str) {
+pub(super) async fn mount(server: &MockServer, status: &str) {
     Mock::given(method("GET"))
         .and(path("/simple/pkg/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(document(&server.uri(), status)))
@@ -68,7 +69,7 @@ async fn mount(server: &MockServer, status: &str) {
         .await;
 }
 
-async fn index(context: &TestContext, prefix: &str) -> (StatusCode, serde_json::Value) {
+pub(super) async fn index(context: &TestContext, prefix: &str) -> (StatusCode, serde_json::Value) {
     let response = send_with_headers(
         &context.app,
         Method::GET,
@@ -85,7 +86,7 @@ async fn index(context: &TestContext, prefix: &str) -> (StatusCode, serde_json::
     )
 }
 
-async fn cached(context: &TestContext) {
+pub(super) async fn cached(context: &TestContext) {
     let repository = context.state.repositories.get("remote").unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while repository
@@ -93,7 +94,20 @@ async fn cached(context: &TestContext) {
         .stat(&format!("pypi/pkg/{FILE}"))
         .await
         .is_none()
+        || repository
+            .storage
+            .pin(&format!("pypi/pkg/{FILE}"))
+            .await
+            .is_none()
     {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+pub(super) async fn settled(context: &TestContext) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !context.state.background_tasks.is_empty() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -131,12 +145,14 @@ async fn json_first_metadata_is_rich_neutral_and_does_not_advertise_sidecars_ear
     .await
     .unwrap()
     .unwrap();
-    assert!(snapshot.project.files[0]
+    assert!(snapshot.project.as_ref().unwrap().files[0]
         .core_metadata
         .as_ref()
         .unwrap()
         .available());
-    assert!(snapshot.project.files[0].url.starts_with(&upstream.uri()));
+    assert!(snapshot.project.as_ref().unwrap().files[0]
+        .url
+        .starts_with(&upstream.uri()));
     assert!(!serde_json::to_string(&snapshot)
         .unwrap()
         .contains("nora.example"));
@@ -324,6 +340,16 @@ async fn quarantine_survives_outage_restart_and_every_cached_file_method() {
     );
     upstream.reset().await;
     mount(&upstream, "active").await;
+    restored.state.circuit_breaker.expire_open_for_test(
+        &restored
+            .state
+            .repositories
+            .get("remote")
+            .unwrap()
+            .breaker_key(),
+    );
+    let _ = index(&restored, "/alias/").await;
+    settled(&restored).await;
     assert_eq!(
         index(&restored, "/alias/").await.1["project-status"]["status"],
         "active"
@@ -500,6 +526,12 @@ async fn failed_snapshot_writes_cannot_replace_known_quarantine_with_active() {
         StatusCode::FORBIDDEN
     );
     controls.fail_writes_to(None);
+    upstream.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/simple/pkg/"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&upstream)
+        .await;
     let restored =
         self::context(&upstream.uri(), Some(context.state.storage.clone()), |_| {}).await;
     assert_eq!(
