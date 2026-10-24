@@ -359,8 +359,33 @@ pub fn proxy_gate_dated(
     }
     use sha2::Digest;
     let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)));
-    store.record(registry, &digest, upstream, trusted_first_seen);
-    let status = store.check(registry, &digest, quarantine_secs);
+    proxy_gate_hash_dated(
+        store,
+        registry,
+        &digest,
+        mode,
+        quarantine_secs,
+        upstream,
+        trusted_first_seen,
+    )
+}
+
+/// Streaming paths retain content-age policy without collecting the artifact in memory.
+#[must_use = "the returned response blocks a quarantined artifact"]
+pub fn proxy_gate_hash_dated(
+    store: &DigestStore,
+    registry: &str,
+    digest: &str,
+    mode: &QuarantineMode,
+    quarantine_secs: i64,
+    upstream: &str,
+    trusted_first_seen: Option<i64>,
+) -> Option<Response> {
+    if matches!(mode, QuarantineMode::Off) {
+        return None;
+    }
+    store.record(registry, digest, upstream, trusted_first_seen);
+    let status = store.check(registry, digest, quarantine_secs);
     if matches!(status, QuarantineStatus::Mature) {
         return None;
     }
@@ -386,7 +411,7 @@ pub fn proxy_gate_dated(
     if matches!(mode, QuarantineMode::Enforce) {
         Some(quarantine_forbidden(
             registry,
-            &digest,
+            digest,
             &status,
             quarantine_secs,
         ))

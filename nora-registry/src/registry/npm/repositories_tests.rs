@@ -172,6 +172,67 @@ async fn local_aliases_are_request_local_and_publication_records_are_neutral() {
 }
 
 #[tokio::test]
+async fn buffered_artifacts_keep_decoding_encoded_tarball_representations() {
+    use std::io::Write;
+    let _lock = crate::test_env::env_lock();
+    let upstream = MockServer::start().await;
+    let bytes = b"tarball representation";
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let integrity = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
+    );
+    let mut document = metadata(&format!("{}/file.tgz", upstream.uri()));
+    document["versions"][VERSION]["dist"]["integrity"] = serde_json::json!(integrity);
+    Mock::given(method("GET"))
+        .and(path(format!("/{NAME}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&document))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/file.tgz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(compressed)
+                .insert_header("content-encoding", "gzip"),
+        )
+        .mount(&upstream)
+        .await;
+    let context = with_named_repositories(create_test_context_with_config(|config| {
+        proxy_config(config, &upstream.uri(), 300)
+    }))
+    .await;
+    let uri = format!("/packages/{NAME}/-/pkg-1.0.0.tgz");
+    let response = send(&context.app, Method::GET, &uri, "").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched = body_bytes(response).await;
+    assert_eq!(fetched.as_ref(), bytes);
+    assert_eq!(
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&fetched))
+        ),
+        integrity
+    );
+    cached(
+        &context,
+        "remote",
+        &format!("npm/{NAME}/tarballs/pkg-1.0.0.tgz"),
+    )
+    .await;
+    upstream.reset().await;
+    assert_eq!(
+        body_bytes(send(&context.app, Method::GET, &uri, "").await)
+            .await
+            .as_ref(),
+        bytes
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn proxy_cdn_files_are_bound_to_the_exact_version_without_cross_origin_credentials() {
     let _lock = crate::test_env::env_lock();
     let upstream = MockServer::start().await;

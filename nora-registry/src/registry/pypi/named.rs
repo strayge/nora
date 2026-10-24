@@ -576,37 +576,6 @@ pub(super) async fn ensure(state: &AppState, name: &str) -> Result<View, ProxyEr
     }
 }
 
-fn matches_cached(file: &model::Distribution, size: u64, pin: &str) -> bool {
-    file.size.is_none_or(|expected| expected == size)
-        && file
-            .hashes
-            .get("sha256")
-            .is_none_or(|expected| expected == pin)
-}
-
-pub(super) async fn cache_eligible(
-    state: &AppState,
-    view: &View,
-    filename: &str,
-    key: &str,
-) -> bool {
-    let Some(file) = view
-        .snapshot
-        .project
-        .as_ref()
-        .and_then(|project| project.files.iter().find(|file| file.filename == filename))
-    else {
-        return false;
-    };
-    let Some(meta) = state.storage.stat(key).await else {
-        return false;
-    };
-    let Some(pin) = state.storage.pin(key).await else {
-        return false;
-    };
-    matches_cached(file, meta.size, &pin)
-}
-
 pub(super) fn quarantined(snapshot: &Snapshot) -> bool {
     snapshot
         .project
@@ -721,14 +690,11 @@ pub(super) async fn project(
     for file in &project.files {
         let key = format!("pypi/{name}/{}", file.filename);
         let Some(meta) = keys.get(&key) else { continue };
-        let Some(pin) = state.storage.pin(&key).await else {
+        let Ok(Some(ready)) = super::cache::load(state, name, file, Some(meta.size)).await else {
             continue;
         };
-        if !matches_cached(file, meta.size, &pin) {
-            continue;
-        }
         let mut file = file.clone();
-        file.size = Some(meta.size);
+        file.size = Some(ready.size);
         files.push(file);
     }
     let mut result = response(&view.snapshot, &files, base, headers, false);

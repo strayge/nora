@@ -22,6 +22,8 @@ pub(crate) struct RepositoryTransport {
     secure: bool,
     configured: Client,
     strict: Client,
+    configured_raw: Client,
+    strict_raw: Client,
 }
 
 #[derive(Debug)]
@@ -67,36 +69,58 @@ impl RepositoryTransport {
             .map(certificates)
             .transpose()?
             .unwrap_or_default();
-        let base = || {
+        let repository_roots = policy
+            .tls_ca_cert
+            .as_deref()
+            .map(certificates)
+            .transpose()?
+            .unwrap_or_default();
+        let base = |raw: bool| {
             let mut builder = Client::builder()
                 .user_agent(crate::USER_AGENT)
                 .connect_timeout(Duration::from_secs(policy.connect_timeout))
                 .read_timeout(Duration::from_secs(policy.read_timeout))
                 .redirect(reqwest::redirect::Policy::none());
+            if raw {
+                builder = builder.no_gzip().no_brotli().no_deflate().no_zstd();
+            }
             for root in &global_roots {
                 builder = builder.add_root_certificate(root.clone());
             }
             builder
         };
-        let mut configured = base().danger_accept_invalid_certs(!policy.tls_verify);
-        if let Some(path) = &policy.tls_ca_cert {
-            for certificate in certificates(path)? {
-                configured = configured.add_root_certificate(certificate);
+        let configured = |raw| {
+            let mut builder = base(raw).danger_accept_invalid_certs(!policy.tls_verify);
+            for certificate in &repository_roots {
+                builder = builder.add_root_certificate(certificate.clone());
             }
-        }
+            builder
+                .build()
+                .map_err(|_| "cannot build origin TLS client")
+        };
         Ok(Self {
             origin: source.origin().ascii_serialization(),
             secure: source.scheme() == "https",
-            configured: configured
+            configured: configured(false)?,
+            strict: base(false)
                 .build()
-                .map_err(|_| "cannot build origin TLS client")?,
-            strict: base()
+                .map_err(|_| "cannot build strict TLS client")?,
+            configured_raw: configured(true)?,
+            strict_raw: base(true)
                 .build()
                 .map_err(|_| "cannot build strict TLS client")?,
         })
     }
 
-    async fn execute(&self, mut request: Request) -> Result<Response, RequestError> {
+    async fn execute(&self, request: Request) -> Result<Response, RequestError> {
+        self.execute_with(request, false).await
+    }
+
+    async fn execute_with(
+        &self,
+        mut request: Request,
+        raw: bool,
+    ) -> Result<Response, RequestError> {
         let mut seen = HashSet::new();
         let mut credentials_allowed = true;
         for hop in 0..=10 {
@@ -123,14 +147,16 @@ impl RepositoryTransport {
                 }
             }
             let next = request.try_clone();
-            let response = if configured_origin {
-                &self.configured
-            } else {
-                &self.strict
-            }
-            .execute(request)
-            .await
-            .map_err(RequestError::Network)?;
+            let client = match (configured_origin, raw) {
+                (true, false) => &self.configured,
+                (false, false) => &self.strict,
+                (true, true) => &self.configured_raw,
+                (false, true) => &self.strict_raw,
+            };
+            let response = client
+                .execute(request)
+                .await
+                .map_err(|error| RequestError::Network(error.without_url()))?;
             let status = response.status().as_u16();
             if !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
@@ -344,24 +370,29 @@ pub(super) enum ProxyClient<'a> {
         transport: &'a RepositoryTransport,
         repository: &'a crate::repositories::Repository,
         deadline: Option<tokio::time::Instant>,
+        raw: bool,
     },
 }
 
 impl<'a> ProxyClient<'a> {
     pub(super) fn for_state(state: &'a AppState) -> Self {
-        Self::for_operation(state, false)
+        Self::for_operation(state, false, false)
     }
     pub(super) fn for_artifact(state: &'a AppState) -> Self {
-        Self::for_operation(state, true)
+        Self::for_operation(state, true, false)
+    }
+    pub(super) fn for_raw_artifact(state: &'a AppState) -> Self {
+        Self::for_operation(state, true, true)
     }
 
-    fn for_operation(state: &'a AppState, artifact: bool) -> Self {
+    fn for_operation(state: &'a AppState, artifact: bool, raw: bool) -> Self {
         if let Some(repository) = state.repository.as_ref() {
             if let (Some(transport), Some(policy)) = (repository.transport.as_ref(), policy(state))
             {
                 return Self::Named {
                     transport,
                     repository,
+                    raw,
                     deadline: if artifact {
                         deadline(policy.total_timeout)
                     } else {
@@ -424,9 +455,21 @@ impl<'a> ProxyClient<'a> {
         }
     }
 
+    pub(super) fn diagnostic_url(self, url: &str) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Legacy(_) => std::borrow::Cow::Borrowed(url),
+            Self::Named { repository, .. } => std::borrow::Cow::Owned(repository.breaker_key()),
+        }
+    }
+
     fn template(self) -> &'a Client {
         match self {
             Self::Legacy(client) => client,
+            Self::Named {
+                transport,
+                raw: true,
+                ..
+            } => &transport.strict_raw,
             Self::Named { transport, .. } => &transport.strict,
         }
     }
@@ -444,13 +487,20 @@ impl<'a> ProxyClient<'a> {
             Self::Named {
                 transport,
                 deadline,
+                raw,
                 ..
             } => {
-                let mut request = builder.build().map_err(RequestError::Network)?;
+                let mut request = builder
+                    .build()
+                    .map_err(|error| RequestError::Network(error.without_url()))?;
                 *request.timeout_mut() = deadline.map(|deadline| {
                     deadline.saturating_duration_since(tokio::time::Instant::now())
                 });
-                transport.execute(request).await
+                if raw {
+                    transport.execute_with(request, true).await
+                } else {
+                    transport.execute(request).await
+                }
             }
         }
     }

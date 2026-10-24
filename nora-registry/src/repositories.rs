@@ -35,6 +35,7 @@ pub(crate) struct Repository {
     locks: PublishLocks,
     coalesce: InflightMap<Bytes>,
     pub pypi_refreshes: InflightMap<tokio::sync::watch::Receiver<crate::registry::PypiRefresh>>,
+    pub pypi_transfers: InflightMap<Arc<crate::registry::PypiTransfer>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +154,7 @@ impl RepositoryCatalogue {
                     locks: Arc::default(),
                     coalesce: InflightMap::new(),
                     pypi_refreshes: InflightMap::new(),
+                    pypi_transfers: InflightMap::new(),
                 }),
             );
         }

@@ -9,8 +9,15 @@
 //!   GET  /simple/{name}/{filename}    — download file
 //!   POST /simple/                     — twine upload (multipart/form-data)
 
+mod cache;
 mod model;
 mod named;
+mod transfer;
+pub(crate) use transfer::Transfer;
+
+pub(crate) fn cleanup_proxy_temp_dir(data: &str) {
+    transfer::cleanup(data);
+}
 pub(crate) use named::{Progress as RefreshProgress, Snapshot as ProjectSnapshot};
 
 use crate::activity_log::{ActionType, ActivityEntry};
@@ -440,10 +447,13 @@ async fn download_file(
         Ok(view) => view,
         Err(response) => return *response,
     };
-    let cache_eligible = match &named_snapshot {
-        Some(view) => named::cache_eligible(&state, view, &filename, &key).await,
-        None => true,
-    };
+    if let Some(view) = named_snapshot {
+        return transfer::download(&state, &normalized, &filename, &headers, publish_date, view)
+            .await;
+    }
+    if state.repository.is_some() {
+        return transfer::local(&state, &normalized, &filename, &headers, publish_date).await;
+    }
 
     // Digest-quarantine: first-seen hold for proxy artifacts (generalizes the
     // Docker-only wiring). Resolved once; applied at each serve point below.
@@ -467,8 +477,7 @@ async fn download_file(
     // ranged. A partial read cannot be hashed, so neither the quarantine gate nor the
     // curation integrity check can run on it: the range serve stands down while
     // quarantine holds artifacts or an integrity rule applies to the file.
-    if cache_eligible
-        && headers.contains_key(header::RANGE)
+    if headers.contains_key(header::RANGE)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
         && !crate::curation::integrity_applies(
             &state.curation().curation_engine,
@@ -502,12 +511,7 @@ async fn download_file(
 
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
-    let cached = if cache_eligible {
-        state.storage.get_verified(&key).await.ok()
-    } else {
-        None
-    };
-    if let Some(outcome) = cached {
+    if let Ok(outcome) = state.storage.get_verified(&key).await {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -579,47 +583,30 @@ async fn download_file(
     for up in &state.config.pypi.upstreams() {
         let page_url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
 
-        let file_url = if named::is_proxy(&state) {
-            let Some(view) = &named_snapshot else {
-                return StatusCode::BAD_GATEWAY.into_response();
-            };
-            if view.offline {
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
-            let Some(project) = &view.snapshot.project else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
-            let Some(file) = project.files.iter().find(|file| file.filename == filename) else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
-            file.url.clone()
-        } else {
-            let html = match proxy_fetch_text(
-                &state,
-                &page_url,
-                Duration::from_secs(state.config.pypi.proxy_timeout),
-                up.auth().map(UpstreamAuth::Basic),
-                Some(("Accept", "text/html")),
-                &state.circuit_breaker,
-                BreakerScope::upstream(RegistryType::PyPI, up.url()),
-            )
-            .await
-            {
-                Ok(html) => html,
-                Err(crate::registry::ProxyError::CircuitOpen(_)) => {
-                    circuit_open = true;
-                    continue;
-                }
-                Err(error) => {
-                    miss.record(&error);
-                    continue;
-                }
-            };
-            let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
-                miss.answered();
+        let html = match proxy_fetch_text(
+            &state,
+            &page_url,
+            Duration::from_secs(state.config.pypi.proxy_timeout),
+            up.auth().map(UpstreamAuth::Basic),
+            Some(("Accept", "text/html")),
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::PyPI, up.url()),
+        )
+        .await
+        {
+            Ok(html) => html,
+            Err(crate::registry::ProxyError::CircuitOpen(_)) => {
+                circuit_open = true;
                 continue;
-            };
-            file_url
+            }
+            Err(error) => {
+                miss.record(&error);
+                continue;
+            }
+        };
+        let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+            miss.answered();
+            continue;
         };
 
         // The upstream's credential goes to the upstream's own origin only: an index may name its
@@ -3863,6 +3850,8 @@ mod repositories_tests;
 mod rich_tests;
 #[cfg(test)]
 mod snapshot_tests;
+#[cfg(test)]
+mod transfer_tests;
 
 #[cfg(test)]
 mod upstream_failure_cases {

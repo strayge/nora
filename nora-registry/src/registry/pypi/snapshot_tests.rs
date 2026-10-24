@@ -486,6 +486,17 @@ async fn schema_one_snapshots_keep_fresh_reads_and_quarantine_until_a_successful
     for status in ["active", "quarantined"] {
         upstream.reset().await;
         let original = context(&upstream.uri(), None, |config| ttl(config, 300)).await;
+        mount(&upstream, "active").await;
+        let response = send(
+            &original.app,
+            Method::GET,
+            &format!("/python/pkg/{FILE}"),
+            "",
+        )
+        .await;
+        assert_eq!(body_bytes(response).await.as_ref(), b"body");
+        cached(&original).await;
+        upstream.reset().await;
         let repository = original.state.repositories.get("remote").unwrap();
         let page = reqwest::Url::parse(&format!("{}/simple/pkg/", upstream.uri())).unwrap();
         let project = model::parse_json(
@@ -500,11 +511,6 @@ async fn schema_one_snapshots_keep_fresh_reads_and_quarantine_until_a_successful
         repository
             .storage
             .put(&key, &serde_json::to_vec(&old).unwrap())
-            .await
-            .unwrap();
-        repository
-            .storage
-            .put(&format!("pypi/pkg/{FILE}"), b"body")
             .await
             .unwrap();
         assert_eq!(

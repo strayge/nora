@@ -215,14 +215,20 @@ async fn proxies_are_read_only_and_cache_only_inside_their_source_namespace() {
     let member = context.state.repositories.get("remote").unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if !member
-                .storage
-                .list("pypi-sha256/pkg/")
-                .await
-                .unwrap()
-                .is_empty()
-            {
-                break;
+            let state = member.state(&context.state);
+            if let Some(snapshot) = super::named::stored(&state, "pkg").await.unwrap() {
+                if let Some(file) = snapshot
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.files.iter().find(|file| file.filename == FILE))
+                {
+                    if matches!(
+                        super::cache::load(&state, "pkg", file, None).await,
+                        Ok(Some(_))
+                    ) {
+                        break;
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

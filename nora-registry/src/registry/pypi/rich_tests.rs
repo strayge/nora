@@ -89,18 +89,26 @@ pub(super) async fn index(context: &TestContext, prefix: &str) -> (StatusCode, s
 pub(super) async fn cached(context: &TestContext) {
     let repository = context.state.repositories.get("remote").unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while repository
-        .storage
-        .stat(&format!("pypi/pkg/{FILE}"))
-        .await
-        .is_none()
-        || repository
-            .storage
-            .pin(&format!("pypi/pkg/{FILE}"))
-            .await
-            .is_none()
-    {
-        assert!(tokio::time::Instant::now() < deadline);
+    loop {
+        let state = repository.state(&context.state);
+        if let Ok(Some(snapshot)) = named::stored(&state, "pkg").await {
+            if let Some(file) = snapshot
+                .project
+                .as_ref()
+                .and_then(|project| project.files.iter().find(|file| file.filename == FILE))
+            {
+                if matches!(
+                    super::cache::load(&state, "pkg", file, None).await,
+                    Ok(Some(_))
+                ) {
+                    break;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "artifact never became source-bound and ready"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }

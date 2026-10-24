@@ -21,6 +21,7 @@ mod pypi;
 pub(crate) mod range;
 pub(crate) mod raw;
 pub(crate) mod rpm;
+mod spool;
 pub(crate) mod terraform;
 pub(crate) mod transport;
 
@@ -50,9 +51,12 @@ pub(crate) use maven::storage_key as maven_storage_key;
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub use pub_dart::routes as pub_dart_routes;
+pub(crate) use pypi::cleanup_proxy_temp_dir as cleanup_pypi_proxy_temp_dir;
 pub use pypi::routes as pypi_routes;
 pub(crate) use pypi::routes_at as pypi_routes_at;
-pub(crate) use pypi::{ProjectSnapshot as PypiSnapshot, RefreshProgress as PypiRefresh};
+pub(crate) use pypi::{
+    ProjectSnapshot as PypiSnapshot, RefreshProgress as PypiRefresh, Transfer as PypiTransfer,
+};
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
 pub use raw::routes as raw_routes;
@@ -210,6 +214,7 @@ pub(crate) fn nora_base_url(state: &AppState) -> String {
 #[allow(dead_code)]
 pub(crate) enum ProxyError {
     NotFound,
+    Local(String),
     Upstream(u16),
     Network(String),
     CircuitOpen(String),
@@ -256,9 +261,10 @@ impl UpstreamMiss {
         match e {
             ProxyError::NotFound => self.not_found = true,
             ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
-            ProxyError::Upstream(_) | ProxyError::Network(_) | ProxyError::CircuitOpen(_) => {
-                self.failed = true
-            }
+            ProxyError::Upstream(_)
+            | ProxyError::Network(_)
+            | ProxyError::Local(_)
+            | ProxyError::CircuitOpen(_) => self.failed = true,
         }
     }
 
@@ -323,7 +329,7 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
     Some(if is_geo { "geo" } else { "waf" })
 }
 
-/// Core fetch logic with retry. Callers provide a response extractor.
+/// Existing callers keep reqwest errors while owned extractors can validate spooled data.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
     client: ProxyClient<'_>,
@@ -339,10 +345,47 @@ where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
+    proxy_fetch_extract(
+        client,
+        url,
+        timeout,
+        auth,
+        extra_headers,
+        |response| async move {
+            extract(response).await.map_err(|error| {
+                ProxyError::Network(match client {
+                    ProxyClient::Legacy(_) => error.to_string(),
+                    ProxyClient::Named { .. } => error.without_url().to_string(),
+                })
+            })
+        },
+        cb,
+        scope,
+    )
+    .await
+}
+
+/// Source validation and body extraction share retries, deadlines, and probe ownership.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_fetch_extract<T, F, Fut>(
+    client: ProxyClient<'_>,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    extra_headers: Option<(&str, &str)>,
+    extract: F,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<T, ProxyError>
+where
+    F: FnOnce(reqwest::Response) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProxyError>>,
+{
     let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = client.breaker_key(scope);
+    let diagnostic_url = client.diagnostic_url(url);
     let probe = cb.check(&cb_key)?;
 
     client.run(cb, &cb_key, probe, async {
@@ -363,10 +406,10 @@ where
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "2xx"])
                         .observe(elapsed);
-                    let result = extract(response)
-                        .await
-                        .map_err(|e| ProxyError::Network(e.to_string()));
-                    if result.is_ok() {
+                    let result = extract(response).await;
+                    if matches!(result, Err(ProxyError::Local(_))) {
+                        cb.record_alive(&cb_key, probe);
+                    } else if result.is_ok() {
                         cb.record_success(&cb_key, probe);
                     } else {
                         // 2xx but the body could not be read (e.g. a mid-stream
@@ -392,7 +435,7 @@ where
                             .inc();
                         tracing::warn!(
                             registry = registry_str,
-                            url,
+                            url = %diagnostic_url,
                             status,
                             reason,
                             "upstream returned a policy/geo block, relayed as 404 (not a genuine not-found) — check egress/region"
@@ -412,7 +455,7 @@ where
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "5xx"])
                         .observe(elapsed);
-                    tracing::debug!(url, status, "upstream 5xx, retrying in 1s");
+                    tracing::debug!(url = %diagnostic_url, status, "upstream 5xx, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -429,7 +472,7 @@ where
                     .with_label_values(&[registry_str, status_label])
                     .observe(elapsed);
                 if attempt == 0 {
-                    tracing::debug!(url, error = %e, "upstream error, retrying in 1s");
+                    tracing::debug!(url = %diagnostic_url, error = %e, "upstream error, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
