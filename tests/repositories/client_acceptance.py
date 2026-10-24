@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -200,6 +201,16 @@ def main():
         installed = json.loads((target / "node_modules" / name / "package.json").read_text())
         assert installed["version"] == version, installed
 
+    def delete_coordinate(repository, name, version=None):
+        """Cleanup uses repository identity, independently of package-client aliases."""
+        path = f"{base}/api/v1/repositories/{repository}/packages/{urllib.parse.quote(name, safe='')}"
+        if version is not None:
+            path += "?" + urllib.parse.urlencode({"version": version})
+        response = urllib.request.urlopen(urllib.request.Request(path, method="DELETE", headers={"HX-Request": "true"}))
+        result = json.load(response)
+        assert result["status"] in ("deleted", "already_absent"), result
+        return result
+
     try:
         start("online")
         versions = {}
@@ -246,6 +257,24 @@ def main():
         npm_install("npm-group-install", "npm", "nora-local-demo", ("nora-local-demo", "1.0.0"))
         audit = run("npm-group-audit", npm + ["audit", "--json", "--registry", base + "/npm/"], root / "npm-group-install", success=False)
         assert b"not supported" in audit or b"501" in audit, audit
+        assert delete_coordinate("npm-a", "nora-local-demo", "1.0.0")["package_removed"]
+        assert json.loads(run("npm-other-local-after-delete", npm + ["view", "nora-local-demo", "version", "--json", "--registry", base + "/npm-b/"])) == "2.0.0"
+        package_dir = root / "publish-npm-a"
+        (package_dir / "index.js").write_text("module.exports = 'replacement';\n")
+        run("npm-republish-deleted-version", npm + ["publish", "--registry", base + "/npm-a/"], package_dir)
+        npm_install("npm-replacement-install", "npm-a", "nora-local-demo", ("nora-local-demo", "1.0.0"))
+        assert "replacement" in (root / "npm-replacement-install/node_modules/nora-local-demo/index.js").read_text()
+        assert delete_coordinate("python-a", "nora-local-demo", "1.0")["package_removed"]
+        replacement = wheel("nora-local-demo", "1.0", value="replacement")
+        file = root / replacement["filename"]
+        file.write_bytes(replacement["body"])
+        run("twine-reupload-deleted-filename", [sys.executable, "-m", "twine", "upload", "--config-file", str(empty), "--non-interactive", "--repository-url", f"{base}/python-a/", str(file)])
+        pip_install("python-replacement-install", "python-a", "nora-local-demo==1.0")
+        assert "replacement" in (root / "python-replacement-install/nora_local_demo/__init__.py").read_text()
+        assert delete_coordinate("npm-a", "nora-local-demo")["package_removed"]
+        assert delete_coordinate("python-a", "nora-local-demo")["package_removed"]
+        assert delete_coordinate("npm-a", "nora-local-demo")["status"] == "already_absent"
+        results.append("local-package-deletion-and-reupload")
         for repo in ("npm-save", "npm-nosave"):
             npm_install(repo + "-install", repo, "nora-proxy-demo", ("nora-proxy-demo", "3.0.0"))
         wait_stored("npm-save", "npm/nora-proxy-demo/tarballs/nora-proxy-demo-3.0.0.tgz")

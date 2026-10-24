@@ -11,7 +11,8 @@ python3 tests/repositories/streaming_acceptance.py --binary target/debug/nora
 The client check requires npm on `PATH`, plus pip and twine installed for the
 chosen Python interpreter. It tests two-local publication, package-wide group
 selection, JSON and HTML metadata-only resolution, dependency installation,
-`save_files`, and real restart/offline behavior. Client configurations, caches and
+`save_files`, permanent local deletion/re-upload with replacement bytes, and real
+restart/offline behavior. Client configurations, caches and
 installation targets are temporary; user configuration and installations are not
 modified. No external registry is needed.
 

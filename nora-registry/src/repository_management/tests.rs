@@ -401,6 +401,76 @@ async fn dropped_request_keeps_the_critical_section_until_storage_settles() {
 }
 
 #[tokio::test]
+async fn a_new_pypi_filename_waits_for_package_cleanup_then_keeps_its_hash() {
+    let (storage, counts) = test_helpers::op_counting_storage();
+    let context = test_helpers::with_named_repositories(
+        test_helpers::create_test_context_with_storage_and_config(storage, configure),
+    )
+    .await;
+    let member = context
+        .state
+        .repositories
+        .get("p")
+        .unwrap()
+        .state(&context.state);
+    member
+        .storage
+        .put("pypi/demo/demo-1.0.zip", b"old")
+        .await
+        .unwrap();
+    let (started, proceed) =
+        counts.pause_deletes_to("repositories/p/sources/local/pypi/demo/demo-1.0.zip");
+    let app = context.app.clone();
+    let deletion = tokio::spawn(async move {
+        send_with_headers(
+            &app,
+            Method::DELETE,
+            "/api/v1/repositories/p/packages/demo",
+            vec![("HX-Request", "true")],
+            Body::empty(),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let body = "--boundary\r\nContent-Disposition: form-data; name=\":action\"\r\n\r\nfile_upload\r\n--boundary\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\ndemo\r\n--boundary\r\nContent-Disposition: form-data; name=\"version\"\r\n\r\n2.0\r\n--boundary\r\nContent-Disposition: form-data; name=\"content\"; filename=\"demo-2.0.zip\"\r\nContent-Type: application/octet-stream\r\n\r\nreplacement\r\n--boundary--\r\n";
+    let upload = send_with_headers(
+        &context.app,
+        Method::POST,
+        "/p/",
+        vec![("Content-Type", "multipart/form-data; boundary=boundary")],
+        Body::from(body),
+    );
+    tokio::pin!(upload);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), upload.as_mut())
+            .await
+            .is_err()
+    );
+    proceed.notify_one();
+    assert_eq!(deletion.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(upload.await.status(), StatusCode::OK);
+    assert_eq!(
+        member
+            .storage
+            .get("pypi/demo/demo-2.0.zip")
+            .await
+            .unwrap()
+            .as_ref(),
+        b"replacement"
+    );
+    let markers = member
+        .storage
+        .list("pypi-sha256/demo/demo-2.0.zip/")
+        .await
+        .unwrap();
+    assert_eq!(markers.len(), 1);
+    use sha2::Digest as _;
+    assert!(markers[0].ends_with(&hex::encode(sha2::Sha256::digest(b"replacement"))));
+}
+
+#[tokio::test]
 async fn write_roles_and_enforced_namespace_scope_are_required() {
     use crate::tokens::Role;
     let context = test_helpers::with_named_repositories(

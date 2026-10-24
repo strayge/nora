@@ -348,8 +348,10 @@ evaluation, the request is blocked — not allowed.
 ### ADR-6: Embedded Minimal UI
 
 **Decision:** The web UI is server-rendered HTML embedded in the binary.
-It is read-only (browse registries, view packages, check health) with
-minimal CRUD (manage API tokens).
+It primarily browses registries, packages and health, with minimal management
+controls for API tokens and permanent package/release cleanup in named local
+npm/PyPI repositories. Cleanup calls a separate Write-role management API; page
+handlers still perform no direct storage writes.
 
 **Context:** A contributor suggested extracting the UI into a standalone
 SPA (React/Vue/Svelte).

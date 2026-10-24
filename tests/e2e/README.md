@@ -17,7 +17,7 @@ In another terminal:
 ```sh
 cd tests/e2e
 npm ci
-npm test -- ui-contracts.spec.ts npm-proxy.spec.ts
+npm test -- ui-contracts.spec.ts repository-deletion.spec.ts npm-proxy.spec.ts
 ```
 
 Use an already installed Playwright browser, or install one separately with your
@@ -25,7 +25,9 @@ approval. `NORA_URL` selects a different running test instance. The fixture is f
 tests only: it enables public upstream access and optional `/npm/` and `/simple/`
 group aliases. Publication goes to `/npm-local/` or `/simple-local/`, never a group.
 
-The repository browser tests cover named inventory and source selection; unchanged
-formats retain their existing UI contracts. Optional pixel tests require reviewed
+The repository browser tests cover named inventory and source selection. Deletion
+tests cover local confirmation/cancellation, release grouping, replacement uploads
+and retry after a lost response; they permanently remove only their own fixture
+packages. Unchanged formats retain their existing UI contracts. Optional pixel tests require reviewed
 local baselines first (`npm test -- ui-screenshots.spec.ts --update-snapshots`). For real npm, pip and twine acceptance,
 see [`../repositories/README.md`](../repositories/README.md).

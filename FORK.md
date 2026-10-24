@@ -22,8 +22,9 @@ npm/PyPI repositories and more reliable proxy, metadata and offline behavior.
 - **Persistent metadata and explicit readiness.** PyPI snapshots survive restart;
   shared refreshes/fills survive caller disconnects. Offline serving depends on
   verified, retained files—not merely a previously successful download.
-- **Repository-aware operations.** A separate read-only browser at
-  `/ui/repositories` shows aliases, stored inventory and client commands. Metrics,
+- **Repository-aware operations.** The browser at `/ui/repositories` shows aliases,
+  stored inventory and client commands, with permanent package/release deletion
+  for local npm/PyPI repositories. Deleted coordinates can be republished. Metrics,
   audit records and maintenance account for member repositories rather than group
   copies or legacy singleton storage.
 
@@ -50,8 +51,8 @@ existing repository configuration and storage backends.
 
 For configuration examples, defaults and conversion steps, see the
 [repository guide](docs/repositories.md). Existing authentication and curation
-boundaries still apply; this fork does not add per-repository ACLs or management
-CRUD.
+boundaries still apply; this fork does not add per-repository ACLs or repository
+configuration CRUD.
 
 ## Builds and further reading
 

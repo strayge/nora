@@ -1,9 +1,9 @@
 # Named npm and PyPI repositories
 
 npm and PyPI have no implicit repository or public upstream. Configure named
-repositories, then point clients at one of their explicit aliases. The read-only
-browser at `/ui/repositories` shows identities, aliases, stored inventory and
-client commands. Other package formats keep their existing configuration.
+repositories, then point clients at one of their explicit aliases. The browser at
+`/ui/repositories` shows identities, aliases, stored inventory and client commands,
+and supports permanent cleanup of local packages and releases. Other package formats keep their existing configuration.
 
 The browser only observes stored state: it never refreshes a proxy or rebuilds
 metadata. Group browsing applies current ownership/order to trusted stored package
@@ -147,6 +147,39 @@ audit uses the selected proxy's upstream and existing security filtering.
 Configure `server.public_url` with the externally visible reverse-proxy base path,
 if any. Protocol links and browser commands use that public base and the requested
 alias, not a hard-coded `/npm/` or `/simple/` endpoint.
+
+## Deleting local uploads
+
+Open a **local** repository's package page to delete the entire package or one
+release. A PyPI release groups every wheel/source archive with the same displayed
+version string; `1.0` and `1.0.0` remain separate. Confirming deletes the target's
+current contents, including uploads made since the page was opened. Deleting the
+last release also removes empty package metadata. npm tags pointing to a removed
+release disappear; `latest` falls back to the highest remaining version using the
+existing ordering, which can select a prerelease.
+
+Deletion requires Write/Admin access and respects existing namespace restrictions.
+Anonymous public browsing does not authorize deletion. **With authentication
+disabled, anyone who can reach the server can delete.** Proxy/group pages remain
+read-only; follow the selected source link to manage its local repository.
+
+Deletion is permanent, with no undo. Deleted versions/filenames can be uploaded
+again, so Write access permits delete-and-replace and existing lockfile hashes may
+stop matching. Native `npm unpublish` remains unsupported. Deleting from a member
+does not change group ownership/order or reserve the deleted name.
+
+Failures may leave some files removed and others readable. The error view offers
+retry; refresh preserves the exact release target even if its bodies are already
+gone. Retry operates on the current target, so it can also remove a replacement
+uploaded in the meantime. Cleanup can continue after a lost browser connection.
+Concurrent writer processes sharing storage are not coordinated; existing client
+caches and already-open downloads cannot be revoked.
+
+The UI uses `DELETE /api/v1/repositories/{repository}/packages/{name}`, optionally
+with `?version=...`, and requires `HX-Request: true` as well as credentials when
+auth is enabled. Repository is the configured identity, not an alias. The endpoint
+returns 200 for completed/already-absent cleanup; maintenance contention returns
+503 with `Retry-After`. See `/api-docs` for the response contract.
 
 ## Metadata, streaming and offline behavior
 

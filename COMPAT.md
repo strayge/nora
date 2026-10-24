@@ -90,8 +90,8 @@ read-only and do not merge versions or tags; their audit endpoint returns 501.
 | Scoped packages `@scope/name` | Full | URL-encoded path |
 | Tarball download | Full | SHA256 verified |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
-| Publish (`npm publish`) | Full | Immutable versions |
-| Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
+| Publish (`npm publish`) | Full | Existing versions cannot be overwritten; explicitly deleted coordinates may be republished |
+| Unpublish | — | Native npm unpublish unsupported; named locals support permanent package/version deletion through the web UI/management API |
 | Dist-tags (`latest`, `next`) | Partial | Read from metadata, no explicit management |
 | Search (`/-/v1/search`) | — | Not implemented |
 | Audit (`bulk` npm7 / `audits/quick` npm6) | Partial | Direct proxies forward to their upstream with existing security filtering; groups return 501; no local advisory DB or false-clean outage result |
@@ -130,6 +130,11 @@ read-only and do not merge versions or tags; their audit endpoint returns 501.
 | Categories/keywords | Partial | Stored but not searchable |
 
 ## PyPI (PEP 503/691)
+
+Named local repositories support permanent package/release deletion through the
+web UI/management API. A release includes all files matching its displayed version;
+deleted filenames may be uploaded again. This is not yanking. See
+[local cleanup](docs/repositories.md#deleting-local-uploads).
 
 All paths are explicit aliases; `/simple/` exists only when configured. Groups
 select one package source, unlike the former multi-upstream merging model. Stored
