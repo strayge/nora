@@ -4,6 +4,8 @@
 use super::*;
 use crate::{config::Config, test_helpers};
 
+mod safety;
+
 async fn context(format: &str) -> test_helpers::TestContext {
     test_helpers::with_named_repositories(test_helpers::create_test_context_with_config(|config| {
         config.repositories = toml::from_str::<Config>(&format!(

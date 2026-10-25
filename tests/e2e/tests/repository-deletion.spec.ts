@@ -28,7 +28,7 @@ test('cancel, version deletion, final-package redirect and replacement upload', 
   await publishNpm(request, name, '1.0.0');
   await publishNpm(request, name, '2.0.0');
   await page.goto(`/ui/repositories/smoke-npm-local/package/${name}`);
-  const latest = page.getByRole('row').filter({ has: page.getByRole('cell', { name: '2.0.0', exact: true }) });
+  const latest = page.getByRole('row').filter({ has: page.getByRole('link', { name: 'View files for version 2.0.0', exact: true }) });
   page.once('dialog', dialog => dialog.dismiss());
   await latest.getByRole('button', { name: 'Delete version', exact: true }).click();
   await expect(latest).toBeVisible();
@@ -56,7 +56,7 @@ test('PyPI groups all release files and stale package confirmation deletes curre
   await uploadPython(request, name, '1.0', `${name}-1.0.zip`);
   await uploadPython(request, name, '1.0', `${wheelName}-1.0-py3-none-any.whl`);
   await page.goto(`/ui/repositories/smoke-python-local/package/${name}`);
-  const release = page.getByRole('row').filter({ has: page.getByRole('cell', { name: '1.0', exact: true }) });
+  const release = page.getByRole('row').filter({ has: page.getByRole('link', { name: 'View files for version 1.0', exact: true }) });
   await expect(release.getByRole('cell', { name: '2', exact: true })).toBeVisible();
   // Publication after page render is included, without snapshot conflicts.
   await uploadPython(request, name, '2.0', `${name}-2.0.zip`);
