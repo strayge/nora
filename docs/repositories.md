@@ -2,8 +2,10 @@
 
 npm and PyPI have no implicit repository or public upstream. Configure named
 repositories, then point clients at one of their explicit aliases. The browser at
-`/ui/repositories` shows identities, aliases, stored inventory and client commands,
-and supports permanent cleanup of local packages and releases. Other package formats keep their existing configuration.
+`/ui/repositories` shows identities, aliases, package versions and client commands.
+Open a version to inspect its files and recorded checksums. Local repositories also
+support permanent cleanup of packages and releases. Other package formats keep
+their existing configuration.
 
 The browser only observes stored state: it never refreshes a proxy or rebuilds
 metadata. Group browsing applies current ownership/order to trusted stored package
@@ -147,6 +149,38 @@ audit uses the selected proxy's upstream and existing security filtering.
 Configure `server.public_url` with the externally visible reverse-proxy base path,
 if any. Protocol links and browser commands use that public base and the requested
 alias, not a hard-coded `/npm/` or `/simple/` endpoint.
+
+## Inspecting package files
+
+Open a package, then select a version to see its files. The overview includes all
+versions known from retained files or saved metadata, including saved npm version
+manifests when no package-wide listing exists. Long lists are paginated; **Other
+files** keeps retained distributions without a recognized version accessible.
+
+File rows show filenames, archive sizes when known, retention state and recorded
+checksums. Copy the primary checksum or expand **All recorded hashes** to inspect
+additional values and their sources. npm advertisements may have no reliable
+filename or compressed size; unpacked size is not used as archive size.
+
+**Advertised only** means a file was described by saved metadata with no stored
+match, not that it is currently available upstream. Metadata timestamps and expiry
+are observations, not a freshness guarantee. Missing metadata and failed reads are
+distinguished; incomplete inventory uses **Unknown**, never a guessed zero. An npm
+version manifest is positive evidence for that version, not a complete listing:
+it cannot establish that another version or file was unadvertised.
+Browsing does not refresh upstream metadata, download distributions or rehash their
+bodies. Use a package client endpoint when metadata needs refreshing.
+
+Checksums retain their sources: stored pins/sidecars, publisher metadata or saved
+upstream descriptions. Different recorded values remain visible, but can reflect
+historical changes rather than corruption. Visibility and retained bytes do not
+guarantee current policy eligibility, matching upstream bytes or offline serving;
+trusted recorded inventory can remain visible even when serving is blocked.
+
+PyPI file association is filename-derived. A listed release can have no matching
+files, and distinct exact local versions such as `1.0` and `1.0.0` remain separate.
+Groups show only their currently selected member, named on each view; they do not
+merge inventories or bypass failed source selection.
 
 ## Deleting local uploads
 

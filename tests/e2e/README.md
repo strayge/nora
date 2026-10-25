@@ -17,7 +17,7 @@ In another terminal:
 ```sh
 cd tests/e2e
 npm ci
-npm test -- ui-contracts.spec.ts repository-deletion.spec.ts npm-proxy.spec.ts
+npm test -- ui-contracts.spec.ts repository-artifacts.spec.ts repository-deletion.spec.ts npm-proxy.spec.ts
 ```
 
 Use an already installed Playwright browser, or install one separately with your
@@ -25,7 +25,11 @@ approval. `NORA_URL` selects a different running test instance. The fixture is f
 tests only: it enables public upstream access and optional `/npm/` and `/simple/`
 group aliases. Publication goes to `/npm-local/` or `/simple-local/`, never a group.
 
-The repository browser tests cover named inventory and source selection. Deletion
+The repository browser tests cover named inventory and source selection. Artifact
+tests publish local npm/PyPI fixtures and cover version navigation, file pagination,
+recorded-checksum Copy/expansion and narrow-screen scrolling. Proxy advertisements,
+partial reads and read-only storage guarantees are covered by Rust router tests
+with mock upstreams and a recording backend. Deletion
 tests cover local confirmation/cancellation, release grouping, replacement uploads
 and retry after a lost response; they permanently remove only their own fixture
 packages. Unchanged formats retain their existing UI contracts. Optional pixel tests require reviewed
