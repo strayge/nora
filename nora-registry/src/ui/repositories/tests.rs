@@ -115,6 +115,72 @@ async fn version_api_is_additive_paged_and_rejects_unknown_or_unsafe_versions() 
 }
 
 #[tokio::test]
+async fn version_html_has_scoped_navigation_copy_details_and_no_mutation_controls() {
+    let context =
+        test_helpers::with_named_repositories(test_helpers::create_test_context_with_config(|c| {
+            configure(c, "pypi")
+        }))
+        .await;
+    let storage = &context.state.repositories.get("a").unwrap().storage;
+    for file in [
+        "demo-1.0+local.tar.gz",
+        "demo-1.0+local-py3-none-any.whl",
+        "demo-2.0.tar.gz",
+        "odd<script>.whl",
+    ] {
+        storage
+            .put(&format!("pypi/demo/{file}"), b"body")
+            .await
+            .unwrap();
+    }
+    storage
+        .put(
+            "pypi/demo/demo-1.0+local-py3-none-any.whl.sha256",
+            "00".repeat(32).as_bytes(),
+        )
+        .await
+        .unwrap();
+    let overview = String::from_utf8(
+        body_bytes(
+            send(
+                &context.app,
+                Method::GET,
+                "/ui/repositories/a/package/demo?limit=1&retry_version=lost",
+                Body::empty(),
+            )
+            .await,
+        )
+        .await
+        .to_vec(),
+    )
+    .unwrap();
+    assert!(overview.contains("aria-label=\"Next versions\""));
+    assert!(overview.contains("retry_version=lost"));
+    assert!(overview.contains("odd&lt;script&gt;.whl") && !overview.contains("odd<script>.whl"));
+    let html = String::from_utf8(
+        body_bytes(
+            send(
+                &context.app,
+                Method::GET,
+                "/ui/repositories/a/package/demo?version=1.0%2Blocal&limit=1",
+                Body::empty(),
+            )
+            .await,
+        )
+        .await
+        .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("demo-1.0+local-py3-none-any.whl"));
+    assert!(!html.contains("demo-2.0.tar.gz"));
+    assert!(html.contains("Copy sha256 checksum") && html.contains("Storage pin"));
+    assert!(html.contains("<details open>") && html.contains("Different recorded checksums"));
+    assert!(html.contains("/base/ui/repositories/a/package/demo?version=1.0%2Blocal"));
+    assert!(html.contains("id=\"package-back\"") && html.contains("aria-label=\"Next files\""));
+    assert!(!html.contains("Delete package") && !html.contains("delete-local"));
+}
+
+#[tokio::test]
 async fn local_mutation_controls_require_a_verified_writer_when_browsing_is_public() {
     let context = test_helpers::with_named_repositories(
         test_helpers::create_test_context_with_anonymous_read_and_config(

@@ -466,6 +466,15 @@ fn page(root: &AppState, headers: &HeaderMap, title: &str, body: &str) -> Respon
 .repository-browser .hover\:border-sky-500:hover{{border-color:#0ea5e9}}
 .repository-browser .divide-y>*+*{{border-top:1px solid #334155}}
 .repository-browser code{{min-width:0;white-space:pre;display:block}}
+.repository-browser .artifact-scroll{{overflow-x:auto}}
+.repository-browser .artifact-table{{min-width:40rem;table-layout:fixed}}
+.repository-browser .artifact-table th:first-child{{width:25%}}
+.repository-browser .artifact-table th:nth-child(2){{width:12%}}
+.repository-browser .artifact-table th:nth-child(3){{width:21%}}
+.repository-browser .artifact-table td{{vertical-align:top}}
+.repository-browser .artifact-checksum code{{white-space:pre-wrap;word-break:break-all;flex:1}}
+.repository-browser .artifact-checksum button{{flex-shrink:0}}
+.repository-browser summary{{cursor:pointer}}
 </style><div class="repository-browser">{body}</div>"#
     );
     Html(components::layout_dark(
@@ -577,6 +586,279 @@ fn delete_form(
     )
 }
 
+fn count(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "Unknown".into())
+}
+
+fn render_inventory_context(body: &mut String, package: &Package) {
+    use crate::registry::saved::SourceState;
+    body.push_str("<p class=\"text-sm text-slate-400 mt-6 mb-4\">Last-known inventory only. Browsing does not refresh upstream metadata or re-verify files. Stored inventory is not a guarantee of offline readiness; current source, integrity and policy still apply to serving.</p>");
+    if !package.artifacts.complete {
+        body.push_str("<p role=\"alert\" class=\"text-amber-400 mb-2\">Inventory is incomplete. Unknown values are not zero or confirmed absence.</p>");
+    }
+    for warning in &package.artifacts.warnings {
+        let _ = write!(
+            body,
+            "<p class=\"text-amber-400 text-sm mb-2\">{}</p>",
+            components::html_escape(warning)
+        );
+    }
+    let mut groups = std::collections::BTreeMap::new();
+    for source in &package.artifacts.sources {
+        let label = source.source.split(" (").next().unwrap_or(&source.source);
+        let state = match source.state {
+            SourceState::Available => "available",
+            SourceState::Missing => "no saved record",
+            SourceState::Absent => "upstream absence recorded",
+            SourceState::Unavailable => "unavailable or untrusted",
+            SourceState::NotApplicable => "not applicable",
+        };
+        let entry =
+            groups
+                .entry((label, state))
+                .or_insert((0usize, None::<u64>, None::<u64>, false));
+        entry.0 += 1;
+        if let Some(at) = source.saved_at {
+            entry.1 = Some(entry.1.map_or(at, |v| v.min(at)));
+            entry.2 = Some(entry.2.map_or(at, |v| v.max(at)));
+        }
+        entry.3 |= source.expired == Some(true);
+    }
+    body.push_str("<details class=\"text-sm text-slate-400 mb-6\"><summary>Saved metadata</summary><ul class=\"mt-2\">");
+    for ((label, state), (records, oldest, newest, expired)) in groups {
+        let times = match (oldest, newest) {
+            (Some(a), Some(b)) if a != b => format!(
+                " · saved {}–{}",
+                components::format_timestamp(a),
+                components::format_timestamp(b)
+            ),
+            (Some(at), _) => format!(" · saved {}", components::format_timestamp(at)),
+            _ => String::new(),
+        };
+        let _ = write!(
+            body,
+            "<li>{}: {state} · {records} record(s){}{}</li>",
+            components::html_escape(label),
+            components::html_escape(&times),
+            if expired {
+                " · expired (last known only)"
+            } else {
+                ""
+            }
+        );
+    }
+    body.push_str("</ul></details>");
+    if !package.artifacts.advertisements_enumerated && package.repository.kind != "local" {
+        body.push_str("<p class=\"text-sm text-slate-400 mb-4\">No complete saved package listing is available. Individual saved observations cannot establish that another version is unadvertised.</p>");
+    }
+}
+
+fn render_pagination<T>(
+    body: &mut String,
+    data: &artifacts::Page<T>,
+    query: &PackageQuery,
+    version: Option<&str>,
+    other: bool,
+) {
+    if data.total <= data.limit && data.page == 1 {
+        return;
+    }
+    let label = if other {
+        "other files"
+    } else if version.is_some() {
+        "files"
+    } else {
+        "versions"
+    };
+    let _ = write!(
+        body,
+        "<nav aria-label=\"{label} pagination\" class=\"mt-4 mb-6 flex gap-4 text-sky-400\">"
+    );
+    for (target, direction) in [
+        (data.page.checked_sub(1).filter(|v| *v > 0), "Previous"),
+        (
+            (data.page < data.total.div_ceil(data.limit)).then_some(data.page.saturating_add(1)),
+            "Next",
+        ),
+    ] {
+        let Some(target) = target else { continue };
+        let mut href = if other {
+            format!(
+                "?page={}&limit={}&other_page={target}",
+                query.page.unwrap_or(1).max(1),
+                data.limit
+            )
+        } else {
+            format!(
+                "?page={target}&limit={}&other_page={}",
+                data.limit,
+                query.other_page.unwrap_or(1).max(1)
+            )
+        };
+        if let Some(version) = version {
+            let _ = write!(href, "&version={}", encode_uri_component(version));
+        }
+        if let Some(retry) = &query.retry_version {
+            let _ = write!(href, "&retry_version={}", encode_uri_component(retry));
+        }
+        let _ = write!(
+            body,
+            "<a aria-label=\"{direction} {label}\" href=\"{}\">{direction}</a>",
+            components::html_escape(&href)
+        );
+    }
+    let _ = write!(
+        body,
+        "<span class=\"text-slate-500\">{} known {label}</span></nav>",
+        data.total
+    );
+}
+
+fn render_versions(body: &mut String, package: &Package, can_delete: bool) {
+    body.push_str("<div class=\"artifact-scroll\"><table class=\"w-full text-sm text-left mt-4\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Version</th><th class=\"p-3\">Stored files</th><th class=\"p-3\">Advertised only</th><th class=\"p-3\">Stored size</th>");
+    if can_delete {
+        body.push_str("<th class=\"p-3\">Actions</th>");
+    }
+    body.push_str("</tr></thead><tbody class=\"text-slate-300\">");
+    for version in &package.artifacts.versions.items {
+        let href = format!(
+            "?version={}&limit={}",
+            encode_uri_component(&version.version),
+            package.artifacts.versions.limit
+        );
+        let _ = write!(body, "<tr class=\"border-t border-slate-700\"><td class=\"p-3\"><a class=\"text-sky-400\" href=\"{}\" aria-label=\"View files for version {}\">{}</a>{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td>", components::html_escape(&href), components::html_escape(&version.version), components::html_escape(&version.version), if version.filename_only { "<div class=\"text-xs text-amber-400\">Filename-derived; not in listed releases</div>" } else { "" }, count(version.stored_files), count(version.advertised_only_files), version.stored_size.map(components::format_size).unwrap_or_else(|| "Unknown".into()));
+        if can_delete {
+            body.push_str("<td class=\"p-3\">");
+            if let Some(release) = package.releases.as_ref().and_then(|releases| {
+                releases
+                    .iter()
+                    .find(|release| release.version == version.version)
+            }) {
+                body.push_str(&delete_form(
+                    &package.repository.name,
+                    &package.name,
+                    Some(&release.version),
+                    "Delete version",
+                    &format!("Displayed inventory: {} distribution files.", release.files),
+                ));
+            }
+            body.push_str("</td>");
+        }
+        body.push_str("</tr>");
+    }
+    if package.artifacts.versions.items.is_empty() {
+        let message = if package.artifacts.versions.total > 0 {
+            "No versions on this page. Use Previous to return to known records."
+        } else if !package.artifacts.complete {
+            "No versions could be established from the available records."
+        } else if package.repository.kind == "local" {
+            "No releases are stored. Package cleanup can still remove orphan metadata."
+        } else {
+            "No versions are known from stored files or saved metadata."
+        };
+        let _ = write!(
+            body,
+            "<tr><td colspan=\"5\" class=\"p-6 text-slate-500\">{message}</td></tr>"
+        );
+    }
+    body.push_str("</tbody></table></div>");
+}
+
+fn render_checksum(body: &mut String, checksum: &crate::registry::saved::Checksum) {
+    let saved = checksum
+        .saved_at
+        .map(|at| format!(" · saved {}", components::format_timestamp(at)))
+        .unwrap_or_default();
+    let _ = write!(
+        body,
+        r#"<div class="artifact-checksum mb-3"><div class="text-xs text-slate-400 mb-1">{}{} · {}{}</div><div class="flex items-start gap-3"><code class="text-sky-300">{}</code><button type="button" class="text-sky-400 text-xs" aria-label="Copy {} checksum" data-copy="{}" onclick="if(navigator.clipboard){{navigator.clipboard.writeText(this.dataset.copy).then(()=>this.textContent='Copied').catch(()=>this.textContent='Select to copy')}}else{{this.textContent='Select to copy'}}">Copy</button></div></div>"#,
+        components::html_escape(&checksum.algorithm),
+        if checksum.representation == "sri" {
+            " (SRI)"
+        } else {
+            ""
+        },
+        components::html_escape(&checksum.source),
+        components::html_escape(&saved),
+        components::html_escape(&checksum.value),
+        components::html_escape(&checksum.algorithm),
+        components::html_escape(&checksum.value)
+    );
+}
+
+fn render_files(body: &mut String, files: &artifacts::Page<artifacts::File>) {
+    body.push_str("<div class=\"artifact-scroll\"><table class=\"artifact-table w-full text-sm text-left\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Filename</th><th class=\"p-3\">Size</th><th class=\"p-3\">State</th><th class=\"p-3\">Recorded checksums</th></tr></thead><tbody class=\"text-slate-300\">");
+    for file in &files.items {
+        let status = match (file.retained, file.advertised) {
+            ("stored", Some(true)) => "Stored · saved advertisement",
+            ("stored", Some(false)) => "Stored · not in saved listing",
+            ("stored", None) => "Stored · advertisement unknown",
+            ("not_stored", _) => "Advertised only · no stored match",
+            _ => "Advertised · retention unknown",
+        };
+        let size = file
+            .stored_size
+            .map(components::format_size)
+            .or_else(|| {
+                file.advertised_size
+                    .map(|v| format!("Advertised {}", components::format_size(v)))
+            })
+            .unwrap_or_else(|| "Unknown".into());
+        let _ = write!(body, "<tr class=\"border-t border-slate-700\"><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{status}</td><td class=\"p-3\">", components::html_escape(file.filename.as_deref().unwrap_or("Filename unknown (saved tarball)")), components::html_escape(&size));
+        if file.checksum_conflict {
+            body.push_str(
+                "<p role=\"status\" class=\"text-amber-400 mb-2\">Different recorded checksums</p>",
+            );
+        }
+        if let Some(primary) = file.checksums.first() {
+            render_checksum(body, primary);
+            if file.checksums.len() > 1 {
+                let _ = write!(body, "<details{}><summary class=\"text-slate-400\">All recorded hashes ({})</summary><div class=\"mt-3\">", if file.checksum_conflict { " open" } else { "" }, file.checksums.len());
+                for checksum in &file.checksums[1..] {
+                    render_checksum(body, checksum);
+                }
+                body.push_str("</div></details>");
+            }
+        } else {
+            body.push_str("<span class=\"text-slate-500\">Unknown</span>");
+        }
+        if let (Some(stored), Some(advertised)) = (file.stored_size, file.advertised_size) {
+            if stored != advertised {
+                let _ = write!(body, "<p class=\"text-amber-400 text-xs\">Different recorded size: advertised {}</p>", components::format_size(advertised));
+            }
+        }
+        if let Some(updated) = &file.updated {
+            let _ = write!(
+                body,
+                "<p class=\"text-slate-500 text-xs\">Stored update: {}</p>",
+                components::html_escape(updated)
+            );
+        }
+        for warning in &file.warnings {
+            let _ = write!(
+                body,
+                "<p class=\"text-amber-400 text-xs\">{}</p>",
+                components::html_escape(warning)
+            );
+        }
+        body.push_str("</td></tr>");
+    }
+    if files.items.is_empty() {
+        let message = if files.total > 0 {
+            "No files on this page. Use Previous to return to known records."
+        } else {
+            "No matching files in the available stored inventory or saved metadata."
+        };
+        let _ = write!(
+            body,
+            "<tr><td colspan=\"4\" class=\"p-6 text-slate-500\">{message}</td></tr>"
+        );
+    }
+    body.push_str("</tbody></table></div>");
+}
+
 fn render_local_releases(
     body: &mut String,
     package: &Package,
@@ -617,27 +899,10 @@ fn render_local_releases(
     if let Some(count) = package.residual_files.filter(|count| *count > 0) {
         let _ = write!(body, "<p class=\"text-amber-400 mt-4\">{count} files cannot be assigned to a release. Delete the whole package to remove them.</p>");
     }
-    body.push_str("<p id=\"delete-error\" role=\"alert\" class=\"text-amber-400 mt-4\" hidden></p><table class=\"w-full text-sm text-left mt-4\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Version</th><th class=\"p-3\">Files</th><th class=\"p-3\">Size</th><th class=\"p-3\">Actions</th></tr></thead><tbody class=\"text-slate-300\">");
-    if let Some(releases) = &package.releases {
-        for release in releases {
-            let action = if can_delete {
-                delete_form(
-                    &package.repository.name,
-                    &package.name,
-                    Some(&release.version),
-                    "Delete version",
-                    &format!("Displayed inventory: {} distribution files.", release.files),
-                )
-            } else {
-                String::new()
-            };
-            let _ = write!(body, "<tr class=\"border-t border-slate-700\"><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{action}</td></tr>", components::html_escape(&release.version), release.files, components::format_size(release.size));
-        }
-        if releases.is_empty() {
-            body.push_str("<tr><td colspan=\"4\" class=\"p-6 text-slate-500\">No releases are stored. Package cleanup can still remove orphan metadata.</td></tr>");
-        }
-    }
-    body.push_str("</tbody></table>");
+    body.push_str(
+        "<p id=\"delete-error\" role=\"alert\" class=\"text-amber-400 mt-4\" hidden></p>",
+    );
+    render_versions(body, package, can_delete);
     if can_delete {
         body.push_str(r#"<script>
 document.querySelectorAll('form.delete-local').forEach(function(form) {
@@ -686,10 +951,17 @@ async fn package(
         Err(response) => return *response,
     };
     let mut body=format!("<a id=\"repository-back\" class=\"text-sky-400 text-sm\" href=\"/ui/repositories/{}\">{}</a><h1 class=\"text-2xl font-bold text-white mt-4 mb-2\">{}</h1><p class=\"text-slate-400 mb-6\">{} repository · selected source: {}</p>",encode_uri_component(&repository),components::html_escape(&repository),components::html_escape(&package.name),package.repository.kind,components::html_escape(&package.source_repository));
+    let source_suffix = package
+        .artifacts
+        .selected_version
+        .as_deref()
+        .map(|version| format!("?version={}", encode_uri_component(version)))
+        .unwrap_or_default();
     let source_link = format!(
-        "<a class=\"text-sky-400\" href=\"/ui/repositories/{}/package/{}\">{}</a>",
+        "<a class=\"text-sky-400\" href=\"/ui/repositories/{}/package/{}{}\">{}</a>",
         encode_uri_component(&package.source_repository),
         encode_uri_component(&package.name),
+        components::html_escape(&source_suffix),
         components::html_escape(&package.source_repository)
     );
     body = body.replace(
@@ -712,6 +984,29 @@ async fn package(
             components::html_escape(description)
         );
     }
+    render_inventory_context(&mut body, &package);
+    if let Some(version) = &package.artifacts.selected_version {
+        let back = format!(
+            "/ui/repositories/{}/package/{}?limit={}",
+            encode_uri_component(&repository),
+            encode_uri_component(&package.name),
+            package.artifacts.versions.limit
+        );
+        let _ = write!(body, "<a id=\"package-back\" class=\"text-sky-400 text-sm\" href=\"{}\">{} versions</a><h2 class=\"text-lg font-semibold text-white mt-6 mb-4\">Version {}</h2>", components::html_escape(&back), components::html_escape(&package.name), components::html_escape(version));
+        if package.repository.format == "pypi" {
+            body.push_str("<p class=\"text-sm text-slate-400 mb-4\">Files are associated by filename-derived version. A saved release listing alone does not establish a file mapping.</p>");
+        }
+        if let Some(files) = &package.artifacts.files {
+            render_files(&mut body, files);
+            render_pagination(&mut body, files, &query, Some(version), false);
+        }
+        return page(
+            &root,
+            &headers,
+            &format!("{} · {}", package.name, version),
+            &body,
+        );
+    }
     for command in &package.commands {
         let _ = write!(
             body,
@@ -730,15 +1025,21 @@ async fn package(
             query.retry_version.as_deref(),
             can_delete,
         );
-        return page(&root, &headers, &package.name, &body);
+    } else {
+        body.push_str("<h2 class=\"text-lg font-semibold text-white mt-8 mb-2\">Versions</h2>");
+        render_versions(&mut body, &package, false);
     }
-    body.push_str("<h2 class=\"text-lg font-semibold text-white mt-8 mb-2\">Stored distribution files</h2><p class=\"text-sm text-slate-400 mb-4\">Stored inventory is not a guarantee of offline readiness. Proxy serving still checks current source, integrity and policy.</p><table class=\"w-full text-sm text-left\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Version</th><th class=\"p-3\">Size</th><th class=\"p-3\">Updated</th></tr></thead><tbody class=\"text-slate-300\">");
-    if package.stored_versions.is_empty() {
-        body.push_str("<tr><td colspan=\"3\" class=\"p-6 text-slate-500\">No distribution files are stored for this package in the selected source.</td></tr>");
+    render_pagination(&mut body, &package.artifacts.versions, &query, None, false);
+    if package.artifacts.other_files.total > 0 {
+        body.push_str("<h2 class=\"text-lg font-semibold text-white mt-8 mb-2\">Other files</h2><p class=\"text-sm text-slate-400 mb-4\">Retained distributions with no recognized version. They are not assigned to a guessed release.</p>");
+        render_files(&mut body, &package.artifacts.other_files);
+        render_pagination(
+            &mut body,
+            &package.artifacts.other_files,
+            &query,
+            None,
+            true,
+        );
     }
-    for version in package.stored_versions {
-        let _=write!(body,"<tr class=\"border-t border-slate-700\"><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td><td class=\"p-3\">{}</td></tr>",components::html_escape(&version.version),components::format_size(version.size),components::html_escape(&version.updated));
-    }
-    body.push_str("</tbody></table>");
     page(&root, &headers, &package.name, &body)
 }

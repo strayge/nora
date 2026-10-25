@@ -90,35 +90,38 @@ fn apply(
     if !value.is_object() || (!local && value["name"].as_str() != Some(name)) {
         return Err("Saved metadata has a mismatched package identity.");
     }
-    if spec.is_none() {
-        let versions = value["versions"]
-            .as_object()
-            .ok_or("Saved package metadata has no version listing.")?;
-        for (version, info) in versions {
-            if !coordinate(version) {
-                metadata.warn("Some saved versions have invalid coordinates.");
-                continue;
-            }
-            metadata.versions.insert(version.clone());
-            metadata.files.extend(distribution(version, info, source));
-        }
-    } else {
-        let version = if local {
-            spec.unwrap()
-        } else {
-            let version = value["version"]
-                .as_str()
-                .filter(|v| coordinate(v))
-                .ok_or("Saved version metadata has no valid version identity.")?;
-            if let Some(requested) = crate::curation::npm_version_key(spec.unwrap()) {
-                if crate::curation::npm_version_key(version).as_ref() != Some(&requested) {
-                    return Err("Saved version metadata has a mismatched version identity.");
+    match spec {
+        None => {
+            let versions = value["versions"]
+                .as_object()
+                .ok_or("Saved package metadata has no version listing.")?;
+            for (version, info) in versions {
+                if !coordinate(version) {
+                    metadata.warn("Some saved versions have invalid coordinates.");
+                    continue;
                 }
+                metadata.versions.insert(version.clone());
+                metadata.files.extend(distribution(version, info, source));
             }
-            version
-        };
-        metadata.versions.insert(version.into());
-        metadata.files.extend(distribution(version, value, source));
+        }
+        Some(spec) => {
+            let version = if local {
+                spec
+            } else {
+                let version = value["version"]
+                    .as_str()
+                    .filter(|v| coordinate(v))
+                    .ok_or("Saved version metadata has no valid version identity.")?;
+                if let Some(requested) = crate::curation::npm_version_key(spec) {
+                    if crate::curation::npm_version_key(version).as_ref() != Some(&requested) {
+                        return Err("Saved version metadata has a mismatched version identity.");
+                    }
+                }
+                version
+            };
+            metadata.versions.insert(version.into());
+            metadata.files.extend(distribution(version, value, source));
+        }
     }
     if metadata.description.is_none() {
         metadata.description = value["description"].as_str().map(str::to_owned);
