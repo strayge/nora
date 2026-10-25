@@ -45,8 +45,12 @@ test('PyPI version navigation, Other files, paged hashes and narrow-screen copyi
   await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(page.url()).origin });
   await row.getByRole('button', { name: 'Copy sha256 checksum', exact: true }).first().click();
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(sha256);
-  await row.locator('summary').click();
-  await expect(row.getByText('Stored SHA-256 sidecar', { exact: false })).toBeVisible();
+  await expect(row.locator('code')).toHaveCount(1);
+  await expect(row.locator('summary')).toHaveCount(0);
+  await expect(row.getByRole('cell', { name: 'Stored', exact: true })).toBeVisible();
+  await expect(row).not.toContainText('Storage pin');
+  await expect(row).not.toContainText('Stored update');
+  await expect(row).not.toContainText('File modified');
 
   await page.getByRole('link', { name: 'Next files', exact: true }).click();
   await expect(page.getByRole('cell', { name: second, exact: true })).toBeVisible();
@@ -80,6 +84,9 @@ test('scoped npm versions expose publisher hashes without adding file-view mutat
   await expect(page.getByRole('button', { name: 'Delete package', exact: true })).toHaveCount(0);
   const detail = await (await request.get(`/api/ui/repositories/smoke-npm-local/package/${encodeURIComponent(name)}?version=${version}`)).json();
   expect(detail.artifacts.files.items[0].checksums.some((hash: { value: string }) => hash.value === integrity)).toBeTruthy();
+  await expect(page.locator('main table summary')).toHaveText('More checksums (2)');
   await page.locator('main table summary').click();
-  await expect(page.getByText(`Publisher metadata (${version})`, { exact: false }).first()).toBeVisible();
+  await expect(page.locator('main table code')).toHaveCount(3);
+  await expect(page.getByText(`Publisher metadata (${version})`, { exact: false })).toHaveCount(0);
+  await expect(page.locator('main table')).not.toContainText('Storage pin');
 });

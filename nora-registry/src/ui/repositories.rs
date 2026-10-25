@@ -766,22 +766,45 @@ fn render_versions(body: &mut String, package: &Package, can_delete: bool) {
     body.push_str("</tbody></table></div>");
 }
 
-fn render_checksum(body: &mut String, checksum: &crate::registry::saved::Checksum) {
-    let saved = checksum
-        .saved_at
-        .map(|at| format!(" · saved {}", components::format_timestamp(at)))
-        .unwrap_or_default();
+fn render_checksum(
+    body: &mut String,
+    records: &[&crate::registry::saved::Checksum],
+    show_sources: bool,
+) {
+    let Some(checksum) = records.first() else {
+        return;
+    };
+    let sources = if show_sources {
+        let mut seen = BTreeSet::new();
+        let descriptions = records
+            .iter()
+            .filter(|record| seen.insert((record.source.as_str(), record.saved_at)))
+            .map(|record| {
+                let saved = record
+                    .saved_at
+                    .map(|at| format!(" · saved {}", components::format_timestamp(at)))
+                    .unwrap_or_default();
+                format!(
+                    "{}{}",
+                    components::html_escape(&record.source),
+                    components::html_escape(&saved)
+                )
+            })
+            .collect::<Vec<_>>();
+        format!(" · {}", descriptions.join("; "))
+    } else {
+        String::new()
+    };
     let _ = write!(
         body,
-        r#"<div class="artifact-checksum mb-3"><div class="text-xs text-slate-400 mb-1">{}{} · {}{}</div><div class="flex items-start gap-3"><code class="text-sky-300">{}</code><button type="button" class="text-sky-400 text-xs" aria-label="Copy {} checksum" data-copy="{}" onclick="if(navigator.clipboard){{navigator.clipboard.writeText(this.dataset.copy).then(()=>this.textContent='Copied').catch(()=>this.textContent='Select to copy')}}else{{this.textContent='Select to copy'}}">Copy</button></div></div>"#,
+        r#"<div class="artifact-checksum mb-3"><div class="text-xs text-slate-400 mb-1">{}{}{}</div><div class="flex items-start gap-3"><code class="text-sky-300">{}</code><button type="button" class="text-sky-400 text-xs" aria-label="Copy {} checksum" data-copy="{}" onclick="if(navigator.clipboard){{navigator.clipboard.writeText(this.dataset.copy).then(()=>this.textContent='Copied').catch(()=>this.textContent='Select to copy')}}else{{this.textContent='Select to copy'}}">Copy</button></div></div>"#,
         components::html_escape(&checksum.algorithm),
         if checksum.representation == "sri" {
             " (SRI)"
         } else {
             ""
         },
-        components::html_escape(&checksum.source),
-        components::html_escape(&saved),
+        sources,
         components::html_escape(&checksum.value),
         components::html_escape(&checksum.algorithm),
         components::html_escape(&checksum.value)
@@ -791,11 +814,9 @@ fn render_checksum(body: &mut String, checksum: &crate::registry::saved::Checksu
 fn render_files(body: &mut String, files: &artifacts::Page<artifacts::File>) {
     body.push_str("<div class=\"artifact-scroll\"><table class=\"artifact-table w-full text-sm text-left\"><thead class=\"text-slate-400\"><tr><th class=\"p-3\">Filename</th><th class=\"p-3\">Size</th><th class=\"p-3\">State</th><th class=\"p-3\">Recorded checksums</th></tr></thead><tbody class=\"text-slate-300\">");
     for file in &files.items {
-        let status = match (file.retained, file.advertised) {
-            ("stored", Some(true)) => "Stored · saved advertisement",
-            ("stored", Some(false)) => "Stored · not in saved listing",
-            ("stored", None) => "Stored · advertisement unknown",
-            ("not_stored", _) => "Advertised only · no stored match",
+        let status = match file.retained {
+            "stored" => "Stored",
+            "not_stored" => "Advertised only · no stored match",
             _ => "Advertised · retention unknown",
         };
         let size = file
@@ -812,12 +833,31 @@ fn render_files(body: &mut String, files: &artifacts::Page<artifacts::File>) {
                 "<p role=\"status\" class=\"text-amber-400 mb-2\">Different recorded checksums</p>",
             );
         }
-        if let Some(primary) = file.checksums.first() {
-            render_checksum(body, primary);
-            if file.checksums.len() > 1 {
-                let _ = write!(body, "<details{}><summary class=\"text-slate-400\">All recorded hashes ({})</summary><div class=\"mt-3\">", if file.checksum_conflict { " open" } else { "" }, file.checksums.len());
-                for checksum in &file.checksums[1..] {
-                    render_checksum(body, checksum);
+        let mut groups: Vec<Vec<&crate::registry::saved::Checksum>> = Vec::new();
+        for checksum in &file.checksums {
+            let matching = groups.iter_mut().find(|records| {
+                records.first().is_some_and(|first| {
+                    first.algorithm.eq_ignore_ascii_case(&checksum.algorithm)
+                        && first.representation == checksum.representation
+                        && if checksum.representation == "hex" {
+                            first.value.eq_ignore_ascii_case(&checksum.value)
+                        } else {
+                            first.value == checksum.value
+                        }
+                })
+            });
+            if let Some(records) = matching {
+                records.push(checksum);
+            } else {
+                groups.push(vec![checksum]);
+            }
+        }
+        if let Some((primary, additional)) = groups.split_first() {
+            render_checksum(body, primary, file.checksum_conflict);
+            if !additional.is_empty() {
+                let _ = write!(body, "<details{}><summary class=\"text-slate-400\">More checksums ({})</summary><div class=\"mt-3\">", if file.checksum_conflict { " open" } else { "" }, additional.len());
+                for records in additional {
+                    render_checksum(body, records, file.checksum_conflict);
                 }
                 body.push_str("</div></details>");
             }
@@ -828,13 +868,6 @@ fn render_files(body: &mut String, files: &artifacts::Page<artifacts::File>) {
             if stored != advertised {
                 let _ = write!(body, "<p class=\"text-amber-400 text-xs\">Different recorded size: advertised {}</p>", components::format_size(advertised));
             }
-        }
-        if let Some(updated) = &file.updated {
-            let _ = write!(
-                body,
-                "<p class=\"text-slate-500 text-xs\">Stored update: {}</p>",
-                components::html_escape(updated)
-            );
         }
         for warning in &file.warnings {
             let _ = write!(

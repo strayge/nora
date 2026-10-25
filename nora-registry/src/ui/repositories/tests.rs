@@ -175,9 +175,67 @@ async fn version_html_has_scoped_navigation_copy_details_and_no_mutation_control
     assert!(!html.contains("demo-2.0.tar.gz"));
     assert!(html.contains("Copy sha256 checksum") && html.contains("Storage pin"));
     assert!(html.contains("<details open>") && html.contains("Different recorded checksums"));
+    assert!(html.contains("More checksums (1)") && html.contains("Stored SHA-256 sidecar"));
     assert!(html.contains("/base/ui/repositories/a/package/demo?version=1.0%2Blocal"));
     assert!(html.contains("id=\"package-back\"") && html.contains("aria-label=\"Next files\""));
     assert!(!html.contains("Delete package") && !html.contains("delete-local"));
+}
+
+#[tokio::test]
+async fn equal_checksums_render_once_without_internal_sources_or_file_timestamps() {
+    use sha2::Digest as _;
+    let context =
+        test_helpers::with_named_repositories(test_helpers::create_test_context_with_config(|c| {
+            configure(c, "pypi")
+        }))
+        .await;
+    let storage = &context.state.repositories.get("a").unwrap().storage;
+    let checksum = hex::encode(sha2::Sha256::digest(b"body"));
+    storage
+        .put("pypi/demo/demo-1.0.tar.gz", b"body")
+        .await
+        .unwrap();
+    storage
+        .put("pypi/demo/demo-1.0.tar.gz.sha256", checksum.as_bytes())
+        .await
+        .unwrap();
+    let detail = json_response(
+        &context.app,
+        "/api/ui/repositories/a/package/demo?version=1.0",
+    )
+    .await;
+    assert_eq!(
+        detail["artifacts"]["files"]["items"][0]["checksums"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let response = send(
+        &context.app,
+        Method::GET,
+        "/ui/repositories/a/package/demo?version=1.0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+    assert_eq!(
+        html.matches(&format!("data-copy=\"{checksum}\"")).count(),
+        1
+    );
+    assert!(html.contains("<td class=\"p-3\">Stored</td>"));
+    for unwanted in [
+        "More checksums",
+        "All recorded hashes",
+        "Storage pin",
+        "Stored SHA-256 sidecar",
+        "advertisement unknown",
+        "Stored update:",
+        "File modified:",
+    ] {
+        assert!(!html.contains(unwanted), "{unwanted}");
+    }
 }
 
 #[tokio::test]

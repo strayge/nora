@@ -158,9 +158,11 @@ manifests when no package-wide listing exists. Long lists are paginated; **Other
 files** keeps retained distributions without a recognized version accessible.
 
 File rows show filenames, archive sizes when known, retention state and recorded
-checksums. Copy the primary checksum or expand **All recorded hashes** to inspect
-additional values and their sources. npm advertisements may have no reliable
-filename or compressed size; unpacked size is not used as archive size.
+checksums. Identical values appear once. Copy the primary checksum or expand
+**More checksums** for additional values; sources appear only when recorded values
+conflict. Full provenance remains available in the JSON API. npm advertisements
+may have no reliable filename or compressed size; unpacked size is not used as
+archive size.
 
 **Advertised only** means a file was described by saved metadata with no stored
 match, not that it is currently available upstream. Metadata timestamps and expiry
