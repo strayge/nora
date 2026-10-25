@@ -123,6 +123,9 @@ fn apply(
     if metadata.description.is_none() {
         metadata.description = value["description"].as_str().map(str::to_owned);
     }
+    if spec.is_none() || local {
+        metadata.exhaustive = true;
+    }
     Ok(())
 }
 

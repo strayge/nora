@@ -4,7 +4,7 @@
 //! Repository identities are explicit; a group's inventory never merges selected members.
 
 use super::{
-    api, components, extract_lang_from_headers, resolve_base_url, templates::encode_uri_component,
+    components, extract_lang_from_headers, resolve_base_url, templates::encode_uri_component,
 };
 use crate::config::repositories::{RepositoryConfig, RepositoryFormat};
 use crate::repositories::{groups, Repository};
@@ -18,6 +18,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt::Write, sync::Arc};
+
+mod artifacts;
 
 #[cfg(test)]
 mod tests;
@@ -74,6 +76,7 @@ struct Package {
     source_repository: String,
     commands: Vec<Commands>,
     stored_versions: Vec<StoredVersion>,
+    artifacts: artifacts::Inventory,
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     releases: Option<Vec<Release>>,
@@ -93,6 +96,10 @@ struct Release {
 #[derive(Default, Deserialize)]
 struct PackageQuery {
     retry_version: Option<String>,
+    version: Option<String>,
+    page: Option<usize>,
+    limit: Option<usize>,
+    other_page: Option<usize>,
 }
 
 pub(super) fn selection_required() -> Response {
@@ -323,6 +330,7 @@ async fn package_data(
     root: &AppState,
     repository: &str,
     name: &str,
+    query: &PackageQuery,
 ) -> Result<Package, Box<Response>> {
     let repository = summary(root, repository)
         .await
@@ -365,21 +373,18 @@ async fn package_data(
     } else {
         (None, None, None)
     };
-    let detail = if repository.format == "npm" {
-        api::get_npm_detail(&member.storage, &name, true, true).await
-    } else {
-        api::get_pypi_detail(&member.storage, &name, true, true).await
-    };
-    let stored_versions = detail
-        .versions
-        .into_iter()
-        .filter(|version| version.cached)
-        .map(|version| StoredVersion {
-            version: version.version,
-            size: version.size,
-            updated: version.published,
-        })
-        .collect();
+    let mut artifacts = artifacts::read(
+        &member.state(root),
+        member.definition.format(),
+        &name,
+        query,
+    )
+    .await
+    .map_err(|status| {
+        Box::new((status, "Artifact inventory could not be inspected.").into_response())
+    })?;
+    let stored_versions = std::mem::take(&mut artifacts.legacy);
+    let description = artifacts.description.take();
     let commands = commands(root, &repository, &name);
     Ok(Package {
         repository,
@@ -387,7 +392,8 @@ async fn package_data(
         source_repository: member.name.clone(),
         commands,
         stored_versions,
-        description: detail.metadata.description,
+        artifacts,
+        description,
         releases,
         inventory_error,
         residual_files,
@@ -413,8 +419,9 @@ async fn api_repository(
 async fn api_package(
     State(root): State<AppState>,
     Path((repository, name)): Path<(String, String)>,
+    Query(query): Query<PackageQuery>,
 ) -> Response {
-    match package_data(&root, &repository, &name).await {
+    match package_data(&root, &repository, &name, &query).await {
         Ok(package) => Json(package).into_response(),
         Err(response) => *response,
     }
@@ -674,7 +681,7 @@ async fn package(
     authority: Option<Extension<crate::auth::NamespaceAuthority>>,
     headers: HeaderMap,
 ) -> Response {
-    let package = match package_data(&root, &repository, &name).await {
+    let package = match package_data(&root, &repository, &name, &query).await {
         Ok(package) => package,
         Err(response) => return *response,
     };

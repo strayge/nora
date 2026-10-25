@@ -945,45 +945,6 @@ pub async fn get_cargo_detail(
     }
 }
 
-pub async fn get_pypi_detail(
-    storage: &Storage,
-    name: &str,
-    show_prerelease: bool,
-    show_all: bool,
-) -> PackageDetail {
-    let prefix = format!("pypi/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
-
-    let mut versions = Vec::new();
-    for key in &keys {
-        if let Some(filename) = key.strip_prefix(&prefix) {
-            if let Some(version) = extract_pypi_version(name, filename) {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
-                versions.push(VersionInfo {
-                    version,
-                    size,
-                    published,
-                    cached: true,
-                });
-            }
-        }
-    }
-
-    versions.sort_by(|a, b| b.version.cmp(&a.version));
-    let (versions, prerelease_count, total_stable) =
-        apply_prerelease_filter(versions, show_prerelease, show_all);
-    PackageDetail {
-        versions,
-        prerelease_count,
-        total_stable,
-        metadata: PackageMetadata::default(),
-    }
-}
-
 /// List immediate children of a Go namespace path for hierarchical browsing.
 /// Returns (entries, is_leaf_module). A leaf module has an `@v/` subdirectory.
 pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
@@ -2052,10 +2013,6 @@ fn apply_cpan_release_filter(
         versions.truncate(20);
     }
     (versions, prerelease_count, total_stable)
-}
-
-fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
-    nora_registry::pypi_files::parse_pypi_version(name, filename)
 }
 
 pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {

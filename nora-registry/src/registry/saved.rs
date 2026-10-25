@@ -52,6 +52,7 @@ pub(crate) struct Metadata {
     pub warnings: Vec<&'static str>,
     pub description: Option<String>,
     pub authoritative_versions: Option<Vec<String>>,
+    pub exhaustive: bool,
 }
 
 impl Metadata {

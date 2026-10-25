@@ -25,6 +25,7 @@ pub(crate) async fn read(state: &AppState, name: &str) -> Metadata {
                     )
                 });
                 source.state = SourceState::Absent;
+                result.exhaustive = true;
                 if let Some(project) = &snapshot.project {
                     source.state = SourceState::Available;
                     result.authoritative_versions.clone_from(&project.versions);

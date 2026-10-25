@@ -62,6 +62,59 @@ async fn local_release_actions_group_files_rewrite_base_paths_and_preserve_empty
 }
 
 #[tokio::test]
+async fn version_api_is_additive_paged_and_rejects_unknown_or_unsafe_versions() {
+    let context =
+        test_helpers::with_named_repositories(test_helpers::create_test_context_with_config(|c| {
+            configure(c, "pypi")
+        }))
+        .await;
+    let storage = &context.state.repositories.get("a").unwrap().storage;
+    for file in [
+        "demo-1.0.tar.gz",
+        "demo-1.0-py3-none-any.whl",
+        "demo-2.0.tar.gz",
+    ] {
+        storage
+            .put(&format!("pypi/demo/{file}"), b"body")
+            .await
+            .unwrap();
+    }
+    let detail = json_response(
+        &context.app,
+        "/api/ui/repositories/a/package/demo?version=1.0&page=2&limit=1",
+    )
+    .await;
+    assert_eq!(detail["stored_versions"].as_array().unwrap().len(), 3);
+    assert_eq!(detail["releases"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["artifacts"]["files"]["total"], 2);
+    assert_eq!(
+        detail["artifacts"]["files"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(detail["artifacts"]["files"]["items"][0]["version"], "1.0");
+    for (query, status) in [
+        ("version=missing", StatusCode::NOT_FOUND),
+        ("version=", StatusCode::BAD_REQUEST),
+        ("version=..", StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            send(
+                &context.app,
+                Method::GET,
+                &format!("/api/ui/repositories/a/package/demo?{query}"),
+                Body::empty()
+            )
+            .await
+            .status(),
+            status
+        );
+    }
+}
+
+#[tokio::test]
 async fn local_mutation_controls_require_a_verified_writer_when_browsing_is_public() {
     let context = test_helpers::with_named_repositories(
         test_helpers::create_test_context_with_anonymous_read_and_config(
@@ -342,7 +395,9 @@ async fn client_commands_terminate_options_before_a_leading_hyphen_coordinate() 
             configure(c, "npm")
         }))
         .await;
-    let package = package_data(&context.state, "a", "--global").await.unwrap();
+    let package = package_data(&context.state, "a", "--global", &PackageQuery::default())
+        .await
+        .unwrap();
     let command = &package.commands[0].install;
     let output = std::process::Command::new("sh")
         .args(["-c", &format!("set -- {command}; printf '%s\\n' \"$@\"")])
