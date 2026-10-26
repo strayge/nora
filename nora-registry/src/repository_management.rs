@@ -47,16 +47,14 @@ pub(crate) fn valid_version(version: &str) -> bool {
 
 pub(crate) fn canonical_name(format: RepositoryFormat, name: &str) -> Option<String> {
     match format {
+        RepositoryFormat::Docker => None,
         RepositoryFormat::Npm => npm::valid_package_name(name).then(|| name.to_owned()),
         RepositoryFormat::Pypi => crate::registry::canonical_pypi_project(name),
     }
 }
 
 pub(crate) fn registry(format: RepositoryFormat) -> RegistryType {
-    match format {
-        RepositoryFormat::Npm => RegistryType::Npm,
-        RepositoryFormat::Pypi => RegistryType::PyPI,
-    }
+    format.registry_type()
 }
 
 #[derive(Clone)]
@@ -84,6 +82,7 @@ impl Inventory {
         let entries = state.storage.list_with_meta(&prefix).await?;
         let mut keys: BTreeSet<_> = entries.iter().map(|(key, _)| key.clone()).collect();
         match format {
+            RepositoryFormat::Docker => unreachable!("Docker has no package-file inventory"),
             RepositoryFormat::Npm => {
                 keys.extend(
                     state
@@ -118,6 +117,7 @@ impl Inventory {
                 releases.insert(version.to_owned());
             }
             let is_body = match format {
+                RepositoryFormat::Docker => false,
                 RepositoryFormat::Npm => key
                     .strip_prefix(&format!("npm/{name}/tarballs/"))
                     .is_some_and(|file| file.ends_with(".tgz")),
@@ -157,6 +157,7 @@ impl Inventory {
 
 pub(crate) fn version_for_key(format: RepositoryFormat, name: &str, key: &str) -> Option<String> {
     match format {
+        RepositoryFormat::Docker => None,
         RepositoryFormat::Npm => {
             let key = key.strip_prefix(".nora-origins/").unwrap_or(key);
             let file = key.strip_prefix(&format!("npm/{name}/tarballs/"))?;
@@ -269,7 +270,7 @@ async fn remove(
     if !root.enabled_registries.contains(&registry(format)) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if !matches!(definition, RepositoryConfig::Local(_)) {
+    if format == RepositoryFormat::Docker || !matches!(definition, RepositoryConfig::Local(_)) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let Some(name) = canonical_name(format, &name) else {
@@ -302,6 +303,7 @@ async fn remove(
             started: false,
         };
         let outcome = match format {
+            RepositoryFormat::Docker => unreachable!("Docker is excluded from package deletion"),
             RepositoryFormat::Npm => npm::deletion::delete(&mut operation).await,
             RepositoryFormat::Pypi => pypi::deletion::delete(&mut operation).await,
         };

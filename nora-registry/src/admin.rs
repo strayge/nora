@@ -143,7 +143,7 @@ async fn reindex(
             _ = cancel.cancelled() => {}
             _ = async {
                 for rt in targets {
-                    if !matches!(rt,RegistryType::Npm|RegistryType::PyPI) {let _ = repo_index.get(rt.as_str(), &storage).await;}
+                    if !matches!(rt,RegistryType::Docker|RegistryType::Npm|RegistryType::PyPI) {let _ = repo_index.get(rt.as_str(), &storage).await;}
                 }
                 repositories.warm(target).await;
             } => {}

@@ -17,7 +17,7 @@ const BLOCKLIST: &str = r#"{"version": 1, "rules": [
 fn curation_env(command: &mut Command, dir: &Path) {
     command
         .current_dir(dir)
-        .env_remove("NORA_CONFIG_PATH")
+        .env("NORA_CONFIG_PATH", dir.join("repositories.toml"))
         .env("NORA_HOST", "127.0.0.1")
         .env("NORA_STORAGE_PATH", dir.join("data"))
         .env("NORA_CURATION_MODE", "enforce")
@@ -73,6 +73,7 @@ fn get(port: u16, path: &str) -> (u16, String) {
 fn the_hint_of_a_refusal_runs_in_a_shell_as_it_is() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("blocklist.json"), BLOCKLIST).unwrap();
+    std::fs::write(dir.path().join("repositories.toml"), "[repositories.npm]\nformat='npm'\nkind='proxy'\npaths=['/npm/']\nupstream='http://127.0.0.1:1'\n").unwrap();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

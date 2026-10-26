@@ -145,78 +145,20 @@ impl Canonical {
     }
 }
 
-/// Canonicalize a Docker image name: resolve upstream, strip prefix/hostname,
-/// and determine the storage namespace.
-///
-/// This is the single entry point for Docker name resolution. Use instead of
-/// the heuristic `strip_docker_namespace()` whenever upstream config is available.
-///
-/// Resolution order (early-return):
-/// 1. Prefix match — first path segment matches a configured upstream prefix
-/// 2. Hostname detection — first segment contains a dot (FQDN like `docker.io`)
-/// 3. Fallback — if `default_action = deny`, mark as denied; otherwise use
-///    the first configured upstream
+/// A port selects the repository; every path segment remains part of the image identity.
 pub(crate) fn canonicalize(
     raw_name: &str,
     docker_config: &crate::config::DockerConfig,
 ) -> Canonical {
-    let upstreams = &docker_config.upstreams;
-    let deny_mode = docker_config.default_action == crate::config::DefaultAction::Deny;
-
-    // Step 1: Check for prefix-based routing
-    if let Some((first_segment, rest)) = raw_name.split_once('/') {
-        for (idx, upstream) in upstreams.iter().enumerate() {
-            if let Some(ref prefix) = upstream.prefix {
-                if first_segment == prefix {
-                    tracing::debug!(
-                        prefix = %prefix,
-                        upstream = %upstream.url,
-                        stripped_name = %rest,
-                        routing = "prefix",
-                        "Docker path-based upstream routing"
-                    );
-                    return Canonical {
-                        name: rest.to_string(),
-                        namespace: Some(upstream.resolved_namespace()),
-                        matched_upstream_idx: Some(idx),
-                        denied: false,
-                    };
-                }
-            }
-        }
-
-        // Step 2: Hostname detection (dot in first segment = FQDN)
-        if first_segment.contains('.') && !rest.is_empty() {
-            // Check if it matches a known upstream's namespace
-            for (idx, upstream) in upstreams.iter().enumerate() {
-                let ns = upstream.resolved_namespace();
-                if first_segment == ns {
-                    return Canonical {
-                        name: rest.to_string(),
-                        namespace: Some(ns),
-                        matched_upstream_idx: Some(idx),
-                        denied: false,
-                    };
-                }
-            }
-            // Unknown hostname — strip it but use default upstream
-            let ns = upstreams.first().map(|u| u.resolved_namespace());
-            return Canonical {
-                name: rest.to_string(),
-                namespace: ns,
-                matched_upstream_idx: None,
-                denied: deny_mode,
-            };
-        }
-    }
-
-    // Step 3: Fallback — first upstream, name unchanged
-    let ns = upstreams.first().map(|u| u.resolved_namespace());
+    debug_assert!(
+        docker_config.upstreams.len() <= 1,
+        "one upstream per named proxy"
+    );
     Canonical {
         name: raw_name.to_string(),
-        namespace: ns,
+        namespace: None,
         matched_upstream_idx: None,
-        denied: deny_mode,
+        denied: false,
     }
 }
 
@@ -437,6 +379,7 @@ impl PullStatsAccumulator {
 /// body is never fully buffered in RAM (#817). Finalization hashes the temp file
 /// and moves it into storage via `put_from_path` without an in-RAM copy.
 pub struct UploadSession {
+    repository: Option<String>,
     /// Path to the temporary file holding blob data.
     temp_path: std::path::PathBuf,
     /// Current size of data written to temp file.
@@ -916,6 +859,9 @@ async fn docker_v2_dispatch(
         method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
+    if is_write && !state.0.config.docker.upstreams.is_empty() {
+        return method_not_allowed("GET, HEAD");
+    }
 
     // Parse endpoint pattern from right — handles names containing "blobs", "manifests", etc.
     // Order matters: check blob uploads before blobs (substring overlap).
@@ -1108,11 +1054,6 @@ async fn check() -> impl IntoResponse {
 /// (e.g., `docker_key_migration`). For request-time routing, use [`canonicalize()`]
 /// which is config-aware and handles prefix-based upstream matching.
 pub(crate) fn strip_docker_namespace(name: &str) -> &str {
-    if let Some((first, rest)) = name.split_once('/') {
-        if first.contains('.') && !rest.is_empty() {
-            return rest;
-        }
-    }
     name
 }
 
@@ -1132,7 +1073,7 @@ async fn catalog(State(state): State<AppState>) -> Response {
         .filter_map(|k| {
             let rest = k.strip_prefix("docker/")?;
             // Find the first known directory separator (manifests/ or blobs/)
-            let name = if let Some(idx) = rest.find("/manifests/") {
+            let name = if let Some(idx) = rest.rfind("/manifests/") {
                 &rest[..idx]
             } else {
                 let idx = rest.find("/blobs/")?;
@@ -1517,7 +1458,7 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
         return start_upload(state, Path(raw_name.to_string())).await;
     }
 
-    state.audit.log(AuditEntry::new(
+    state.log_audit(AuditEntry::new(
         "mount",
         "api",
         &format!("{}@{}", name, digest),
@@ -1573,6 +1514,7 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
             sessions.insert(
                 uuid.clone(),
                 UploadSession {
+                    repository: state.repository.as_ref().map(|r| r.name.clone()),
                     temp_path,
                     size: 0,
                     name: name.clone(),
@@ -1635,8 +1577,10 @@ async fn patch_blob(
             }
         };
 
-        // Verify session belongs to this repository
-        if session.name != name {
+        // Upload UUIDs cannot authorize access through a different repository port.
+        if session.name != name
+            || session.repository.as_deref() != state.repository.as_ref().map(|r| r.name.as_str())
+        {
             tracing::warn!(
                 session_name = %session.name,
                 request_name = %name,
@@ -1785,7 +1729,10 @@ async fn cancel_upload(
     // `map` yields an owned bool so no borrow of `sessions` outlives the match.
     let temp_path = {
         let mut sessions = state.upload_sessions.write();
-        match sessions.get(&uuid).map(|s| s.name == name) {
+        match sessions.get(&uuid).map(|s| {
+            s.name == name
+                && s.repository.as_deref() == state.repository.as_ref().map(|r| r.name.as_str())
+        }) {
             None => None,
             Some(false) => {
                 tracing::warn!(
@@ -1852,6 +1799,16 @@ async fn upload_blob(
     // Remove session from map under brief lock, then do file I/O outside
     let session_opt = {
         let mut sessions = state.upload_sessions.write();
+        if sessions.get(&uuid).is_some_and(|s| {
+            s.name != name
+                || s.repository.as_deref() != state.repository.as_ref().map(|r| r.name.as_str())
+        }) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Session does not belong to this repository",
+            )
+                .into_response();
+        }
         sessions.remove(&uuid)
     }; // lock released before file I/O
 
@@ -1990,7 +1947,7 @@ async fn upload_blob(
         Ok(()) => {
             guard.disarm(); // temp moved into storage — nothing left to clean up
             state.metrics.record_upload("docker");
-            state.audit.log(AuditEntry::new(
+            state.log_audit(AuditEntry::new(
                 "push",
                 "api",
                 &format!("{}@{}", name, digest),
@@ -2033,7 +1990,7 @@ async fn try_fetch_and_cache(
 ) -> Option<Response> {
     for (upstream, miss) in upstreams.iter().zip(misses.iter_mut()) {
         tracing::debug!(upstream_url = %upstream.url, upstream_name = %upstream_name, "Trying upstream");
-        match fetch_manifest_from_upstream(
+        match fetch_manifest_from_upstream_with_key(
             &state.http_client,
             &upstream.url,
             upstream_name,
@@ -2042,6 +1999,11 @@ async fn try_fetch_and_cache(
             state.config.docker.proxy_timeout,
             expose_opt(&upstream.auth),
             &state.circuit_breaker,
+            state
+                .repository
+                .as_ref()
+                .map(|repository| repository.breaker_key())
+                .as_deref(),
         )
         .await
         {
@@ -2130,7 +2092,7 @@ async fn try_fetch_and_cache(
                 }
 
                 // Cache manifest and create metadata (fire and forget)
-                let upstream_ns = Some(upstream.resolved_namespace());
+                let upstream_ns: Option<String> = None;
                 let storage = state.storage.clone();
                 let key_clone = cache_key.to_string();
                 let data_clone = data.clone();
@@ -2245,26 +2207,13 @@ async fn resolve_manifest(
     pushed: Option<crate::storage::Result<PushedTag>>,
 ) -> crate::storage::Result<Option<(Bytes, bool)>> {
     use crate::storage::StorageError;
-    let key = manifest_key(ns, name, reference);
-    let legacy_key = manifest_key(None, name, reference);
-    if consults_push_record(ns, name, reference) {
-        let pushed = match pushed {
-            Some(pushed) => pushed,
-            None => pushed_tag(&state.storage, name, reference).await,
-        };
-        if let PushedTag::Push { manifest, .. } = pushed? {
-            return Ok(Some((manifest, true)));
-        }
-    }
-    match state.storage.get(&key).await {
-        Ok(data) => Ok(Some((data, key == legacy_key))),
-        Err(StorageError::NotFound) if key != legacy_key => {
-            match state.storage.get(&legacy_key).await {
-                Ok(data) => Ok(Some((data, true))),
-                Err(StorageError::NotFound) => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
+    let _ = (ns, pushed);
+    match state
+        .storage
+        .get(&manifest_key(None, name, reference))
+        .await
+    {
+        Ok(data) => Ok(Some((data, state.config.docker.upstreams.is_empty()))),
         Err(StorageError::NotFound) => Ok(None),
         Err(e) => Err(e),
     }
@@ -2275,10 +2224,7 @@ enum PushedTag {
     /// The bare metadata holds a push record and the bare manifest is stored: the tag is the push's.
     /// Its manifest answers it — whatever bytes it holds, since the bare key is written only by a
     /// push, so other bytes are a re-push in progress — and curation dates it by the record.
-    Push {
-        manifest: Bytes,
-        record: ImageMetadata,
-    },
+    Push { record: ImageMetadata },
     /// No push answers the tag: no record, or a record without its manifest (an interrupted
     /// delete left it). The bare metadata as read, for the publish date.
     NotPushed { bare_meta: Option<Bytes> },
@@ -2298,7 +2244,7 @@ async fn pushed_tag(
         return Ok(PushedTag::NotPushed { bare_meta });
     };
     match storage.get(&manifest_key(None, name, reference)).await {
-        Ok(manifest) => Ok(PushedTag::Push { manifest, record }),
+        Ok(_) => Ok(PushedTag::Push { record }),
         Err(StorageError::NotFound) => Ok(PushedTag::NotPushed { bare_meta }),
         Err(e) => Err(e),
     }
@@ -2792,7 +2738,7 @@ async fn put_manifest(
         crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
-    state.audit.log(AuditEntry::new(
+    state.log_audit(AuditEntry::new(
         "push",
         "api",
         &format!("{}:{}", name, reference),
@@ -3104,7 +3050,7 @@ async fn delete_manifest(
     // Delete manifest — try namespaced key first, then legacy fallback — then its metadata.
     match delete_manifest_and_meta(&state, ns.as_deref(), &name, &reference).await {
         Ok(()) => {
-            state.audit.log(AuditEntry::new(
+            state.log_audit(AuditEntry::new(
                 "delete",
                 "api",
                 &format!("{}:{}", name, reference),
@@ -3148,7 +3094,7 @@ async fn delete_blob(
     }
     match state.storage.delete(&key).await {
         Ok(()) => {
-            state.audit.log(AuditEntry::new(
+            state.log_audit(AuditEntry::new(
                 "delete",
                 "api",
                 &format!("{}@{}", name, &digest[..19.min(digest.len())]),
@@ -3333,7 +3279,7 @@ async fn start_fill(
             return None;
         }
     };
-    match open_blob_from_upstream(
+    match open_blob_from_upstream_with_key(
         &state.http_client,
         upstream_url,
         name,
@@ -3342,6 +3288,11 @@ async fn start_fill(
         state.config.docker.proxy_timeout,
         upstream_auth,
         &state.circuit_breaker,
+        state
+            .repository
+            .as_ref()
+            .map(|repository| repository.breaker_key())
+            .as_deref(),
     )
     .await
     {
@@ -3812,6 +3763,32 @@ pub async fn open_blob_from_upstream(
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
 ) -> Result<UpstreamBlob, ProxyError> {
+    open_blob_from_upstream_with_key(
+        client,
+        upstream_url,
+        name,
+        digest,
+        docker_auth,
+        timeout,
+        basic_auth,
+        cb,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_blob_from_upstream_with_key(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    name: &str,
+    digest: &str,
+    docker_auth: &DockerAuth,
+    timeout: u64,
+    basic_auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+    breaker_key: Option<&str>,
+) -> Result<UpstreamBlob, ProxyError> {
     use crate::metrics::PROXY_ACTIVE_DOWNLOADS;
 
     // Track active concurrent proxy downloads. ProxyDownloadGuard decrements
@@ -3826,10 +3803,12 @@ pub async fn open_blob_from_upstream(
         "Proxy blob download started"
     );
 
-    let cb_key = upstream_key(
-        crate::registry_type::RegistryType::Docker.as_str(),
-        upstream_url,
-    );
+    let cb_key = breaker_key.map(str::to_owned).unwrap_or_else(|| {
+        upstream_key(
+            crate::registry_type::RegistryType::Docker.as_str(),
+            upstream_url,
+        )
+    });
     let probe = cb.check(&cb_key)?;
 
     let source = BlobSource {
@@ -4081,10 +4060,38 @@ pub async fn fetch_manifest_from_upstream(
     basic_auth: Option<&str>,
     cb: &CircuitBreakerRegistry,
 ) -> Result<(Vec<u8>, String), ProxyError> {
-    let cb_key = upstream_key(
-        crate::registry_type::RegistryType::Docker.as_str(),
+    fetch_manifest_from_upstream_with_key(
+        client,
         upstream_url,
-    );
+        name,
+        reference,
+        docker_auth,
+        timeout,
+        basic_auth,
+        cb,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_manifest_from_upstream_with_key(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    name: &str,
+    reference: &str,
+    docker_auth: &DockerAuth,
+    timeout: u64,
+    basic_auth: Option<&str>,
+    cb: &CircuitBreakerRegistry,
+    breaker_key: Option<&str>,
+) -> Result<(Vec<u8>, String), ProxyError> {
+    let cb_key = breaker_key.map(str::to_owned).unwrap_or_else(|| {
+        upstream_key(
+            crate::registry_type::RegistryType::Docker.as_str(),
+            upstream_url,
+        )
+    });
     let probe = cb.check(&cb_key)?;
 
     let url = format!(
@@ -4443,12 +4450,26 @@ pub(crate) async fn pull_stats_flush_loop(state: AppState, interval: std::time::
         // cancellation token). On shutdown we run one final flush, then stop.
         tokio::select! {
             _ = tick.tick() => {
-                flush_pull_stats(&state).await;
+                flush_repository_pull_stats(&state).await;
             }
             _ = state.cancel_token.cancelled() => {
-                flush_pull_stats(&state).await;
+                flush_repository_pull_stats(&state).await;
                 break;
             }
+        }
+    }
+}
+
+async fn flush_repository_pull_stats(state: &AppState) {
+    if state.repository.is_some() {
+        flush_pull_stats(state).await;
+    } else {
+        for member in state
+            .repositories
+            .members()
+            .filter(|r| r.registry_type() == crate::registry_type::RegistryType::Docker)
+        {
+            flush_pull_stats(&member.state(state)).await;
         }
     }
 }
@@ -4542,6 +4563,9 @@ pub(crate) async fn flush_pull_stats(state: &AppState) {
         }
     }
 }
+
+#[cfg(test)]
+mod repositories_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -4705,6 +4729,7 @@ mod tests {
         sessions.write().insert(
             "uuid-1".to_string(),
             UploadSession {
+                repository: None,
                 temp_path,
                 size: 9,
                 name: "test/image".to_string(),
@@ -4726,7 +4751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_upload_frees_session_and_temp() {
-        use crate::test_helpers::{create_test_context, send};
+        use crate::test_helpers::docker::{create_test_context, send};
 
         let ctx = create_test_context();
         let resp = send(
@@ -4768,7 +4793,7 @@ mod tests {
         // The handler reads the limit from env while the request runs, so the lock is
         // held across the whole request; a runtime of its own keeps that off an `.await`.
         let _lock = crate::test_env::env_lock();
-        use crate::test_helpers::{body_bytes, create_test_context, send};
+        use crate::test_helpers::docker::{body_bytes, create_test_context, send};
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4784,6 +4809,7 @@ mod tests {
                     sessions.insert(
                         format!("fill-{i}"),
                         UploadSession {
+                            repository: None,
                             temp_path: std::env::temp_dir().join(format!("fill-{i}")),
                             size: 0,
                             name: "alpine".to_string(),
@@ -5016,7 +5042,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use crate::circuit_breaker::ProbeToken;
-    use crate::test_helpers::{
+    use crate::test_helpers::docker::{
         body_bytes, create_test_context, create_test_context_with_config, send,
     };
     use axum::body::Body;
@@ -5164,8 +5190,7 @@ mod integration_tests {
     }
 
     /// A cold miss is "not found" only when an upstream said so: a manifest or blob whose
-    /// every upstream failed is 502. One upstream answering "not found" decides 404 while
-    /// another is down. Docker Hub answers a single-segment name (`alpine`) with a 4xx and
+    /// its upstream failed is 502. Docker Hub answers a single-segment name (`alpine`) with a 4xx and
     /// serves it as `library/alpine`, so that 4xx does not make the image missing while
     /// `library/alpine` failed.
     #[tokio::test]
@@ -5205,19 +5230,9 @@ mod integration_tests {
             (vec![down.uri()], &manifest, StatusCode::BAD_GATEWAY),
             (vec![refused.clone()], &manifest, StatusCode::BAD_GATEWAY),
             (vec![missing.uri()], &manifest, StatusCode::NOT_FOUND),
-            (
-                vec![down.uri(), missing.uri()],
-                &manifest,
-                StatusCode::NOT_FOUND,
-            ),
             (vec![down.uri()], &layer, StatusCode::BAD_GATEWAY),
             (vec![refused.clone()], &layer, StatusCode::BAD_GATEWAY),
             (vec![missing.uri()], &layer, StatusCode::NOT_FOUND),
-            (
-                vec![down.uri(), missing.uri()],
-                &layer,
-                StatusCode::NOT_FOUND,
-            ),
             (vec![hub_down.uri()], &official, StatusCode::BAD_GATEWAY),
             (vec![missing.uri()], &official, StatusCode::NOT_FOUND),
             (
@@ -5250,23 +5265,12 @@ mod integration_tests {
             .any(|r| r.url.path().starts_with("/v2/library/alpine/")));
     }
 
-    /// A locally pushed manifest is authoritative: with global pull-through upstreams
-    /// configured, GET must serve it without revalidating against upstream — an unreachable
-    /// upstream must neither 404 the tag (serve_stale = false) nor stale-mark it.
+    /// Local tags are authoritative and never depend on proxy availability.
     #[tokio::test]
     async fn test_hosted_manifest_skips_upstream_revalidation() {
-        use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
-
-        let ctx = create_test_context_with_config(|cfg| {
-            cfg.docker.serve_stale = false;
-            cfg.docker.upstreams = vec![DockerUpstream {
-                url: "http://127.0.0.1:1".into(),
-                auth: None,
-                namespace: None,
-                prefix: None,
-            }];
-        });
+        use crate::test_helpers::docker::create_test_context;
+        let ctx = create_test_context();
+        assert!(ctx.state.config.docker.upstreams.is_empty());
 
         let manifest = serde_json::json!({
             "schemaVersion": 2,
@@ -5373,12 +5377,11 @@ mod integration_tests {
 
     /// A manifest requested by digest is content-addressed: bytes from an upstream that hash to
     /// another digest are neither served under the requested one nor cached there — on every way
-    /// an upstream is asked: the name as requested, the `library/` name of an official image, the
-    /// next upstream after a miss, and an upstream addressed by its prefix.
+    /// the configured upstream is asked: the exact name and its `library/` fallback.
     #[tokio::test]
     async fn a_manifest_by_digest_is_served_only_if_it_has_that_digest() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use sha2::Digest;
         use wiremock::matchers::{any, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5404,14 +5407,11 @@ mod integration_tests {
         for (case, honest) in [
             ("one upstream", false),
             ("library name", false),
-            ("next upstream", false),
-            ("prefixed upstream", false),
             ("one upstream", true),
             ("library name", true),
         ] {
             let body = if honest { &wanted } else { &other };
             let first = MockServer::start().await;
-            let second = MockServer::start().await;
             let (upstreams, request) = match case {
                 "one upstream" => {
                     Mock::given(any())
@@ -5437,30 +5437,7 @@ mod integration_tests {
                         format!("/v2/nginx/manifests/{digest}"),
                     )
                 }
-                "next upstream" => {
-                    Mock::given(any())
-                        .respond_with(ResponseTemplate::new(404))
-                        .mount(&first)
-                        .await;
-                    Mock::given(any())
-                        .respond_with(manifest(body))
-                        .mount(&second)
-                        .await;
-                    (
-                        vec![upstream(first.uri(), None), upstream(second.uri(), None)],
-                        format!("/v2/corp/app/manifests/{digest}"),
-                    )
-                }
-                _ => {
-                    Mock::given(any())
-                        .respond_with(manifest(body))
-                        .mount(&first)
-                        .await;
-                    (
-                        vec![upstream(first.uri(), Some("hub"))],
-                        format!("/v2/hub/corp/app/manifests/{digest}"),
-                    )
-                }
+                _ => unreachable!(),
             };
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = upstreams;
@@ -5501,7 +5478,7 @@ mod integration_tests {
     #[tokio::test]
     async fn a_stored_copy_by_digest_is_served_only_if_it_has_that_digest() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use sha2::Digest;
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5527,11 +5504,10 @@ mod integration_tests {
             namespace: None,
             prefix: None,
         };
-        let ns = upstream.resolved_namespace();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![upstream];
         });
-        let proxied = super::manifest_key(Some(&ns), "corp/app", &digest);
+        let proxied = super::manifest_key(None, "corp/app", &digest);
         ctx.state.storage.put(&proxied, &other).await.unwrap();
         let request = format!("/v2/corp/app/manifests/{digest}");
         let resp = send(&ctx.app, Method::GET, &request, Body::empty()).await;
@@ -5563,7 +5539,7 @@ mod integration_tests {
     #[tokio::test]
     async fn a_manifest_pushed_by_digest_must_have_that_digest() {
         use sha2::Digest;
-        let ctx = crate::test_helpers::create_test_context_with_config(|_| {});
+        let ctx = crate::test_helpers::docker::create_test_context_with_config(|_| {});
         let pushed = table_manifest(PUSHED_CFG);
         seed_zero_config(&ctx.state, "corp/app").await;
         let other = format!(
@@ -5599,93 +5575,6 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
-    /// COMPAT.md: pushing to a name that would otherwise proxy pins that tag to the pushed copy.
-    /// Also when the tag was pulled through the proxy before the push.
-    #[tokio::test]
-    async fn a_push_pins_a_tag_that_was_pulled_through_the_proxy() {
-        use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
-        use wiremock::matchers::any;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let manifest = |config_digest: &str| {
-            serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-                "config": {
-                    "mediaType": "application/vnd.docker.container.image.v1+json",
-                    "size": 0,
-                    "digest": config_digest
-                },
-                "layers": []
-            }))
-            .unwrap()
-        };
-        let upstream_manifest =
-            manifest("sha256:1111111111111111111111111111111111111111111111111111111111111111");
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        "content-type",
-                        "application/vnd.docker.distribution.manifest.v2+json",
-                    )
-                    .set_body_bytes(upstream_manifest.clone()),
-            )
-            .mount(&server)
-            .await;
-        let uri = server.uri();
-        let ctx = create_test_context_with_config(move |cfg| {
-            cfg.docker.upstreams = vec![DockerUpstream {
-                url: uri,
-                auth: None,
-                namespace: None,
-                prefix: None,
-            }];
-        });
-
-        let resp = send(
-            &ctx.app,
-            Method::GET,
-            "/v2/corp/app/manifests/1.0",
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            body_bytes(resp).await.as_ref(),
-            upstream_manifest.as_slice()
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let pushed =
-            manifest("sha256:0000000000000000000000000000000000000000000000000000000000000000");
-        seed_zero_config(&ctx.state, "corp/app").await;
-        let put = send(
-            &ctx.app,
-            Method::PUT,
-            "/v2/corp/app/manifests/1.0",
-            Body::from(pushed.clone()),
-        )
-        .await;
-        assert_eq!(put.status(), StatusCode::CREATED);
-
-        let resp = send(
-            &ctx.app,
-            Method::GET,
-            "/v2/corp/app/manifests/1.0",
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            body_bytes(resp).await.as_ref(),
-            pushed.as_slice(),
-            "the pushed manifest answers its tag"
-        );
-    }
-
     /// Decision table for a pushed tag: helpers.
     fn table_manifest(config_digest: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -5705,40 +5594,6 @@ mod integration_tests {
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     const UPSTREAM_CFG: &str =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-
-    /// An upstream serving the same tag with its own manifest, and a context pointing at it.
-    async fn table_context() -> (
-        wiremock::MockServer,
-        crate::test_helpers::TestContext,
-        String,
-    ) {
-        use crate::config::DockerUpstream;
-        use wiremock::matchers::any;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        "content-type",
-                        "application/vnd.docker.distribution.manifest.v2+json",
-                    )
-                    .set_body_bytes(table_manifest(UPSTREAM_CFG)),
-            )
-            .mount(&server)
-            .await;
-        let upstream = DockerUpstream {
-            url: server.uri(),
-            auth: None,
-            namespace: None,
-            prefix: None,
-        };
-        let ns = upstream.resolved_namespace();
-        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
-            cfg.docker.upstreams = vec![upstream];
-        });
-        (server, ctx, ns)
-    }
 
     async fn table_push(ctx: &crate::test_helpers::TestContext) -> Vec<u8> {
         let pushed = table_manifest(PUSHED_CFG);
@@ -5766,57 +5621,13 @@ mod integration_tests {
         body_bytes(resp).await.to_vec()
     }
 
-    /// Row 7: a push removes the proxied copy of its tag and the copy's metadata.
-    #[tokio::test]
-    async fn row7_a_push_removes_the_proxied_copy_of_its_tag() {
-        let (_server, ctx, ns) = table_context().await;
-        assert_eq!(table_get(&ctx).await, table_manifest(UPSTREAM_CFG));
-        let proxied = super::manifest_key(Some(&ns), "corp/app", "1.0");
-        let proxied_meta = super::manifest_meta_key(Some(&ns), "corp/app", "1.0");
-        // The proxied copy is cached off the request path; its metadata is the task's last write.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while ctx.state.storage.stat(&proxied).await.is_none()
-            || ctx.state.storage.stat(&proxied_meta).await.is_none()
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "proxied copy and its metadata cached"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        table_push(&ctx).await;
-        assert!(
-            ctx.state.storage.stat(&proxied).await.is_none(),
-            "proxied copy left beside the push"
-        );
-        assert!(
-            ctx.state.storage.stat(&proxied_meta).await.is_none(),
-            "proxied copy's metadata left beside the push"
-        );
-    }
-
     /// Row 1, cost: a pull of a pushed tag reads its push record once (it answers the tag and dates
     /// it for curation) and the pushed manifest — two reads. Reading the bare metadata a second time,
     /// or the namespaced metadata a push makes moot, costs every pull of a pushed image a round trip.
     #[tokio::test]
     async fn row1_a_pull_of_a_pushed_tag_reads_its_metadata_once() {
-        use crate::config::DockerUpstream;
-        let (storage, ops) = crate::test_helpers::op_counting_storage();
-        let upstream = DockerUpstream {
-            url: "http://127.0.0.1:9".to_string(),
-            auth: None,
-            namespace: None,
-            prefix: None,
-        };
-        let ns = upstream.resolved_namespace();
-        let ctx =
-            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
-                cfg.docker.upstreams = vec![upstream];
-            });
-        assert_ne!(
-            super::manifest_key(Some(&ns), "corp/app", "1.0"),
-            super::manifest_key(None, "corp/app", "1.0")
-        );
+        let (storage, ops) = crate::test_helpers::docker::op_counting_storage();
+        let ctx = crate::test_helpers::docker::create_test_context_with_storage(storage);
         let pushed = table_push(&ctx).await;
         ops.reset();
         assert_eq!(table_get(&ctx).await, pushed);
@@ -5835,18 +5646,19 @@ mod integration_tests {
     async fn a_pull_by_digest_of_a_proxied_copy_reads_two_documents() {
         use crate::config::DockerUpstream;
         use sha2::Digest;
-        let (storage, ops) = crate::test_helpers::op_counting_storage();
+        let (storage, ops) = crate::test_helpers::docker::op_counting_storage();
         let upstream = DockerUpstream {
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             namespace: None,
             prefix: None,
         };
-        let ns = upstream.resolved_namespace();
-        let ctx =
-            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+        let ctx = crate::test_helpers::docker::create_test_context_with_storage_and_config(
+            storage,
+            move |cfg| {
                 cfg.docker.upstreams = vec![upstream];
-            });
+            },
+        );
         let proxied = table_manifest(UPSTREAM_CFG);
         let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&proxied)));
         let meta = super::ImageMetadata {
@@ -5855,16 +5667,13 @@ mod integration_tests {
         };
         ctx.state
             .storage
-            .put(
-                &super::manifest_key(Some(&ns), "corp/app", &digest),
-                &proxied,
-            )
+            .put(&super::manifest_key(None, "corp/app", &digest), &proxied)
             .await
             .unwrap();
         ctx.state
             .storage
             .put(
-                &super::manifest_meta_key(Some(&ns), "corp/app", &digest),
+                &super::manifest_meta_key(None, "corp/app", &digest),
                 &serde_json::to_vec(&meta).unwrap(),
             )
             .await
@@ -5998,130 +5807,22 @@ mod integration_tests {
         assert_eq!(seen.len(), 3, "{seen:?}");
     }
 
-    /// A backend that, the first time `trigger` is read, applies `writes` before answering: a
-    /// concurrent push whose writes land while the request reads that document.
-    struct WriteOnReadBackend {
-        inner: crate::storage::LocalStorage,
-        trigger: String,
-        writes: std::sync::Mutex<Option<Vec<(String, Vec<u8>)>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::storage::StorageBackend for WriteOnReadBackend {
-        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
-            self.inner.put(key, data, sha256).await
-        }
-        async fn get(
-            &self,
-            key: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
-            if key == self.trigger {
-                let pending = self.writes.lock().unwrap().take();
-                for (k, v) in pending.unwrap_or_default() {
-                    use sha2::Digest;
-                    let sha = hex::encode(sha2::Sha256::digest(&v));
-                    self.inner.put(&k, &v, &sha).await.unwrap();
-                }
-            }
-            self.inner.get(key).await
-        }
-        async fn pin(&self, key: &str) -> Option<String> {
-            self.inner.pin(key).await
-        }
-        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
-            self.inner.delete(key).await
-        }
-        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
-            self.inner.list(prefix).await
-        }
-        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
-            self.inner.stat(key).await
-        }
-        async fn health_check(&self) -> bool {
-            true
-        }
-        async fn total_size(&self) -> u64 {
-            self.inner.total_size().await
-        }
-        async fn copy(
-            &self,
-            src: &str,
-            dst: &str,
-            sha256: Option<&str>,
-        ) -> crate::storage::Result<()> {
-            self.inner.copy(src, dst, sha256).await
-        }
-        async fn put_from_path(
-            &self,
-            key: &str,
-            src: &std::path::Path,
-            sha256: Option<&str>,
-        ) -> crate::storage::Result<()> {
-            self.inner.put_from_path(key, src, sha256).await
-        }
-        async fn get_reader(
-            &self,
-            key: &str,
-        ) -> crate::storage::Result<(
-            u64,
-            Option<String>,
-            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
-        )> {
-            self.inner.get_reader(key).await
-        }
-        fn backend_name(&self) -> &'static str {
-            "write-on-read"
-        }
-    }
-
-    /// Rows 7b and R3, through curation (`min_release_age` 7d): a tag a push answers is dated by its
-    /// record, whatever its proxied copy's metadata says; a record without its manifest dates
-    /// nothing — the tag is dated by its proxied copy, which answers it. The answer's status is the
-    /// oracle: 200 for an old date, 403 for a fresh one.
+    /// Local curation uses the publication date, not the time of a later read.
     #[tokio::test]
-    async fn row7b_curation_dates_a_tag_by_the_push_that_answers_it() {
+    async fn local_tag_curation_uses_its_publication_date() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let old = now - 30 * 86_400;
-        // (push record date, bare manifest kept, proxied copy's date, expected status)
-        let rows = [
-            (old, true, now, StatusCode::OK),
-            (now, true, old, StatusCode::FORBIDDEN),
-            (old, false, now, StatusCode::FORBIDDEN),
-            (now, false, old, StatusCode::OK),
-        ];
-        for (pushed_at, manifest_kept, proxied_at, expected) in rows {
-            use crate::config::DockerUpstream;
-            use wiremock::matchers::any;
-            use wiremock::{Mock, MockServer, ResponseTemplate};
-            let server = MockServer::start().await;
-            Mock::given(any())
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .insert_header(
-                            "content-type",
-                            "application/vnd.docker.distribution.manifest.v2+json",
-                        )
-                        .set_body_bytes(table_manifest(UPSTREAM_CFG)),
-                )
-                .mount(&server)
-                .await;
-            let upstream = DockerUpstream {
-                url: server.uri(),
-                auth: None,
-                namespace: None,
-                prefix: None,
-            };
-            let ns = upstream.resolved_namespace();
-            let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
-                cfg.docker.upstreams = vec![upstream];
+        for (pushed_at, expected) in [
+            (now - 30 * 86_400, StatusCode::OK),
+            (now, StatusCode::FORBIDDEN),
+        ] {
+            let ctx = create_test_context_with_config(|cfg| {
                 cfg.curation.mode = crate::config::CurationMode::Enforce;
-                cfg.curation.min_release_age = Some("7d".to_string());
+                cfg.curation.min_release_age = Some("7d".into());
             });
             let pushed = table_manifest(PUSHED_CFG);
-            use sha2::Digest;
             let record = super::ImageMetadata {
                 push_timestamp: pushed_at,
                 pushed_digest: Some(format!(
@@ -6130,467 +5831,132 @@ mod integration_tests {
                 )),
                 ..Default::default()
             };
-            let proxied_meta = super::ImageMetadata {
-                push_timestamp: proxied_at,
-                ..Default::default()
-            };
-            let storage = &ctx.state.storage;
-            storage
+            ctx.state
+                .storage
+                .put(&super::manifest_key(None, "corp/app", "1.0"), &pushed)
+                .await
+                .unwrap();
+            ctx.state
+                .storage
                 .put(
                     &super::manifest_meta_key(None, "corp/app", "1.0"),
                     &serde_json::to_vec(&record).unwrap(),
                 )
                 .await
                 .unwrap();
-            if manifest_kept {
-                storage
-                    .put(&super::manifest_key(None, "corp/app", "1.0"), &pushed)
-                    .await
-                    .unwrap();
+            assert_eq!(
+                send(
+                    &ctx.app,
+                    Method::GET,
+                    "/v2/corp/app/manifests/1.0",
+                    Body::empty()
+                )
+                .await
+                .status(),
+                expected
+            );
+        }
+    }
+
+    /// An unreadable selected manifest must not turn a delete into partial data loss.
+    #[tokio::test]
+    async fn tag_delete_fails_before_removing_an_unreadable_manifest() {
+        for failing in [true, false] {
+            let ctx = create_test_context();
+            let pushed = table_push(&ctx).await;
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&pushed)));
+            let mut state = ctx.state.clone();
+            if failing {
+                state.storage =
+                    storage_with_read_failure(&ctx, "docker/corp/app/manifests/1.0.json");
             }
-            storage
-                .put(
-                    &super::manifest_key(Some(&ns), "corp/app", "1.0"),
-                    &table_manifest(UPSTREAM_CFG),
-                )
-                .await
-                .unwrap();
-            storage
-                .put(
-                    &super::manifest_meta_key(Some(&ns), "corp/app", "1.0"),
-                    &serde_json::to_vec(&proxied_meta).unwrap(),
-                )
-                .await
-                .unwrap();
-            let resp = send(
-                &ctx.app,
-                Method::GET,
-                "/v2/corp/app/manifests/1.0",
+            let response = super::docker_v2_dispatch(
+                axum::extract::State(state),
+                Method::DELETE,
+                axum::extract::Path("corp/app/manifests/1.0".into()),
+                axum::Extension(crate::auth::NamespaceAuthority::Unrestricted),
+                "/v2/corp/app/manifests/1.0".parse().unwrap(),
+                axum::http::HeaderMap::new(),
                 Body::empty(),
             )
             .await;
             assert_eq!(
-                resp.status(),
-                expected,
-                "pushed {pushed_at}, manifest kept {manifest_kept}, proxied {proxied_at}"
+                response.status(),
+                if failing {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::ACCEPTED
+                }
             );
-        }
-    }
-
-    /// Row R3: a push record left without its bare manifest (a delete interrupted between the two)
-    /// answers nothing; the tag goes on as if it had no record — here its proxied copy answers.
-    #[tokio::test]
-    async fn row_r3_a_record_without_its_manifest_hands_the_tag_on() {
-        let (_server, ctx, ns) = table_context().await;
-        table_push(&ctx).await;
-        ctx.state
-            .storage
-            .put(
-                &super::manifest_key(Some(&ns), "corp/app", "1.0"),
-                &table_manifest(UPSTREAM_CFG),
-            )
-            .await
-            .unwrap();
-        ctx.state
-            .storage
-            .delete(&super::manifest_key(None, "corp/app", "1.0"))
-            .await
-            .unwrap();
-        assert!(ctx
-            .state
-            .storage
-            .stat(&super::manifest_meta_key(None, "corp/app", "1.0"))
-            .await
-            .is_some());
-        assert_eq!(table_get(&ctx).await, table_manifest(UPSTREAM_CFG));
-    }
-
-    /// Row R2, race: a pushed tag with a proxied copy beside it, re-pushed (its bare manifest, then
-    /// its record; the proxied copy not yet removed) between the pull's read of the push record and
-    /// its read of the manifest. The record still names the old digest, the bare bytes are the new
-    /// push: the tag is the push's, so the new bytes answer — never the proxied copy.
-    #[tokio::test]
-    async fn row_r2_a_re_push_between_the_record_and_the_manifest_answers_the_new_push() {
-        use sha2::Digest;
-        use std::sync::Arc;
-        let (_server, ctx, ns) = table_context().await;
-        table_push(&ctx).await;
-        ctx.state
-            .storage
-            .put(
-                &super::manifest_key(Some(&ns), "corp/app", "1.0"),
-                &table_manifest(UPSTREAM_CFG),
-            )
-            .await
-            .unwrap();
-        let repushed = table_manifest(
-            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        );
-        let meta = super::ImageMetadata {
-            push_timestamp: 1,
-            pushed_digest: Some(format!(
-                "sha256:{}",
-                hex::encode(sha2::Sha256::digest(&repushed))
-            )),
-            ..Default::default()
-        };
-        let mut racy = ctx.state.clone();
-        racy.storage = crate::storage::Storage::from_backend(Arc::new(WriteOnReadBackend {
-            inner: crate::storage::LocalStorage::new(ctx._tempdir.path().to_str().unwrap()),
-            trigger: super::manifest_key(None, "corp/app", "1.0"),
-            writes: std::sync::Mutex::new(Some(vec![
-                (
-                    super::manifest_key(None, "corp/app", "1.0"),
-                    repushed.clone(),
-                ),
-                (
-                    super::manifest_meta_key(None, "corp/app", "1.0"),
-                    serde_json::to_vec(&meta).unwrap(),
-                ),
-            ])),
-        }));
-        let resp = get_manifest_via_dispatch(&racy, "corp/app/manifests/1.0").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let got = body_bytes(resp).await.to_vec();
-        assert!(
-            got != table_manifest(UPSTREAM_CFG),
-            "the proxied copy answered a pushed tag"
-        );
-        assert_eq!(got, repushed);
-    }
-
-    /// Row 1, race: a proxied copy written after the push (a fetch that was in flight) does not
-    /// take the tag back.
-    #[tokio::test]
-    async fn row1_a_proxied_copy_written_after_the_push_does_not_win() {
-        let (_server, ctx, ns) = table_context().await;
-        let pushed = table_push(&ctx).await;
-        let proxied = super::manifest_key(Some(&ns), "corp/app", "1.0");
-        ctx.state
-            .storage
-            .put(&proxied, &table_manifest(UPSTREAM_CFG))
-            .await
-            .unwrap();
-        assert_eq!(table_get(&ctx).await, pushed);
-        let head = send(
-            &ctx.app,
-            Method::HEAD,
-            "/v2/corp/app/manifests/1.0",
-            Body::empty(),
-        )
-        .await;
-        use sha2::Digest;
-        let want = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&pushed)));
-        assert_eq!(
-            head.headers()
-                .get("docker-content-digest")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            want
-        );
-    }
-
-    /// Row 1, failed reads: with a proxied copy beside a push, a storage error reading the push
-    /// record or the pushed manifest is a 500 — never the proxied copy.
-    #[tokio::test]
-    async fn row1_a_failed_read_of_the_push_is_a_500_not_the_proxied_copy() {
-        use std::sync::Arc;
-        for failing in [
-            "docker/corp/app/manifests/1.0.meta.json",
-            "docker/corp/app/manifests/1.0.json",
-        ] {
-            let (_server, ctx, ns) = table_context().await;
-            table_push(&ctx).await;
-            ctx.state
-                .storage
-                .put(
-                    &super::manifest_key(Some(&ns), "corp/app", "1.0"),
-                    &table_manifest(UPSTREAM_CFG),
-                )
-                .await
-                .unwrap();
-            let mut flaky = ctx.state.clone();
-            flaky.storage = crate::storage::Storage::from_backend(Arc::new(FailingPrefixBackend {
-                inner: crate::storage::LocalStorage::new(ctx._tempdir.path().to_str().unwrap()),
-                fail_prefix: failing.to_string(),
-            }));
-            let resp = get_manifest_via_dispatch(&flaky, "corp/app/manifests/1.0").await;
-            assert_eq!(
-                resp.status(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "{failing} unreadable"
-            );
-        }
-    }
-
-    /// Row 5.3: a delete of a pushed tag whose push record cannot be read answers 500 and removes
-    /// nothing — the tag, its metadata and the pushed manifest under its digest stay, as a pull of
-    /// the tag answers 500. Control: with the record readable the same delete answers 202.
-    #[tokio::test]
-    async fn row5_a_delete_that_cannot_read_the_push_record_removes_nothing() {
-        use sha2::Digest;
-        use std::sync::Arc;
-        for failing in [true, false] {
-            let (_server, ctx, ns) = table_context().await;
-            let pushed = table_push(&ctx).await;
-            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&pushed)));
-            let mut state = ctx.state.clone();
-            if failing {
-                state.storage =
-                    crate::storage::Storage::from_backend(Arc::new(FailingPrefixBackend {
-                        inner: crate::storage::LocalStorage::new(
-                            ctx._tempdir.path().to_str().unwrap(),
-                        ),
-                        fail_prefix: "docker/corp/app/manifests/1.0.meta.json".to_string(),
-                    }));
-            }
-            let resp = {
-                use axum::extract::{Path, State};
-                use axum::http::Uri;
-                use axum::Extension;
-                super::docker_v2_dispatch(
-                    State(state),
-                    Method::DELETE,
-                    Path("corp/app/manifests/1.0".to_string()),
-                    Extension(crate::auth::NamespaceAuthority::Unrestricted),
-                    "/v2/corp/app/manifests/1.0".parse::<Uri>().unwrap(),
-                    axum::http::HeaderMap::new(),
-                    Body::empty(),
-                )
-                .await
-            };
-            let kept = [
+            for key in [
                 super::manifest_key(None, "corp/app", "1.0"),
                 super::manifest_meta_key(None, "corp/app", "1.0"),
                 super::manifest_key(None, "corp/app", &digest),
-            ];
-            if failing {
-                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-                for key in &kept {
-                    assert!(ctx.state.storage.stat(key).await.is_some(), "{key} removed");
-                }
-            } else {
-                assert_eq!(resp.status(), StatusCode::ACCEPTED);
-                for key in &kept {
-                    assert!(ctx.state.storage.stat(key).await.is_none(), "{key} left");
-                }
+            ] {
+                assert_eq!(
+                    ctx.state.storage.stat(&key).await.is_some(),
+                    failing,
+                    "{key}"
+                );
             }
-            let _ = ns;
         }
     }
 
-    /// Row 5.4: a delete by digest whose tags cannot all be read (here the push record of the tag
-    /// that answers with it) answers 500 and removes nothing; with the record readable it removes
-    /// the tag with the manifest (#658).
+    /// Resolve all sibling tags before deleting even the readable candidates.
     #[tokio::test]
-    async fn row5_a_delete_by_digest_that_cannot_read_a_tag_removes_nothing() {
-        use sha2::Digest;
-        use std::sync::Arc;
-        // The tag's push record unreadable, the bare listing unreadable, the namespaced listing
-        // unreadable, nothing failing.
-        for case in 0..4 {
-            let (_server, ctx, ns) = table_context().await;
-            let fail_prefix = match case {
-                0 => Some("docker/corp/app/manifests/1.0.meta.json".to_string()),
-                1 => Some("docker/corp/app/manifests/".to_string()),
-                2 => Some(format!("docker/{ns}/corp/app/manifests/")),
-                _ => None,
-            };
-            let failing = fail_prefix.is_some();
+    async fn digest_delete_is_atomic_when_a_sibling_tag_or_listing_is_unreadable() {
+        for failure in [
+            Some("docker/corp/app/manifests/1.0.json"),
+            Some("docker/corp/app/manifests/"),
+            None,
+        ] {
+            let ctx = create_test_context();
             let pushed = table_push(&ctx).await;
             let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&pushed)));
+            let sibling = super::manifest_key(None, "corp/app", "0-readable");
+            ctx.state.storage.put(&sibling, &pushed).await.unwrap();
             let mut state = ctx.state.clone();
-            if let Some(fail_prefix) = fail_prefix {
-                state.storage =
-                    crate::storage::Storage::from_backend(Arc::new(FailingPrefixBackend {
-                        inner: crate::storage::LocalStorage::new(
-                            ctx._tempdir.path().to_str().unwrap(),
-                        ),
-                        fail_prefix,
-                    }));
+            if let Some(prefix) = failure {
+                state.storage = storage_with_read_failure(&ctx, prefix);
             }
             let path = format!("corp/app/manifests/{digest}");
-            let resp = {
-                use axum::extract::{Path, State};
-                use axum::http::Uri;
-                use axum::Extension;
-                super::docker_v2_dispatch(
-                    State(state),
-                    Method::DELETE,
-                    Path(path.clone()),
-                    Extension(crate::auth::NamespaceAuthority::Unrestricted),
-                    format!("/v2/{path}").parse::<Uri>().unwrap(),
-                    axum::http::HeaderMap::new(),
-                    Body::empty(),
-                )
-                .await
-            };
-            let tag = super::manifest_key(None, "corp/app", "1.0");
-            let by_digest = super::manifest_key(None, "corp/app", &digest);
-            if failing {
-                assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-                assert!(ctx.state.storage.stat(&tag).await.is_some());
-                assert!(ctx.state.storage.stat(&by_digest).await.is_some());
-            } else {
-                assert_eq!(resp.status(), StatusCode::ACCEPTED);
-                assert!(ctx.state.storage.stat(&tag).await.is_none());
-                assert!(ctx.state.storage.stat(&by_digest).await.is_none());
+            let response = super::docker_v2_dispatch(
+                axum::extract::State(state),
+                Method::DELETE,
+                axum::extract::Path(path.clone()),
+                axum::Extension(crate::auth::NamespaceAuthority::Unrestricted),
+                format!("/v2/{path}").parse().unwrap(),
+                axum::http::HeaderMap::new(),
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                if failure.is_some() {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::ACCEPTED
+                }
+            );
+            for key in [
+                sibling,
+                super::manifest_key(None, "corp/app", "1.0"),
+                super::manifest_meta_key(None, "corp/app", "1.0"),
+                super::manifest_key(None, "corp/app", &digest),
+            ] {
+                assert_eq!(
+                    ctx.state.storage.stat(&key).await.is_some(),
+                    failure.is_some(),
+                    "{key}"
+                );
             }
         }
     }
 
-    /// A push by digest with other bytes is refused also where an upstream is configured (the
-    /// name then has an upstream namespace).
-    #[tokio::test]
-    async fn a_push_by_digest_with_other_bytes_is_refused_beside_an_upstream() {
-        use sha2::Digest;
-        let (_server, ctx, ns) = table_context().await;
-        seed_zero_config(&ctx.state, "corp/app").await;
-        let pushed = table_manifest(PUSHED_CFG);
-        let other = format!(
-            "sha256:{}",
-            hex::encode(sha2::Sha256::digest(table_manifest(UPSTREAM_CFG)))
-        );
-        let resp = send(
-            &ctx.app,
-            Method::PUT,
-            &format!("/v2/corp/app/manifests/{other}"),
-            Body::from(pushed),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        for key in [
-            super::manifest_key(None, "corp/app", &other),
-            super::manifest_key(Some(&ns), "corp/app", &other),
-        ] {
-            assert!(
-                ctx.state.storage.stat(&key).await.is_none(),
-                "{key} written"
-            );
-        }
-    }
-
-    /// Deleting a pushed manifest by its digest takes its tag back to the upstream, also when a
-    /// proxied copy of the tag was written after the push: the tag resolves as a read does.
-    #[tokio::test]
-    async fn a_delete_by_digest_of_a_push_gives_the_tag_back_to_the_upstream() {
-        use sha2::Digest;
-        let (_server, ctx, ns) = table_context().await;
-        let pushed = table_push(&ctx).await;
-        ctx.state
-            .storage
-            .put(
-                &super::manifest_key(Some(&ns), "corp/app", "1.0"),
-                &table_manifest(UPSTREAM_CFG),
-            )
-            .await
-            .unwrap();
-        assert_eq!(table_get(&ctx).await, pushed);
-        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&pushed)));
-        let resp = send(
-            &ctx.app,
-            Method::DELETE,
-            &format!("/v2/corp/app/manifests/{digest}"),
-            Body::empty(),
-        )
-        .await;
-        assert!(resp.status().is_success(), "{}", resp.status());
-        assert_eq!(table_get(&ctx).await, table_manifest(UPSTREAM_CFG));
-        assert!(ctx
-            .state
-            .storage
-            .stat(&super::manifest_key(None, "corp/app", "1.0"))
-            .await
-            .is_none());
-    }
-
-    /// Row 3: a bare manifest without the push record (pushed before 1.4.0, or a flat proxy
-    /// cache before #349) beside a proxied copy keeps today's answer: the proxied copy.
-    #[tokio::test]
-    async fn row3_a_bare_manifest_without_a_record_keeps_todays_answer() {
-        let (_server, ctx, ns) = table_context().await;
-        let old = table_manifest(PUSHED_CFG);
-        ctx.state
-            .storage
-            .put("docker/corp/app/manifests/1.0.json", &old)
-            .await
-            .unwrap();
-        let meta = serde_json::to_vec(&super::ImageMetadata::default()).unwrap();
-        ctx.state
-            .storage
-            .put("docker/corp/app/manifests/1.0.meta.json", &meta)
-            .await
-            .unwrap();
-        let proxied = super::manifest_key(Some(&ns), "corp/app", "1.0");
-        ctx.state
-            .storage
-            .put(&proxied, &table_manifest(UPSTREAM_CFG))
-            .await
-            .unwrap();
-        assert_eq!(table_get(&ctx).await, table_manifest(UPSTREAM_CFG));
-    }
-
-    /// Row 1a: a bare manifest other than the bytes its push record names is a re-push in progress
-    /// (the bare key is written only by a push): the tag is still the push's, and those bytes answer
-    /// it — never the proxied copy beside it.
-    #[tokio::test]
-    async fn row1a_a_record_for_other_bytes_still_answers_with_the_bare_manifest() {
-        let (_server, ctx, ns) = table_context().await;
-        table_push(&ctx).await;
-        ctx.state
-            .storage
-            .put(
-                "docker/corp/app/manifests/1.0.json",
-                &table_manifest(UPSTREAM_CFG.replace('1', "2").as_str()),
-            )
-            .await
-            .unwrap();
-        let proxied = super::manifest_key(Some(&ns), "corp/app", "1.0");
-        ctx.state
-            .storage
-            .put(&proxied, &table_manifest(UPSTREAM_CFG))
-            .await
-            .unwrap();
-        assert_eq!(
-            table_get(&ctx).await,
-            table_manifest(UPSTREAM_CFG.replace('1', "2").as_str())
-        );
-    }
-
-    /// A deleted push gives the tag back to the upstream.
-    #[tokio::test]
-    async fn a_deleted_push_gives_the_tag_back_to_the_upstream() {
-        let (_server, ctx, _ns) = table_context().await;
-        table_push(&ctx).await;
-        let del = send(
-            &ctx.app,
-            Method::DELETE,
-            "/v2/corp/app/manifests/1.0",
-            Body::empty(),
-        )
-        .await;
-        assert!(del.status().is_success(), "{}", del.status());
-        assert_eq!(table_get(&ctx).await, table_manifest(UPSTREAM_CFG));
-    }
-
-    /// A pull of a locally pushed image counts against that image. With an upstream configured
-    /// every name resolves to the upstream's namespace, but a hosted manifest is served from its
-    /// bare key, and its pull statistics go to the pushed manifest's own metadata — by tag and
-    /// by digest — with nothing written under the namespace.
+    /// Tag and digest pulls count independently without changing a local publication date.
     #[tokio::test]
     async fn a_hosted_pull_counts_against_the_pushed_image() {
-        use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
-
-        let ctx = create_test_context_with_config(|cfg| {
-            cfg.docker.upstreams = vec![DockerUpstream {
-                url: "http://127.0.0.1:1".into(),
-                auth: None,
-                namespace: Some("docker.io".into()),
-                prefix: None,
-            }];
-        });
+        let ctx = create_test_context();
         let manifest = serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
@@ -6620,8 +5986,8 @@ mod integration_tests {
                 &state.storage,
                 "hosted-img",
                 "v1",
-                false,
-                Some("docker.io"),
+                true,
+                None,
                 &mut super::BareMeta::Unread,
             )
             .await
@@ -6659,11 +6025,6 @@ mod integration_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let elsewhere = ctx.state.storage.list("docker/docker.io/").await.unwrap();
-        assert!(
-            elsewhere.is_empty(),
-            "written under the namespace: {elsewhere:?}"
-        );
         // Curation still reads the push date after the pulls.
         assert_eq!(pushed_at(ctx.state.clone()).await, date);
     }
@@ -7051,17 +6412,7 @@ mod integration_tests {
     /// rewrote it cannot match by landing in the same second).
     #[tokio::test]
     async fn a_later_pull_keeps_the_push_date() {
-        use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
-
-        let ctx = create_test_context_with_config(|cfg| {
-            cfg.docker.upstreams = vec![DockerUpstream {
-                url: "http://127.0.0.1:1".into(),
-                auth: None,
-                namespace: Some("docker.io".into()),
-                prefix: None,
-            }];
-        });
+        let ctx = create_test_context();
         let manifest = serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
@@ -7119,8 +6470,8 @@ mod integration_tests {
             &ctx.state.storage,
             "aged-img",
             "v1",
-            false,
-            Some("docker.io"),
+            true,
+            None,
             &mut super::BareMeta::Unread,
         )
         .await;
@@ -7132,7 +6483,7 @@ mod integration_tests {
     #[tokio::test]
     async fn a_proxied_pull_counts_against_the_proxied_copy() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
@@ -7144,7 +6495,7 @@ mod integration_tests {
         });
         let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#;
         let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(manifest)));
-        let key = super::manifest_key(Some("docker.io"), "library/proxied", &digest);
+        let key = super::manifest_key(None, "library/proxied", &digest);
         ctx.state.storage.put(&key, manifest).await.unwrap();
 
         let uri = format!("/v2/library/proxied/manifests/{digest}");
@@ -7152,7 +6503,7 @@ mod integration_tests {
             let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        let meta_key = super::manifest_meta_key(Some("docker.io"), "library/proxied", &digest);
+        let meta_key = super::manifest_meta_key(None, "library/proxied", &digest);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let downloads = Some(
@@ -7169,8 +6520,6 @@ mod integration_tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let bare = super::manifest_meta_key(None, "library/proxied", &digest);
-        assert!(ctx.state.storage.stat(&bare).await.is_none(), "{bare}");
     }
 
     /// Provenance invariant that #868's hosted/proxied inference depends on: a local push
@@ -7319,7 +6668,9 @@ mod integration_tests {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(json["tags"], serde_json::json!(["1.0.0"]), "{json}");
 
-        let detail = crate::ui::api::get_docker_detail(&ctx.state, "alpine").await;
+        let detail = crate::ui::api::get_docker_detail(&ctx.state, "alpine")
+            .await
+            .unwrap();
         let names: Vec<_> = detail.tags.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["1.0.0"]);
         assert_eq!(detail.tags[0].downloads, 1, "the pull count is kept");
@@ -7440,14 +6791,14 @@ mod integration_tests {
                 cfg.docker.upstreams = crate::config::DockerConfig::default().upstreams
             };
             let ctx = if object {
-                crate::test_helpers::create_test_context_with_storage_and_config(
+                crate::test_helpers::docker::create_test_context_with_storage_and_config(
                     crate::storage::Storage::from_backend(std::sync::Arc::new(
                         crate::storage::ObjectStorage::in_memory(),
                     )),
                     default_upstream,
                 )
             } else {
-                crate::test_helpers::create_test_context_with_config(default_upstream)
+                crate::test_helpers::docker::create_test_context_with_config(default_upstream)
             };
             seed_zero_config(&ctx.state, "rc/app").await;
             for (tag, by) in [("v1", "digest"), ("v2", "tag")] {
@@ -7503,60 +6854,6 @@ mod integration_tests {
                     );
                 }
             }
-        }
-    }
-
-    /// A delete by digest removes the namespaced copy and a pre-migration bare copy alike: a read
-    /// falls back to the bare copy, so leaving it kept the manifest served (local and object).
-    #[tokio::test]
-    async fn a_delete_removes_both_copies_of_a_manifest() {
-        let body = b"{\"schemaVersion\":2}".to_vec();
-        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
-        for object in [false, true] {
-            let default_upstream = |cfg: &mut crate::config::Config| {
-                cfg.docker.upstreams = crate::config::DockerConfig::default().upstreams
-            };
-            let ctx = if object {
-                crate::test_helpers::create_test_context_with_storage_and_config(
-                    crate::storage::Storage::from_backend(std::sync::Arc::new(
-                        crate::storage::ObjectStorage::in_memory(),
-                    )),
-                    default_upstream,
-                )
-            } else {
-                crate::test_helpers::create_test_context_with_config(default_upstream)
-            };
-            let c = super::canonicalize("rc/two", &ctx.state.config.docker);
-            assert!(
-                c.namespace.is_some(),
-                "the default upstream gives the name a namespace"
-            );
-            for key in [
-                super::manifest_key(c.namespace.as_deref(), &c.name, &digest),
-                super::manifest_key(None, &c.name, &digest),
-            ] {
-                ctx.state.storage.put(&key, &body).await.unwrap();
-            }
-            let del = send(
-                &ctx.app,
-                Method::DELETE,
-                &format!("/v2/rc/two/manifests/{digest}"),
-                Body::empty(),
-            )
-            .await;
-            assert_eq!(del.status(), StatusCode::ACCEPTED, "object={object}");
-            let get = send(
-                &ctx.app,
-                Method::GET,
-                &format!("/v2/rc/two/manifests/{digest}"),
-                Body::empty(),
-            )
-            .await;
-            assert_eq!(
-                get.status(),
-                StatusCode::NOT_FOUND,
-                "object={object}: a copy is still served"
-            );
         }
     }
 
@@ -8387,7 +7684,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_docker_circuit_breaker_trips() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use crate::test_helpers::docker::{body_bytes, create_test_context_with_config, send};
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.circuit_breaker.enabled = true;
@@ -8402,13 +7699,13 @@ mod integration_tests {
             }];
         });
 
-        // Trip the breaker for this upstream
+        let key = ctx.state.repository.as_ref().unwrap().breaker_key();
         ctx.state
             .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
         ctx.state
             .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
+            .record_failure(&key, ProbeToken::BACKGROUND);
 
         // Request a manifest NOT in local storage → proxy path → cb.check() → 503
         let response = send(
@@ -8634,238 +7931,30 @@ mod integration_tests {
         assert_eq!(cl, body.len(), "Content-Length must match body size");
     }
 
-    /// Per-upstream circuit breaker isolation: upstream A down, upstream B serves.
-    #[tokio::test]
-    async fn test_docker_circuit_breaker_per_upstream() {
-        use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
-
-        let ctx = create_test_context_with_config(|cfg| {
-            cfg.circuit_breaker.enabled = true;
-            cfg.circuit_breaker.failure_threshold = 2;
-            cfg.circuit_breaker.reset_timeout = 3600;
-            cfg.docker.upstreams = vec![
-                DockerUpstream {
-                    url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
-                    auth: None,
-                    namespace: None,
-                    prefix: None,
-                },
-                DockerUpstream {
-                    url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
-                    auth: None,
-                    namespace: None,
-                    prefix: None,
-                },
-            ];
-        });
-
-        // Trip only upstream A
-        ctx.state
-            .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
-        ctx.state
-            .circuit_breaker
-            .record_failure("docker:http://127.0.0.1:1", ProbeToken::BACKGROUND);
-
-        // Upstream A should be open
-        assert!(ctx
-            .state
-            .circuit_breaker
-            .check("docker:http://127.0.0.1:1")
-            .is_err());
-
-        // Upstream B should still be closed (requests allowed)
-        assert!(ctx
-            .state
-            .circuit_breaker
-            .check("docker:http://127.0.0.1:2")
-            .is_ok());
-    }
-
     #[test]
-    fn test_strip_docker_namespace() {
-        // Namespace prefix (hostname with dot) should be stripped
-        assert_eq!(
-            super::strip_docker_namespace("docker.io/library/nginx"),
-            "library/nginx"
-        );
-        assert_eq!(
-            super::strip_docker_namespace("ghcr.io/requarks/wiki"),
-            "requarks/wiki"
-        );
-        assert_eq!(
-            super::strip_docker_namespace("registry.example.com/myapp"),
-            "myapp"
-        );
-
-        // No namespace prefix — returned as-is
-        assert_eq!(
-            super::strip_docker_namespace("library/nginx"),
-            "library/nginx"
-        );
-        assert_eq!(super::strip_docker_namespace("alpine"), "alpine");
-
-        // Edge: empty or slash-only
-        assert_eq!(super::strip_docker_namespace(""), "");
-        assert_eq!(super::strip_docker_namespace("docker.io/"), "docker.io/");
-
-        // Org name with no dots — not a namespace
-        assert_eq!(
-            super::strip_docker_namespace("myorg/myimage"),
-            "myorg/myimage"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_catalog_dedup_across_namespaces() {
-        use crate::test_helpers::create_test_context;
-
-        let ctx = create_test_context();
-
-        // Simulate keys from two different upstream namespaces for the same image
-        ctx.state
-            .storage
-            .put(
-                "docker/docker.io/library/nginx/manifests/latest.json",
-                b"{}",
-            )
-            .await
-            .unwrap();
-        ctx.state
-            .storage
-            .put("docker/ghcr.io/library/nginx/manifests/v1.json", b"{}")
-            .await
-            .unwrap();
-        // And a non-namespaced (legacy) key for the same image
-        ctx.state
-            .storage
-            .put("docker/library/nginx/manifests/old.json", b"{}")
-            .await
-            .unwrap();
-
-        let keys = ctx.state.storage.list("docker/").await.unwrap();
-        let mut repos: Vec<String> = keys
-            .iter()
-            .filter_map(|k| {
-                let rest = k.strip_prefix("docker/")?;
-                let name = if let Some(idx) = rest.find("/manifests/") {
-                    &rest[..idx]
-                } else {
-                    return None;
-                };
-                if name.is_empty() {
-                    return None;
-                }
-                Some(super::strip_docker_namespace(name).to_string())
-            })
-            .collect();
-        repos.sort();
-        repos.dedup();
-
-        // All three keys should resolve to a single repo: "library/nginx"
-        assert_eq!(repos, vec!["library/nginx"]);
-    }
-
-    /// Build a DockerConfig with the given upstreams and default_action = Allow.
-    fn docker_config_allow(
-        upstreams: Vec<crate::config::DockerUpstream>,
-    ) -> crate::config::DockerConfig {
-        crate::config::DockerConfig {
-            upstreams,
-            default_action: crate::config::DefaultAction::Allow,
+    fn repository_coordinates_never_select_another_upstream() {
+        let local = crate::config::DockerConfig::default();
+        let proxy = crate::config::DockerConfig {
+            upstreams: vec![crate::config::DockerUpstream {
+                url: "https://registry.example.com".into(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+            }],
             ..Default::default()
+        };
+        for config in [local, proxy] {
+            for name in ["docker.io/library/nginx", "hub/team/app", "alpine"] {
+                let coordinate = super::canonicalize(name, &config);
+                assert_eq!(coordinate.name, name);
+                assert!(coordinate.namespace.is_none());
+                assert_eq!(
+                    coordinate.upstreams_to_try(&config.upstreams).len(),
+                    config.upstreams.len()
+                );
+                assert!(!coordinate.denied);
+            }
         }
-    }
-
-    /// Build a DockerConfig with the given upstreams and default_action = Deny.
-    fn docker_config_deny(
-        upstreams: Vec<crate::config::DockerUpstream>,
-    ) -> crate::config::DockerConfig {
-        crate::config::DockerConfig {
-            upstreams,
-            default_action: crate::config::DefaultAction::Deny,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_canonicalize_prefix_routing() {
-        let upstreams = vec![crate::config::DockerUpstream {
-            url: "https://registry-1.docker.io".to_string(),
-            auth: None,
-            namespace: Some("docker.io".to_string()),
-            prefix: Some("docker-hub".to_string()),
-        }];
-        let cfg = docker_config_allow(upstreams.clone());
-
-        let c = super::canonicalize("docker-hub/library/nginx", &cfg);
-        assert_eq!(c.name, "library/nginx");
-        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
-        assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
-        assert!(!c.denied);
-    }
-
-    #[test]
-    fn test_canonicalize_hostname_detection() {
-        let upstreams = vec![crate::config::DockerUpstream {
-            url: "https://registry-1.docker.io".to_string(),
-            auth: None,
-            namespace: Some("docker.io".to_string()),
-            prefix: None,
-        }];
-        let cfg = docker_config_allow(upstreams.clone());
-
-        let c = super::canonicalize("docker.io/library/nginx", &cfg);
-        assert_eq!(c.name, "library/nginx");
-        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
-        // Known namespace matches specific upstream
-        assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
-        assert!(!c.denied);
-
-        // Unknown hostname → strip but use default upstream
-        let c2 = super::canonicalize("ghcr.io/requarks/wiki", &cfg);
-        assert_eq!(c2.name, "requarks/wiki");
-        assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
-        // No specific match → all upstreams
-        assert_eq!(c2.upstreams_to_try(&upstreams).len(), 1); // only 1 configured
-        assert!(!c2.denied); // Allow mode → not denied
-    }
-
-    #[test]
-    fn test_canonicalize_fallback() {
-        let upstreams = vec![crate::config::DockerUpstream {
-            url: "https://registry-1.docker.io".to_string(),
-            auth: None,
-            namespace: Some("docker.io".to_string()),
-            prefix: None,
-        }];
-        let cfg = docker_config_allow(upstreams.clone());
-
-        // No prefix, no dot in first segment → fallback
-        let c = super::canonicalize("library/nginx", &cfg);
-        assert_eq!(c.name, "library/nginx");
-        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
-        assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
-        assert!(!c.denied);
-
-        // Single segment
-        let c2 = super::canonicalize("alpine", &cfg);
-        assert_eq!(c2.name, "alpine");
-        assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
-        assert!(!c2.denied);
-    }
-
-    #[test]
-    fn test_canonicalize_empty_upstreams() {
-        let upstreams: Vec<crate::config::DockerUpstream> = vec![];
-        let cfg = docker_config_allow(upstreams.clone());
-
-        let c = super::canonicalize("library/nginx", &cfg);
-        assert_eq!(c.name, "library/nginx");
-        assert!(c.namespace.is_none());
-        assert!(c.upstreams_to_try(&upstreams).is_empty());
-        assert!(!c.denied);
     }
 
     #[test]
@@ -8901,117 +7990,6 @@ mod integration_tests {
         assert!(!manifest_cache_fresh(false, true, 3600, None));
     }
 
-    #[test]
-    fn test_canonicalize_multi_upstream() {
-        let upstreams = vec![
-            crate::config::DockerUpstream {
-                url: "https://registry-1.docker.io".to_string(),
-                auth: None,
-                namespace: Some("docker.io".to_string()),
-                prefix: Some("docker-hub".to_string()),
-            },
-            crate::config::DockerUpstream {
-                url: "https://ghcr.io".to_string(),
-                auth: None,
-                namespace: Some("ghcr.io".to_string()),
-                prefix: Some("ghcr".to_string()),
-            },
-        ];
-        let cfg = docker_config_allow(upstreams.clone());
-
-        // Prefix routes to specific upstream
-        let c1 = super::canonicalize("ghcr/requarks/wiki", &cfg);
-        assert_eq!(c1.name, "requarks/wiki");
-        assert_eq!(c1.namespace.as_deref(), Some("ghcr.io"));
-        let targets = c1.upstreams_to_try(&upstreams);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].url, "https://ghcr.io");
-        assert!(!c1.denied);
-
-        // No prefix match → all upstreams (allow mode)
-        let c2 = super::canonicalize("library/nginx", &cfg);
-        assert_eq!(c2.name, "library/nginx");
-        assert_eq!(c2.upstreams_to_try(&upstreams).len(), 2);
-        assert!(!c2.denied);
-    }
-
-    #[test]
-    fn test_canonicalize_deny_mode_blocks_unmatched() {
-        let upstreams = vec![
-            crate::config::DockerUpstream {
-                url: "https://registry-1.docker.io".to_string(),
-                auth: None,
-                namespace: Some("docker.io".to_string()),
-                prefix: Some("docker-hub".to_string()),
-            },
-            crate::config::DockerUpstream {
-                url: "https://ghcr.io".to_string(),
-                auth: None,
-                namespace: Some("ghcr.io".to_string()),
-                prefix: Some("ghcr".to_string()),
-            },
-        ];
-        let cfg = docker_config_deny(upstreams.clone());
-
-        // Prefix match → allowed even in deny mode
-        let c1 = super::canonicalize("ghcr/requarks/wiki", &cfg);
-        assert!(!c1.denied);
-        assert_eq!(c1.name, "requarks/wiki");
-
-        // No prefix match → denied
-        let c2 = super::canonicalize("library/nginx", &cfg);
-        assert!(c2.denied);
-        assert!(c2.denied_response().is_some());
-
-        // Single segment (no slash) → denied
-        let c3 = super::canonicalize("alpine", &cfg);
-        assert!(c3.denied);
-
-        // Unknown hostname → denied
-        let c4 = super::canonicalize("quay.io/prometheus/node-exporter", &cfg);
-        assert!(c4.denied);
-    }
-
-    #[test]
-    fn test_canonicalize_deny_mode_allows_known_hostname() {
-        let upstreams = vec![crate::config::DockerUpstream {
-            url: "https://registry-1.docker.io".to_string(),
-            auth: None,
-            namespace: Some("docker.io".to_string()),
-            prefix: None,
-        }];
-        let cfg = docker_config_deny(upstreams.clone());
-
-        // Known namespace hostname → matched upstream → allowed
-        let c = super::canonicalize("docker.io/library/nginx", &cfg);
-        assert!(!c.denied);
-        assert_eq!(c.name, "library/nginx");
-        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
-    }
-
-    #[test]
-    fn test_denied_response_format() {
-        let upstreams = vec![crate::config::DockerUpstream {
-            url: "https://registry-1.docker.io".to_string(),
-            auth: None,
-            namespace: Some("docker.io".to_string()),
-            prefix: Some("hub".to_string()),
-        }];
-        let cfg = docker_config_deny(upstreams);
-
-        let c = super::canonicalize("library/nginx", &cfg);
-        assert!(c.denied);
-
-        // denied_response returns Some for denied requests
-        let resp = c.denied_response();
-        assert!(resp.is_some());
-
-        // Non-denied request returns None
-        let c2 = super::canonicalize("hub/library/nginx", &cfg);
-        assert!(!c2.denied);
-        assert!(c2.denied_response().is_none());
-    }
-
     // ── #580/#581: streaming proxy blob integrity (content-addressable) ──
 
     /// Security-critical (#581): an upstream that returns bytes whose SHA-256 does
@@ -9021,7 +7999,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_docker_proxy_blob_sha256_mismatch_rejected() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9103,7 +8081,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_docker_proxy_tag_revalidates_on_upstream_change() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9166,7 +8144,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_docker_proxy_blob_sha256_match_served_and_cached() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9226,6 +8204,23 @@ mod integration_tests {
     /// with a transient (non-`NotFound`) error for keys under a given prefix —
     /// models an object-store blip on the namespaced key while the legacy key
     /// stays readable.
+    /// Faults target the member's physical namespace, never an empty root fixture.
+    fn storage_with_read_failure(
+        ctx: &crate::test_helpers::TestContext,
+        prefix: &str,
+    ) -> crate::storage::Storage {
+        let member = ctx.state.repository.as_ref().unwrap();
+        let path = std::path::Path::new(&ctx.state.config.storage.path)
+            .join("repositories")
+            .join(&member.name)
+            .join("sources")
+            .join(&member.source_id);
+        crate::storage::Storage::from_backend(std::sync::Arc::new(FailingPrefixBackend {
+            inner: crate::storage::LocalStorage::new(path.to_str().unwrap()),
+            fail_prefix: prefix.into(),
+        }))
+    }
+
     struct FailingPrefixBackend {
         inner: crate::storage::LocalStorage,
         fail_prefix: String,
@@ -9336,25 +8331,19 @@ mod integration_tests {
     /// weather. Drives the real `get_manifest` read via `docker_v2_dispatch`.
     #[tokio::test]
     async fn manifest_get_fails_closed_on_transient_storage_error() {
-        use std::sync::Arc;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![unreachable_upstream()];
         });
 
-        // Legacy (flat) copy exists and is readable.
+        // A retained proxy manifest must not hide a failed storage read.
         ctx.state
             .storage
             .put("docker/app/manifests/latest.json", b"{\"legacy\":true}")
             .await
             .unwrap();
 
-        // Same files, but the namespaced key errors transiently. Namespace for
-        // an http://127.0.0.1:9 upstream is "127.0.0.1".
         let mut flaky = ctx.state.clone();
-        flaky.storage = crate::storage::Storage::from_backend(Arc::new(FailingPrefixBackend {
-            inner: crate::storage::LocalStorage::new(ctx._tempdir.path().to_str().unwrap()),
-            fail_prefix: "docker/127.0.0.1/".to_string(),
-        }));
+        flaky.storage = storage_with_read_failure(&ctx, "docker/app/manifests/");
 
         let resp = get_manifest_via_dispatch(&flaky, "app/manifests/latest").await;
         assert_eq!(
@@ -9363,39 +8352,15 @@ mod integration_tests {
             "transient error on the namespaced key must fail closed, not fall back"
         );
     }
-
-    /// The legacy-key fallback still works for the case it exists for: the
-    /// namespaced key is genuinely absent (`NotFound`) and a flat-key hosted
-    /// copy exists. Served as locally authoritative — no upstream round trip,
-    /// so no `x-nora-stale` even though the configured upstream is unreachable.
-    #[tokio::test]
-    async fn manifest_get_serves_hosted_legacy_on_ns_not_found() {
-        let ctx = create_test_context_with_config(|cfg| {
-            cfg.docker.upstreams = vec![unreachable_upstream()];
-        });
-
-        ctx.state
-            .storage
-            .put("docker/app/manifests/latest.json", b"{\"legacy\":true}")
-            .await
-            .unwrap();
-
-        let resp = get_manifest_via_dispatch(&ctx.state, "app/manifests/latest").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            resp.headers().get("x-nora-stale").is_none(),
-            "hosted copy is authoritative — must not be served via the stale path"
-        );
-        let body = body_bytes(resp).await;
-        assert_eq!(body.as_ref(), b"{\"legacy\":true}");
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod index_cost_tests {
     //! Tag and catalog listings must cost the same storage round-trips for 1 and 100 entries.
-    use crate::test_helpers::{create_test_context_with_storage, op_counting_storage, send};
+    use crate::test_helpers::docker::{
+        create_test_context_with_storage, op_counting_storage, send,
+    };
     use axum::body::Body;
     use axum::http::{Method, StatusCode};
 
@@ -9461,7 +8426,9 @@ mod index_cost_tests {
 mod stream_spool_tests {
     //! A proxied blob is served while it is still being spooled from upstream.
     use super::{blob_key, canonicalize};
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use crate::test_helpers::docker::{
+        body_bytes, create_test_context_with_config, send, TestContext,
+    };
     use axum::body::{Body, Bytes};
     use axum::http::{header, Method, StatusCode};
     use axum::response::Response;
@@ -9977,7 +8944,7 @@ mod upstream_resume_tests {
     //! the wait for upstream headers, not the body, and a body cut mid-stream is resumed
     //! with `Range` instead of being fetched again from byte zero.
     use super::{blob_key, canonicalize};
-    use crate::test_helpers::{
+    use crate::test_helpers::docker::{
         body_bytes, create_test_context_with_config, send, send_with_headers, TestContext,
     };
     use axum::body::{Body, Bytes};
@@ -10759,7 +9726,7 @@ mod blob_single_flight_tests {
             blocklist.to_str().unwrap().to_string(),
             upstream.url.clone(),
         );
-        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        let ctx = crate::test_helpers::docker::create_test_context_with_config(move |cfg| {
             cfg.curation.mode = CurationMode::Enforce;
             cfg.curation.blocklist_path = Some(bl);
             cfg.curation.bypass_token = Some(ProtectedString::from("let-me-in"));
@@ -11122,7 +10089,7 @@ mod breaker_probe_tests {
 #[cfg(test)]
 mod upstream_failure_cases {
     use crate::config::DockerUpstream;
-    use crate::test_helpers::{create_test_context_with_config, send};
+    use crate::test_helpers::docker::{create_test_context_with_config, send};
     use axum::body::Body;
     use axum::http::{Method, StatusCode};
     use sha2::Digest;
@@ -11170,7 +10137,7 @@ mod upstream_failure_cases {
 #[cfg(test)]
 mod upstream_failure_edge_cases {
     use crate::config::DockerUpstream;
-    use crate::test_helpers::{create_test_context_with_config, send};
+    use crate::test_helpers::docker::{create_test_context_with_config, send};
     use axum::body::Body;
     use axum::http::{Method, StatusCode};
     use sha2::Digest;
@@ -11289,7 +10256,7 @@ mod hosted_pull_stats_and_re_push {
     /// release. Returns the push date curation reads afterwards.
     async fn push_date_after_re_push(with_pull: bool) -> i64 {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
@@ -11405,7 +10372,7 @@ mod hosted_pull_stats_and_re_push {
     #[tokio::test]
     async fn a_delete_during_a_pull_leaves_no_metadata() {
         use crate::config::DockerUpstream;
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
@@ -11593,7 +10560,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
     /// Upstream with namespace docker.io configured (so a hosted pull is a bare-key hit);
     /// `local` = LocalStorage (delete of a missing key is NotFound) instead of in-memory.
     async fn fx(local: bool, held_key: impl Fn(&str) -> String) -> Fx {
-        use crate::test_helpers::create_test_context_with_config;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use sha2::Digest as _;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
@@ -11865,8 +10832,8 @@ mod hosted_pull_stats_after_a_delete {
 
     const BLOB: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-    fn ctx() -> crate::test_helpers::TestContext {
-        crate::test_helpers::create_test_context_with_config(|cfg| {
+    fn ctx() -> crate::test_helpers::docker::TestContext {
+        crate::test_helpers::docker::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
@@ -12059,7 +11026,7 @@ mod manifest_before_metadata_one_lock_order {
     /// `local`: LocalStorage instead of in-memory.
     async fn fx(upstream_ns: bool, local: bool) -> Fx {
         use sha2::Digest as _;
-        let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
+        let ctx = crate::test_helpers::docker::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = if upstream_ns {
                 vec![DockerUpstream {
                     url: "http://127.0.0.1:1".into(),

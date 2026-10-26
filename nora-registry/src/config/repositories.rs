@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
+mod docker_tests;
+#[cfg(test)]
 mod tests;
 
 use super::{Config, UpstreamAuth};
@@ -19,6 +21,17 @@ use crate::secrets::{expose_opt, ProtectedString};
 pub enum RepositoryFormat {
     Npm,
     Pypi,
+    Docker,
+}
+
+impl RepositoryFormat {
+    pub fn registry_type(self) -> RegistryType {
+        match self {
+            Self::Npm => RegistryType::Npm,
+            Self::Pypi => RegistryType::PyPI,
+            Self::Docker => RegistryType::Docker,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,37 +46,145 @@ pub enum RepositoryConfig {
 #[serde(deny_unknown_fields)]
 pub struct LocalRepository {
     pub format: RepositoryFormat,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ProxyDefinition", into = "ProxyDefinition")]
 pub struct ProxyRepository {
     pub format: RepositoryFormat,
     pub paths: Vec<String>,
+    pub port: Option<u16>,
+    pub public_url: Option<String>,
     pub upstream: String,
-    #[serde(default = "super::default_true")]
     pub save_files: bool,
-    #[serde(default = "metadata_ttl")]
     pub metadata_ttl: u64,
-    #[serde(default = "connect_timeout")]
     pub connect_timeout: u64,
-    #[serde(default = "super::default_timeout")]
     pub read_timeout: u64,
-    #[serde(default = "metadata_timeout")]
     pub metadata_timeout: u64,
-    #[serde(default)]
     pub total_timeout: u64,
-    #[serde(default = "super::default_true")]
+    pub proxy_timeout: Option<u64>,
     pub tls_verify: bool,
-    #[serde(default)]
     pub tls_ca_cert: Option<String>,
-    #[serde(default, skip_serializing)]
     pub auth: Option<ProtectedString>,
-    #[serde(default)]
     pub auth_bearer_env: Option<String>,
-    #[serde(skip)]
     pub(crate) auth_bearer: Option<ProtectedString>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyDefinition {
+    format: RepositoryFormat,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_url: Option<String>,
+    upstream: String,
+    #[serde(default, skip_serializing)]
+    auth: Option<ProtectedString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    save_files: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_ttl: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connect_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_verify: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_ca_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_bearer_env: Option<String>,
+}
+
+impl TryFrom<ProxyDefinition> for ProxyRepository {
+    type Error = String;
+
+    fn try_from(raw: ProxyDefinition) -> Result<Self, Self::Error> {
+        let docker = raw.format == RepositoryFormat::Docker;
+        if docker {
+            for (field, present) in [
+                ("save_files", raw.save_files.is_some()),
+                ("connect_timeout", raw.connect_timeout.is_some()),
+                ("metadata_timeout", raw.metadata_timeout.is_some()),
+                ("total_timeout", raw.total_timeout.is_some()),
+                ("tls_verify", raw.tls_verify.is_some()),
+                ("tls_ca_cert", raw.tls_ca_cert.is_some()),
+                ("auth_bearer_env", raw.auth_bearer_env.is_some()),
+            ] {
+                if present {
+                    return Err(format!("{field} is not supported for Docker repositories"));
+                }
+            }
+        } else if raw.proxy_timeout.is_some() {
+            return Err("proxy_timeout is Docker-only".into());
+        }
+        Ok(Self {
+            format: raw.format,
+            paths: raw.paths,
+            port: raw.port,
+            public_url: raw.public_url,
+            upstream: raw.upstream,
+            auth: raw.auth,
+            save_files: raw.save_files.unwrap_or(true),
+            metadata_ttl: raw
+                .metadata_ttl
+                .unwrap_or_else(|| if docker { 0 } else { metadata_ttl() }),
+            connect_timeout: raw.connect_timeout.unwrap_or_else(connect_timeout),
+            read_timeout: raw.read_timeout.unwrap_or_else(|| {
+                if docker {
+                    60
+                } else {
+                    super::default_timeout()
+                }
+            }),
+            metadata_timeout: raw.metadata_timeout.unwrap_or_else(metadata_timeout),
+            total_timeout: raw.total_timeout.unwrap_or(0),
+            proxy_timeout: docker.then(|| raw.proxy_timeout.unwrap_or(300)),
+            tls_verify: raw.tls_verify.unwrap_or(true),
+            tls_ca_cert: raw.tls_ca_cert,
+            auth_bearer_env: raw.auth_bearer_env,
+            auth_bearer: None,
+        })
+    }
+}
+
+impl From<ProxyRepository> for ProxyDefinition {
+    fn from(proxy: ProxyRepository) -> Self {
+        let docker = proxy.format == RepositoryFormat::Docker;
+        Self {
+            format: proxy.format,
+            paths: proxy.paths,
+            port: proxy.port,
+            public_url: proxy.public_url,
+            upstream: proxy.upstream,
+            auth: proxy.auth,
+            save_files: (!docker).then_some(proxy.save_files),
+            metadata_ttl: Some(proxy.metadata_ttl),
+            connect_timeout: (!docker).then_some(proxy.connect_timeout),
+            read_timeout: Some(proxy.read_timeout),
+            metadata_timeout: (!docker).then_some(proxy.metadata_timeout),
+            total_timeout: (!docker).then_some(proxy.total_timeout),
+            proxy_timeout: proxy.proxy_timeout,
+            tls_verify: (!docker).then_some(proxy.tls_verify),
+            tls_ca_cert: proxy.tls_ca_cert,
+            auth_bearer_env: proxy.auth_bearer_env,
+        }
+    }
 }
 
 impl std::fmt::Debug for ProxyRepository {
@@ -181,6 +302,7 @@ fn canonical_pattern(
         return Ok(String::new());
     }
     let valid = match format {
+        RepositoryFormat::Docker => return Err("Docker groups are not supported".into()),
         RepositoryFormat::Pypi => {
             !literal.is_empty()
                 && literal.starts_with(|c: char| c.is_ascii_alphanumeric())
@@ -231,6 +353,39 @@ fn canonical_pattern(
 }
 
 impl RepositoryConfig {
+    pub fn port(&self, server: &super::ServerConfig) -> u16 {
+        match self {
+            Self::Local(r) => r.port,
+            Self::Proxy(r) => r.port,
+            Self::Group(_) => None,
+        }
+        .unwrap_or(server.port)
+    }
+
+    pub fn public_url(&self) -> Option<&str> {
+        match self {
+            Self::Local(r) => r.public_url.as_deref(),
+            Self::Proxy(r) => r.public_url.as_deref(),
+            Self::Group(_) => None,
+        }
+    }
+
+    pub fn docker_public_url(&self, server: &super::ServerConfig) -> String {
+        if let Some(url) = self.public_url() {
+            return url.trim_end_matches('/').to_owned();
+        }
+        let mut url =
+            reqwest::Url::parse(&server.public_base_url()).expect("validated server public URL");
+        url.set_path("");
+        url.set_query(None);
+        url.set_fragment(None);
+        if self.port(server) != server.port {
+            url.set_port(Some(self.port(server)))
+                .expect("HTTP URL accepts a port");
+        }
+        url.as_str().trim_end_matches('/').to_owned()
+    }
+
     pub fn format(&self) -> RepositoryFormat {
         match self {
             Self::Local(r) => r.format,
@@ -299,6 +454,26 @@ impl ProxyRepository {
             warnings.push(format!(
                 "{label}: upstream certificate and hostname verification is disabled"
             ));
+        }
+        if self.format == RepositoryFormat::Docker {
+            if url.as_ref().is_some_and(|url| {
+                !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+            }) {
+                errors.push(format!(
+                    "{label}.upstream must not contain credentials, query or fragment"
+                ));
+            }
+            if self.metadata_ttl > i64::MAX as u64 {
+                errors.push(format!("{label}.metadata_ttl exceeds supported seconds"));
+            }
+            if self.proxy_timeout == Some(0) {
+                errors.push(format!(
+                    "{label}.proxy_timeout must be positive integer seconds"
+                ));
+            }
         }
         if self.auth.is_some() && self.auth_bearer_env.is_some() {
             errors.push(format!(
@@ -373,12 +548,10 @@ pub(super) fn problems(config: &Config) -> (Vec<String>, Vec<String>) {
             reserved.extend(["/chocolatey/", "/pwsh/"]);
         }
     }
+    let mut docker_ports = BTreeMap::new();
     for (name, repository) in &config.repositories {
         let label = format!("repositories.{name}");
-        let registry = match repository.format() {
-            RepositoryFormat::Npm => RegistryType::Npm,
-            RepositoryFormat::Pypi => RegistryType::PyPI,
-        };
+        let registry = repository.format().registry_type();
         if !enabled.contains(&registry) {
             errors.push(format!("{label}: format {} is disabled; enable it in [registries].enable or remove this repository", registry.as_str()));
         }
@@ -387,8 +560,50 @@ pub(super) fn problems(config: &Config) -> (Vec<String>, Vec<String>) {
                 "{label}: expected a safe lowercase repository path-segment identity"
             ));
         }
-        if repository.paths().is_empty() {
-            errors.push(format!("{label}.paths must not be empty"));
+        if repository.format() == RepositoryFormat::Docker {
+            if matches!(repository, RepositoryConfig::Group(_)) {
+                errors.push(format!("{label}: Docker groups are not supported"));
+            }
+            if !repository.paths().is_empty() {
+                errors.push(format!(
+                    "{label}.paths: Docker repositories use ports, not paths"
+                ));
+            }
+            let port = repository.port(&config.server);
+            if port == 0 {
+                errors.push(format!("{label}.port must be nonzero"));
+            }
+            if let Some(previous) = docker_ports.insert(port, name) {
+                errors.push(format!(
+                    "{label}: Docker port {port} conflicts with repositories.{previous}"
+                ));
+            }
+            if let Some(raw) = repository.public_url() {
+                let valid = reqwest::Url::parse(raw).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && matches!(url.path(), "" | "/")
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                });
+                if !valid {
+                    errors.push(format!("{label}.public_url must be an HTTP(S) origin without credentials, path, query or fragment"));
+                }
+            }
+        } else {
+            if repository.paths().is_empty() {
+                errors.push(format!("{label}.paths must not be empty"));
+            }
+            let explicit_port = match repository {
+                RepositoryConfig::Local(r) => r.port.is_some(),
+                RepositoryConfig::Proxy(r) => r.port.is_some(),
+                RepositoryConfig::Group(_) => false,
+            };
+            if explicit_port || repository.public_url().is_some() {
+                errors.push(format!("{label}: port and public_url are Docker-only"));
+            }
         }
         for path in repository.paths() {
             if !canonical_path(path) {

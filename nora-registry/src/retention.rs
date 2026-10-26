@@ -886,8 +886,8 @@ async fn run_retention_inner(
     // Collect versions from all registries
     let mut all_groups: Vec<(String, Vec<VersionEntry>)> = Vec::new();
     all_groups.extend(collect_maven_versions(storage).await);
-    all_groups.extend(collect_docker_versions(storage).await);
     if include_package_roots {
+        all_groups.extend(collect_docker_versions(storage).await);
         all_groups.extend(collect_npm_versions(storage).await);
         all_groups.extend(collect_pypi_versions(storage).await);
     }

@@ -43,7 +43,6 @@ mod config;
 mod curation;
 mod dashboard_metrics;
 mod digest_quarantine;
-mod docker_key_migration;
 mod gc;
 mod hash_pin_store;
 mod health;
@@ -172,12 +171,6 @@ enum Commands {
     Curation {
         #[command(subcommand)]
         action: CurationCommand,
-    },
-    /// Migrate legacy Docker storage keys to namespaced format
-    MigrateDockerKeys {
-        /// Dry run — show what would be migrated without modifying storage
-        #[arg(long, default_value = "false")]
-        dry_run: bool,
     },
     /// Recover an artifact whose hash pin no longer matches its bytes (#601).
     ///
@@ -357,26 +350,30 @@ async fn refresh_artifact_gauges(
     storage: &Storage,
     enabled: &HashSet<RegistryType>,
 ) {
-    for rt in enabled
-        .iter()
-        .filter(|rt| !matches!(rt, RegistryType::Npm | RegistryType::PyPI))
-    {
+    for rt in enabled.iter().filter(|rt| {
+        !matches!(
+            rt,
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+        )
+    }) {
         let _ = repo_index.get(rt.as_str(), storage).await;
     }
-    for (rt, count) in repo_index
-        .counts()
-        .into_iter()
-        .filter(|(rt, _)| !matches!(rt, RegistryType::Npm | RegistryType::PyPI))
-    {
+    for (rt, count) in repo_index.counts().into_iter().filter(|(rt, _)| {
+        !matches!(
+            rt,
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+        )
+    }) {
         metrics::ARTIFACTS_TOTAL
             .with_label_values(&[rt.as_str()])
             .set(count as i64);
     }
-    for (rt, bytes) in repo_index
-        .sizes()
-        .into_iter()
-        .filter(|(rt, _)| !matches!(rt, RegistryType::Npm | RegistryType::PyPI))
-    {
+    for (rt, bytes) in repo_index.sizes().into_iter().filter(|(rt, _)| {
+        !matches!(
+            rt,
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+        )
+    }) {
         metrics::STORAGE_BYTES
             .with_label_values(&[rt.as_str()])
             .set(bytes as i64);
@@ -1376,41 +1373,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::MigrateDockerKeys { dry_run }) => {
-            let namespace = config
-                .docker
-                .upstreams
-                .first()
-                .map(|u| u.resolved_namespace())
-                .unwrap_or_else(|| "docker.io".to_string());
-
-            if config.docker.upstreams.len() > 1 {
-                warn!(
-                    namespace = %namespace,
-                    upstream_count = config.docker.upstreams.len(),
-                    "Multiple Docker upstreams configured; using first upstream namespace for migration"
-                );
-            }
-
-            match docker_key_migration::migrate_docker_keys(
-                &storage,
-                &namespace,
-                docker_key_migration::MigrateDockerKeysOptions { dry_run },
-            )
-            .await
-            {
-                Ok(stats) => {
-                    if stats.failed > 0 {
-                        error!("{} keys failed to migrate", stats.failed);
-                        std::process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    error!("Docker key migration failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
         Some(Commands::RePin { key, expected, yes }) => {
             let expected = expected.to_ascii_lowercase();
             if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1997,10 +1959,14 @@ fn rate_limited_routes<S: Clone + Send + Sync + 'static>(
     registry_routes: Router<S>,
     quotas: &rate_limit::LimiterQuotas,
     trusted_proxies: config::TrustedProxies,
+    shared_upload: Option<(
+        rate_limit::Limiter<rate_limit::TrustedProxyKeyExtractor>,
+        rate_limit::Quota,
+    )>,
 ) -> (Router<S>, rate_limit::LimiterQuotas) {
     let (auth_limiter, auth) = rate_limit::auth_rate_limiter(quotas.auth, trusted_proxies.clone());
-    let (upload_limiter, upload) =
-        rate_limit::upload_rate_limiter(quotas.upload, trusted_proxies.clone());
+    let (upload_limiter, upload) = shared_upload
+        .unwrap_or_else(|| rate_limit::upload_rate_limiter(quotas.upload, trusted_proxies.clone()));
     let (general_limiter, general) =
         rate_limit::general_rate_limiter(quotas.general, trusted_proxies);
 
@@ -2050,7 +2016,8 @@ mod rate_limited_routes_tests {
     /// origin, whatever type the format serves it as. Package clients do not read the header.
     #[tokio::test]
     async fn every_registry_answer_carries_a_sandbox_policy() {
-        use crate::test_helpers::{create_test_context_with_config, send};
+        let _lock = crate::test_env::env_lock();
+        use crate::test_helpers::docker::{create_test_context_with_config, send};
         use axum::{body::Body, http::Method};
         let ctx = create_test_context_with_config(|c| {
             c.registries = Some(crate::config::RegistriesSection {
@@ -2167,6 +2134,7 @@ mod rate_limited_routes_tests {
             registry,
             &quotas,
             config::TrustedProxies::default_loopback(),
+            None,
         );
         assert_eq!(enforced, quotas);
         assert_eq!(
@@ -2195,6 +2163,7 @@ mod rate_limited_routes_tests {
             registry,
             &quotas,
             config::TrustedProxies::default_loopback(),
+            None,
         );
         assert_eq!(enforced, quotas);
         assert_eq!(
@@ -2207,6 +2176,36 @@ mod rate_limited_routes_tests {
             vec![200, 429],
             "auth"
         );
+    }
+
+    #[tokio::test]
+    async fn upload_quota_is_shared_across_listener_routers() {
+        let config = config::RateLimitConfig {
+            upload_rps: 1,
+            upload_burst: 2,
+            ..Default::default()
+        };
+        let quotas = rate_limit::limiter_quotas(&config);
+        let shared = rate_limit::upload_rate_limiter(
+            quotas.upload,
+            config::TrustedProxies::default_loopback(),
+        );
+        let build = || {
+            rate_limited_routes::<()>(
+                Router::new(),
+                Router::new().route("/v2/", axum::routing::get(|| async { "ok" })),
+                &quotas,
+                config::TrustedProxies::default_loopback(),
+                Some(shared.clone()),
+            )
+            .0
+        };
+        let main = build();
+        let extra = build();
+        assert_eq!(statuses(&main, "/v2/", 1).await, vec![200]);
+        assert_eq!(statuses(&extra, "/v2/", 1).await, vec![200]);
+        assert_eq!(statuses(&main, "/v2/", 1).await, vec![429]);
+        assert_eq!(statuses(&extra, "/v2/", 1).await, vec![429]);
     }
 
     // Whatever the rates, the routes are built with the quotas they are given, each from its
@@ -2233,6 +2232,7 @@ mod rate_limited_routes_tests {
                 Router::new(),
                 &quotas,
                 config::TrustedProxies::default_loopback(),
+                None,
             );
             assert_eq!(enforced, quotas, "{auth} {upload} {general}");
         }
@@ -2503,12 +2503,19 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     let registry_routes =
         registry_routes(&state.enabled_registries).merge(state.repositories.routes(&state));
+    let shared_upload = rate_limit_enabled.then(|| {
+        rate_limit::upload_rate_limiter(
+            rate_limit::limiter_quotas(&state.config.rate_limit).upload,
+            state.config.auth.trusted_proxies.clone(),
+        )
+    });
     let app_routes = if rate_limit_enabled {
         let (routes, enforced) = rate_limited_routes(
             auth::token_routes(),
             registry_routes,
             &rate_limit::limiter_quotas(&state.config.rate_limit),
             state.config.auth.trusted_proxies.clone(),
+            shared_upload.clone(),
         );
         info!(
             auth_rps = enforced.auth.per_second(),
@@ -2742,6 +2749,43 @@ async fn run_server(mut config: Config, storage: Storage) {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| state.config.server.bind_addr());
 
+    let mut listeners = vec![(listener, app)];
+    for member in state.repositories.members().filter(|member| {
+        member.registry_type() == RegistryType::Docker
+            && state.enabled_registries.contains(&RegistryType::Docker)
+            && member.definition.port(&state.config.server) != state.config.server.port
+    }) {
+        let port = member.definition.port(&state.config.server);
+        let listener = bind_listener(&state.config.server.host, port)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Cannot bind Docker repository {} on {}:{port}: {error}",
+                    member.name, state.config.server.host
+                )
+            });
+        let view = member.state(&state);
+        let mut router = member.docker_routes(&state);
+        if let Some((limiter, _)) = &shared_upload {
+            router = router.layer(limiter.clone());
+        }
+        router = router.layer(DefaultBodyLimit::max(
+            view.config.server.body_limit_mb * 1024 * 1024,
+        ));
+        let router = apply_security_headers(router);
+        let router = request_layers(router, &view)
+            .layer(middleware::from_fn_with_state(
+                view.clone(),
+                metrics::metrics_middleware,
+            ))
+            .layer(middleware::from_fn(
+                validation::reject_null_bytes_middleware,
+            ))
+            .with_state(view);
+        listeners.push((listener, router));
+        info!(repository = %member.name, port, "Docker repository listener bound");
+    }
+
     info!(
         address = %addr,
         version = env!("CARGO_PKG_VERSION"),
@@ -2864,16 +2908,35 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
-    match serve_with_drain(listener, app, shutdown_signal(), drain)
-        .await
-        .expect("Server error")
-    {
-        ServeEnd::Drained => {}
-        ServeEnd::DeadlinePassed => warn!(
-            shutdown_timeout_secs = state.config.server.shutdown_timeout,
-            "Connections still open after the shutdown timeout are closed; finishing shutdown"
-        ),
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let signal_shutdown = shutdown.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_shutdown.cancel();
+    });
+    let mut servers = tokio::task::JoinSet::new();
+    for (listener, router) in listeners {
+        let stop = shutdown.clone();
+        servers.spawn(serve_with_drain(
+            listener,
+            router,
+            stop.cancelled_owned(),
+            drain,
+        ));
     }
+    let mut serve_failed = false;
+    while let Some(result) = servers.join_next().await {
+        match result {
+            Ok(Ok(ServeEnd::Drained)) => {}
+            Ok(Ok(ServeEnd::DeadlinePassed)) => warn!("Listener drain deadline passed"),
+            error => {
+                error!(?error, "Listener failed; shutting down all listeners");
+                serve_failed = true;
+                shutdown.cancel();
+            }
+        }
+    }
+    signal_task.abort();
 
     // Signal background schedulers to stop and wait for them (#306)
     cancel_token.cancel();
@@ -2916,6 +2979,9 @@ async fn run_server(mut config: Config, storage: Storage) {
         uptime_seconds = state.start_time.elapsed().as_secs(),
         "Nora shutdown complete"
     );
+    if serve_failed {
+        std::process::exit(1);
+    }
 }
 
 /// How serving ended after the shutdown signal.
@@ -3107,16 +3173,13 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
     let mut registry_routes = Router::new();
     for reg in enabled {
         match reg {
-            RegistryType::Docker => {
-                registry_routes = registry_routes.merge(registry::docker_routes())
-            }
             RegistryType::Maven => {
                 registry_routes = registry_routes.merge(registry::maven_routes())
             }
             RegistryType::Cargo => {
                 registry_routes = registry_routes.merge(registry::cargo_routes())
             }
-            RegistryType::Npm | RegistryType::PyPI => {}
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI => {}
             RegistryType::Raw => registry_routes = registry_routes.merge(registry::raw_routes()),
             RegistryType::Go => registry_routes = registry_routes.merge(registry::go_routes()),
             RegistryType::Gems => registry_routes = registry_routes.merge(registry::gems_routes()),

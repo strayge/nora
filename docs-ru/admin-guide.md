@@ -116,21 +116,30 @@ htpasswd -Bc /etc/nora/users.htpasswd admin
 
 ### 3.3. Проксирование внешних репозиториев
 
-npm и PyPI настраиваются только явными `[repositories.<name>]` в TOML: `format`, `kind` (`local`, `proxy`, `group`), `paths`, а для прокси — `upstream` и политики TLS/тайм-аутов/сохранения файлов. Неявных публичных upstream и URL нет. Старые `[npm]`, `[pypi]` и их переменные окружения отклоняются. См. [настройку именованных репозиториев](../docs/repositories.md). `NORA_REGISTRIES_ENABLE` по-прежнему включает форматы, но не создаёт репозитории.
+Docker, npm и PyPI настраиваются только явными `[repositories.<name>]` в TOML. Docker поддерживает `kind = "local"` или `"proxy"`; репозиторий выбирается по `port`, а не по префиксу имени образа. Для npm/PyPI используются `paths` и виды `local`, `proxy`, `group`. Неявных публичных upstream и URL нет. Старые `[docker]`, `[npm]`, `[pypi]` и их переменные окружения отклоняются. См. [настройку именованных репозиториев](../docs/repositories.md) и [Docker-репозиториев и портов](../docs/docker-repositories.md). `NORA_REGISTRIES_ENABLE` по-прежнему включает форматы, но не создаёт репозитории.
 
 | Переменная | Описание | По умолчанию |
 |-----------|----------|--------------|
 | `NORA_MAVEN_PROXIES` | Список Maven-репозиториев через запятую | `https://repo1.maven.org/maven2` |
-| `NORA_DOCKER_PROXIES` | Docker-реестры (quick start), формат: `url\|auth,url2` | `https://registry-1.docker.io` |
 
-> **Рекомендация для production.** Для Docker-прокси с аутентификацией используйте `config.toml` вместо переменной окружения. Это позволяет хранить учётные данные отдельно (например, в Kubernetes Secret, смонтированном как файл) и упрощает ротацию токенов.
+> **Рекомендация для production.** Для Docker-прокси с аутентификацией храните учётные данные в монтируемом `config.toml` (например, в Kubernetes Secret). Это отделяет их от конфигурации запуска и упрощает ротацию токенов.
 >
 > ```toml
-> [[docker.upstreams]]
-> url = "https://registry-1.docker.io"
+> [repositories.images]
+> format = "docker"
+> kind = "local"
 >
-> [[docker.upstreams]]
-> url = "https://private.registry.io"
+> [repositories.docker-hub]
+> format = "docker"
+> kind = "proxy"
+> port = 5001
+> upstream = "https://registry-1.docker.io"
+>
+> [repositories.private-images]
+> format = "docker"
+> kind = "proxy"
+> port = 5002
+> upstream = "https://private.registry.io"
 > auth = "user:token"
 > ```
 
@@ -296,7 +305,7 @@ nora migrate --from local --to s3              # Выполнение
 
 | Протокол | Endpoint | Описание |
 |----------|----------|----------|
-| Docker / OCI | `/v2/` | Docker Registry V2 API |
+| Docker / OCI | `/v2/` на порту выбранного репозитория | Docker Registry V2 API; `local` для публикации, `proxy` для upstream |
 | npm | Настроенный alias | Именованные local/proxy/group; публикация только в local |
 | Maven | `/maven2/` | Maven-репозиторий |
 | PyPI | Настроенный alias | Simple API; `/simple/` существует только при явной настройке |

@@ -1449,7 +1449,7 @@ mod basic_decision_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
-    use crate::test_helpers::*;
+    use crate::test_helpers::docker::*;
     use axum::http::{Method, StatusCode};
     use base64::{engine::general_purpose::STANDARD, Engine};
 
@@ -2355,8 +2355,9 @@ mod integration_tests {
         let ctx = create_test_context_without_htpasswd();
         let mut state = ctx.state.clone();
         state.tokens = None;
-        let app = crate::request_layers(crate::registry::docker_routes(), &state)
-            .with_state(state.clone());
+        let routes =
+            axum::Router::new().route("/v2/", axum::routing::get(|| async { StatusCode::OK }));
+        let app = crate::request_layers(routes, &state).with_state(state.clone());
 
         one_failure_from_lockout(&state.auth_failures);
         let response = send_with_headers(

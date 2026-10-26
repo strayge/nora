@@ -35,9 +35,12 @@ use crate::AppState;
 
 use parking_lot::RwLock;
 
+pub mod docker;
+
 /// Everything a test needs: tempdir (must stay alive), shared state, and the router.
 pub struct TestContext {
     pub state: AppState,
+    pub root: Option<AppState>,
     pub app: Router,
     pub _tempdir: TempDir,
     /// Holds the signing key outside the storage root, so storage-size
@@ -58,14 +61,6 @@ pub fn create_test_context_with_auth(users: &[(&str, &str)]) -> TestContext {
 /// Build a test context with auth + anonymous_read.
 pub fn create_test_context_with_anonymous_read(users: &[(&str, &str)]) -> TestContext {
     build_context(true, users, true, |_| {})
-}
-
-/// Build a test context with auth + `docker_anon_pull` (general
-/// `anonymous_read` left OFF, to prove Docker is governed by its own switch).
-pub fn create_test_context_with_docker_anon_pull(users: &[(&str, &str)]) -> TestContext {
-    build_context(true, users, false, |cfg| {
-        cfg.auth.docker_anon_pull = true;
-    })
 }
 
 /// Build a test context with raw storage **disabled**.
@@ -418,6 +413,7 @@ fn build_context_full(
 
     TestContext {
         state,
+        root: None,
         app,
         _tempdir: tempdir,
         _signing_dir: signing_dir,
@@ -442,7 +438,9 @@ fn router_for_state(state: &AppState) -> Router {
     let mut registry_routes =
         crate::registry_routes(&state.enabled_registries).merge(state.repositories.routes(state));
     // Historical handler fixtures use unscoped storage explicitly; production never mounts these routes.
-    if state.config.repositories.is_empty() {
+    if state.config.repositories.values().all(|definition| {
+        definition.format() == crate::config::repositories::RepositoryFormat::Docker
+    }) {
         let mut legacy = Router::new();
         if state
             .enabled_registries

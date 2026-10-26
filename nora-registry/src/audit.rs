@@ -787,12 +787,13 @@ mod curation_refusal_audit_kinds {
 #[allow(clippy::unwrap_used)]
 mod curation_refusal_audit_docker {
     use super::*;
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use crate::test_helpers::docker::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
     use tempfile::TempDir;
 
     #[tokio::test]
     async fn docker_blob_refusals_are_recorded() {
+        let _lock = crate::test_env::env_lock();
         let digest = format!("sha256:{}", "a".repeat(64));
         let policy = TempDir::new().unwrap();
         let blocklist = policy.path().join("blocklist.json");

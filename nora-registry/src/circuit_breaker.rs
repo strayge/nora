@@ -60,14 +60,7 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
     let mut keys = Vec::new();
     for rt in RegistryType::all() {
         match rt {
-            RegistryType::Docker => keys.extend(
-                config
-                    .docker
-                    .upstreams
-                    .iter()
-                    .map(|up| upstream_key(rt.as_str(), &up.url)),
-            ),
-            RegistryType::PyPI | RegistryType::Npm => {}
+            RegistryType::Docker | RegistryType::PyPI | RegistryType::Npm => {}
             _ => keys.push(rt.as_str().to_string()),
         }
     }
@@ -78,10 +71,7 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
         ) {
             continue;
         }
-        let registry = match repository.format() {
-            crate::config::repositories::RepositoryFormat::Npm => RegistryType::Npm,
-            crate::config::repositories::RepositoryFormat::Pypi => RegistryType::PyPI,
-        };
+        let registry = repository.format().registry_type();
         if let Ok(source) = crate::repositories::source_id(repository) {
             keys.push(repository_key(registry, name, &source));
         }
@@ -1078,21 +1068,25 @@ mod tests {
     fn initial_gauge_keys_follow_the_breaker_keys() {
         let mut config = crate::config::Config::default();
         config.repositories=toml::from_str::<crate::config::Config>("[repositories.npm]\nformat='npm'\nkind='proxy'\npaths=['/npm/']\nupstream='https://registry.npmjs.org'\n[repositories.python]\nformat='pypi'\nkind='proxy'\npaths=['/simple/']\nupstream='https://pypi.org/simple/'\n").unwrap().repositories;
-        config.docker.upstreams = vec![crate::config::DockerUpstream {
-            url: "https://registry-1.docker.io".into(),
-            auth: None,
-            namespace: None,
-            prefix: None,
-        }];
+        config.repositories.insert(
+            "docker".into(),
+            toml::from_str(
+                "format='docker'\nkind='proxy'\nupstream='https://registry-1.docker.io'\n",
+            )
+            .unwrap(),
+        );
         let keys = initial_gauge_keys(&config);
-        assert!(keys.contains(&"docker:https://registry-1.docker.io".to_string()));
-        for (name, format) in [("npm", RegistryType::Npm), ("python", RegistryType::PyPI)] {
+        for (name, format) in [
+            ("docker", RegistryType::Docker),
+            ("npm", RegistryType::Npm),
+            ("python", RegistryType::PyPI),
+        ] {
             let source = crate::repositories::source_id(&config.repositories[name]).unwrap();
             assert!(keys.contains(&repository_key(format, name, &source)));
         }
-        assert!(!keys
-            .iter()
-            .any(|key| key.contains("registry.npmjs.org") || key.contains("pypi.org")));
+        assert!(!keys.iter().any(|key| key.contains("registry-1.docker.io")
+            || key.contains("registry.npmjs.org")
+            || key.contains("pypi.org")));
         assert!(
             keys.contains(&"cargo".to_string()),
             "formats without per-upstream keys"
@@ -1417,12 +1411,12 @@ mod integration_tests {
         assert_eq!(json["upstreams"]["pypi"]["status"], "closed");
     }
 
-    /// Docker keys its breakers through the shared [`super::upstream_key`]: a
-    /// configured upstream written with userinfo and a trailing `/` is recorded
-    /// under the same key the helper (and `overrides`) produce.
+    /// A named upstream failure uses repository/source identity without exposing credentials.
     #[tokio::test]
-    async fn test_docker_breaker_key_comes_from_shared_helper() {
+    async fn test_docker_breaker_key_matches_repository_source() {
+        let _lock = crate::test_env::env_lock();
         use crate::config::DockerUpstream;
+        use crate::test_helpers::docker::create_test_context_with_config;
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1431,15 +1425,14 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&upstream)
             .await;
-        let configured = upstream.uri().replace("http://", "http://u:p@") + "/";
-        let url = configured.clone();
+        let url = upstream.uri() + "/";
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.circuit_breaker.enabled = true;
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.upstreams = vec![DockerUpstream {
                 url,
-                auth: None,
+                auth: Some("u:p".into()),
                 namespace: None,
                 prefix: None,
             }];
@@ -1454,13 +1447,14 @@ mod integration_tests {
         .await;
         assert_eq!(
             ctx.state.circuit_breaker.keys(),
-            vec![super::upstream_key("docker", &configured)]
+            vec![ctx.state.repository.as_ref().unwrap().breaker_key()]
         );
-        assert_eq!(
-            ctx.state.circuit_breaker.keys(),
-            vec![format!("docker:{}", upstream.uri())],
-            "no credentials, no trailing slash in the key"
-        );
+        assert!(!ctx
+            .state
+            .circuit_breaker
+            .keys()
+            .iter()
+            .any(|key| key.contains("u:p") || key.contains(&upstream.uri())));
     }
 
     /// When circuit breaker is disabled (default), proxy errors should NOT

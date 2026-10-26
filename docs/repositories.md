@@ -1,10 +1,13 @@
 # Named npm and PyPI repositories
 
+Docker uses the same named identities but selects repositories by port, not URL
+aliases. See [Docker repository configuration](docker-repositories.md).
+
 npm and PyPI have no implicit repository or public upstream. Configure named
 repositories, then point clients at one of their explicit aliases. The browser at
 `/ui/repositories` shows identities, aliases, package versions and client commands.
 Open a version to inspect its files and recorded checksums. Local repositories also
-support permanent cleanup of packages and releases. Other package formats keep
+support permanent cleanup of packages and releases. Formats other than Docker keep
 their existing configuration.
 
 The browser only observes stored state: it never refreshes a proxy or rebuilds

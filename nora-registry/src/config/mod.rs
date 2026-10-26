@@ -353,7 +353,7 @@ fn removed_repository_table<'de, D, T>(_: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Err(serde::de::Error::custom("[npm] and [pypi] were removed; configure explicit [repositories.<name>] with format, kind and paths (including /npm/ or /simple/ only if wanted)"))
+    Err(serde::de::Error::custom("[npm], [pypi] and [docker] were removed; configure explicit [repositories.<name>] with format, kind and paths (npm/PyPI) or port (Docker)"))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -378,7 +378,11 @@ pub struct Config {
         deserialize_with = "removed_repository_table"
     )]
     pub pypi: PypiConfig,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_repository_table"
+    )]
     pub docker: DockerConfig,
     #[serde(default)]
     pub go: GoConfig,
@@ -741,10 +745,9 @@ impl Config {
 
     fn is_enabled_proxy(&self, rt: RegistryType) -> bool {
         match rt {
-            RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
             RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
-            RegistryType::Npm | RegistryType::PyPI => self.enabled_registries_quiet().contains(&rt) && self.repositories.values().any(|repository| {
-                matches!(repository, repositories::RepositoryConfig::Proxy(proxy) if match proxy.format { repositories::RepositoryFormat::Npm => rt == RegistryType::Npm, repositories::RepositoryFormat::Pypi => rt == RegistryType::PyPI })
+            RegistryType::Npm | RegistryType::PyPI | RegistryType::Docker => self.enabled_registries_quiet().contains(&rt) && self.repositories.values().any(|repository| {
+                matches!(repository, repositories::RepositoryConfig::Proxy(proxy) if proxy.format.registry_type() == rt)
             }),
             RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
             RegistryType::Go => self.go.enabled && self.go.proxy.is_some(),
@@ -976,10 +979,7 @@ impl Config {
                     .and_then(|url| url.host_str().map(str::to_owned))
                     .filter(|host| host != "localhost" && host != "127.0.0.1")
                 {
-                    let format = match proxy.format {
-                        repositories::RepositoryFormat::Npm => "npm",
-                        repositories::RepositoryFormat::Pypi => "pypi",
-                    };
+                    let format = proxy.format.registry_type().as_str();
                     result.push((format.into(), host));
                 }
             }
@@ -1001,18 +1001,6 @@ impl Config {
                     .to_string(),
                 host,
             ));
-        }
-
-        // Docker upstreams: Vec<DockerUpstream>
-        for upstream in &self.docker.upstreams {
-            if let Some(host) = extract_host(&upstream.url) {
-                result.push((
-                    crate::registry_type::RegistryType::Docker
-                        .as_str()
-                        .to_string(),
-                    host,
-                ));
-            }
         }
 
         // Maven proxies: Vec<MavenProxyEntry>
@@ -1605,6 +1593,14 @@ impl Config {
     /// disable security or misconfigure storage.
     fn apply_env_overrides(&mut self) -> Result<(), String> {
         for key in [
+            "NORA_DOCKER_ENABLED",
+            "NORA_DOCKER_PROXY_TIMEOUT",
+            "NORA_DOCKER_READ_TIMEOUT",
+            "NORA_DOCKER_METADATA_TTL",
+            "NORA_DOCKER_SERVE_STALE",
+            "NORA_DOCKER_DEFAULT_ACTION",
+            "NORA_DOCKER_PROXIES",
+            "NORA_DOCKER_UPSTREAMS",
             "NORA_NPM_ENABLED",
             "NORA_NPM_PROXY",
             "NORA_NPM_PROXY_AUTH",
@@ -1634,7 +1630,6 @@ impl Config {
         self.auth.apply_env_overrides();
 
         // Registry configs (each handles its own NORA_*_ENABLED + format-specific vars)
-        self.docker.apply_env_overrides();
         self.maven.apply_env_overrides();
         for repository in self.repositories.values_mut() {
             if let repositories::RepositoryConfig::Proxy(proxy) = repository {
@@ -1712,7 +1707,7 @@ mod tests {
                     !proxies.contains(&RegistryType::Npm) && !proxies.contains(&RegistryType::PyPI),
                     "{proxies:?}"
                 );
-                assert!(proxies.contains(&RegistryType::Docker), "{proxies:?}");
+                assert!(!proxies.contains(&RegistryType::Docker), "{proxies:?}");
             }
             other => panic!("default config: {other:?}"),
         }
@@ -2133,9 +2128,7 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
     fn test_docker_config_default() {
         let d = DockerConfig::default();
         assert_eq!(d.proxy_timeout, 300);
-        assert_eq!(d.upstreams.len(), 1);
-        assert_eq!(d.upstreams[0].url, "https://registry-1.docker.io");
-        assert!(d.upstreams[0].auth.is_none());
+        assert!(d.upstreams.is_empty());
     }
 
     #[test]
@@ -2552,7 +2545,7 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
         assert!(config.npm.proxy.is_none());
         assert!(config.pypi.proxy.is_none());
         assert!(config.repositories.is_empty());
-        assert_eq!(config.docker.upstreams.len(), 1);
+        assert!(config.docker.upstreams.is_empty());
         assert!(config.raw.enabled);
         assert!(!config.auth.enabled);
     }
@@ -2682,25 +2675,31 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
             [storage]
             mode = "local"
 
-            [docker]
+            [repositories.mirror]
+            format = "docker"
+            kind = "proxy"
             proxy_timeout = 120
+            upstream = "https://mirror.gcr.io"
 
-            [[docker.upstreams]]
-            url = "https://mirror.gcr.io"
-
-            [[docker.upstreams]]
-            url = "https://private.registry.io"
+            [repositories.private]
+            format = "docker"
+            kind = "proxy"
+            port = 19443
+            upstream = "https://private.registry.io"
             auth = "user:pass"
         "#;
 
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.docker.proxy_timeout, 120);
-        assert_eq!(config.docker.upstreams.len(), 2);
-        assert!(config.docker.upstreams[0].auth.is_none());
-        assert_eq!(
-            crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
-            Some("user:pass")
-        );
+        assert!(config.docker.upstreams.is_empty());
+        let repositories::RepositoryConfig::Proxy(mirror) = &config.repositories["mirror"] else {
+            panic!()
+        };
+        let repositories::RepositoryConfig::Proxy(private) = &config.repositories["private"] else {
+            panic!()
+        };
+        assert_eq!(mirror.proxy_timeout, Some(120));
+        assert!(mirror.auth.is_none());
+        assert_eq!(crate::secrets::expose_opt(&private.auth), Some("user:pass"));
     }
 
     /// `KEY=VALUE` lines of an env file (comments and blanks skipped).
@@ -2807,9 +2806,8 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
             [curation]
             mdoe = "enforce"
 
-            [[docker.upstreams]]
-            url = "https://registry-1.docker.io"
-            auht = "user:pass"
+            [maven]
+            proxies = [{ url = "https://maven.example.com", auht = "user:pass" }]
 
             [unknwon_section]
             a = 1
@@ -2819,7 +2817,7 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
             unknown_keys(content),
             [
                 "curation.mdoe",
-                "docker.upstreams.0.auht",
+                "maven.proxies.0.auht",
                 "typo_top",
                 "unknwon_section"
             ]
@@ -2938,9 +2936,6 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
             bypass_token = "t"  # secret
             [maven]
             proxies = [{ url = "https://maven.example", auth = "u:p" }]  # secret
-            [[docker.upstreams]]
-            url = "https://docker.example"
-            auth = "u:p"  # secret
             [go]
             proxy_auth = "u:p"  # secret
             [cargo]
@@ -2981,6 +2976,7 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
                 } else if p.extension().is_some_and(|x| x == "rs")
                     && !p.ends_with("registry/npm.rs")
                     && !p.ends_with("registry/pypi.rs")
+                    && !p.ends_with("registry/docker.rs")
                 {
                     let src = std::fs::read_to_string(&p).unwrap();
                     in_source += src
@@ -3580,38 +3576,23 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
     }
 
     #[test]
-    fn test_env_override_docker_proxies_and_backward_compat() {
+    fn removed_docker_environment_controls_are_refused() {
         let _lock = env_lock();
-        // Test new NORA_DOCKER_PROXIES name
-        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
-        std::env::set_var(
+        for key in [
+            "NORA_DOCKER_ENABLED",
             "NORA_DOCKER_PROXIES",
-            "https://mirror.gcr.io,https://private.io|token123",
-        );
-        let mut config = Config::default();
-        config.apply_env_overrides().unwrap();
-        assert_eq!(config.docker.upstreams.len(), 2);
-        assert_eq!(config.docker.upstreams[0].url, "https://mirror.gcr.io");
-        assert!(config.docker.upstreams[0].auth.is_none());
-        assert_eq!(config.docker.upstreams[1].url, "https://private.io");
-        assert_eq!(
-            crate::secrets::expose_opt(&config.docker.upstreams[1].auth),
-            Some("token123")
-        );
-        std::env::remove_var("NORA_DOCKER_PROXIES");
-
-        // Test backward compat: old NORA_DOCKER_UPSTREAMS still works
-        std::env::remove_var("NORA_DOCKER_PROXIES");
-        std::env::set_var("NORA_DOCKER_UPSTREAMS", "https://legacy.io|secret");
-        let mut config2 = Config::default();
-        config2.apply_env_overrides().unwrap();
-        assert_eq!(config2.docker.upstreams.len(), 1);
-        assert_eq!(config2.docker.upstreams[0].url, "https://legacy.io");
-        assert_eq!(
-            crate::secrets::expose_opt(&config2.docker.upstreams[0].auth),
-            Some("secret")
-        );
-        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+            "NORA_DOCKER_UPSTREAMS",
+            "NORA_DOCKER_PROXY_TIMEOUT",
+            "NORA_DOCKER_READ_TIMEOUT",
+            "NORA_DOCKER_METADATA_TTL",
+            "NORA_DOCKER_SERVE_STALE",
+            "NORA_DOCKER_DEFAULT_ACTION",
+        ] {
+            std::env::set_var(key, "legacy");
+            let result = Config::default().apply_env_overrides();
+            std::env::remove_var(key);
+            assert!(result.unwrap_err().contains(key));
+        }
     }
 
     #[test]
@@ -4043,15 +4024,9 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
 
     #[test]
     fn test_is_enabled_proxy_counts_docker_and_excludes_raw() {
-        // #765: docker was dropped from the any_enabled_proxy chain. The exhaustive
-        // helper must count docker (enabled + has upstream) and never count raw.
-        let mut config = Config::default();
-        // Config::default() already carries the registry-1.docker.io upstream.
-        assert!(
-            config.is_enabled_proxy(RegistryType::Docker),
-            "enabled docker with an upstream is a proxy"
-        );
-        config.docker.upstreams = vec![];
+        let mut config: Config = toml::from_str("[repositories.docker]\nformat='docker'\nkind='proxy'\nupstream='https://registry-1.docker.io'\n").unwrap();
+        assert!(config.is_enabled_proxy(RegistryType::Docker));
+        config.repositories.clear();
         assert!(
             !config.is_enabled_proxy(RegistryType::Docker),
             "docker without upstreams is not a proxy"
@@ -4353,7 +4328,7 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
     fn proxy_forms() -> Vec<(RegistryType, &'static str, fn(&mut Config))> {
         fn none(_: &mut Config) {}
         vec![
-            (RegistryType::Docker, "[docker]\nenabled = true\n[[docker.upstreams]]\nurl = \"https://registry-1.docker.io\"\n", none),
+            (RegistryType::Docker, "[repositories.docker]\nformat = \"docker\"\nkind = \"proxy\"\nupstream = \"https://registry-1.docker.io\"\n", none),
             (RegistryType::Maven, "[maven]\nenabled = true\nproxies = [\"https://repo1.maven.org/maven2\"]\n", none),
             (RegistryType::Npm, "[repositories.npm]\nformat = \"npm\"\nkind = \"proxy\"\npaths = [\"/npm/\"]\nupstream = \"https://registry.npmjs.org\"\n", none),
             (RegistryType::Cargo, "[cargo]\nenabled = true\nproxy = \"https://index.crates.io\"\n", none),
@@ -4374,7 +4349,10 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
     /// Each registry enabled with no upstream at all, written out per registry.
     fn make_hosted(rt: RegistryType, c: &mut Config) {
         match rt {
-            RegistryType::Docker => (c.docker.enabled, c.docker.upstreams) = (true, vec![]),
+            RegistryType::Docker => {
+                c.docker.enabled = true;
+                c.repositories.clear();
+            }
             RegistryType::Maven => (c.maven.enabled, c.maven.proxies) = (true, vec![]),
             RegistryType::Npm => {
                 c.npm.enabled = true;
@@ -4403,7 +4381,10 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
     /// Each registry disabled, written out per registry.
     fn make_disabled(rt: RegistryType, c: &mut Config) {
         match rt {
-            RegistryType::Docker => c.docker.enabled = false,
+            RegistryType::Docker => {
+                c.docker.enabled = false;
+                c.repositories.clear();
+            }
             RegistryType::Maven => c.maven.enabled = false,
             RegistryType::Npm => {
                 c.npm.enabled = false;
@@ -4633,7 +4614,10 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
             } else {
                 "raw"
             };
-            let named = matches!(rt, RegistryType::Npm | RegistryType::PyPI);
+            let named = matches!(
+                rt,
+                RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+            );
             for way in [EnableWay::Env, EnableWay::Section, EnableWay::Flag] {
                 if named && matches!(way, EnableWay::Flag) {
                     continue;
@@ -4703,8 +4687,7 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
         let _lock = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        // docker is on by its flag's default and a proxy; the enable-set decides.
-        std::fs::write(&path, "[curation.docker]\nmin_release_age = \"3d\"\n").unwrap();
+        std::fs::write(&path, "[repositories.docker]\nformat='docker'\nkind='proxy'\nupstream='https://registry-1.docker.io'\n[curation.docker]\nmin_release_age='3d'\n").unwrap();
         std::env::set_var("NORA_CONFIG_PATH", &path);
         std::env::set_var("NORA_REGISTRIES_ENABLE", "raw");
         let off = Config::try_load();
@@ -4712,7 +4695,12 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
         let on = Config::try_load();
         std::env::remove_var("NORA_REGISTRIES_ENABLE");
         std::env::remove_var("NORA_CONFIG_PATH");
-        assert!(off.is_ok(), "docker is not mounted: {:?}", off.err());
+        let err =
+            off.expect_err("a configured Docker repository cannot silently disappear on reload");
+        assert!(
+            err.contains("repositories.docker") && err.contains("disabled"),
+            "{err}"
+        );
         let err = on.expect_err("docker is a mounted proxy without a quarantine");
         assert!(err.contains("curation.docker.min_release_age"), "{err}");
     }
@@ -5818,14 +5806,16 @@ auth_bearer_env = "NORA_NPM_VENDOR_TOKEN"
             [storage]
             path = "/tmp/nora-test"
 
-            [docker]
-            enabled = true
+            [repositories.docker-hub]
+            format = "docker"
+            kind = "proxy"
+            upstream = "https://registry-1.docker.io"
 
-            [[docker.upstreams]]
-            url = "https://registry-1.docker.io"
-
-            [[docker.upstreams]]
-            url = "https://ghcr.io"
+            [repositories.ghcr]
+            format = "docker"
+            kind = "proxy"
+            port = 19443
+            upstream = "https://ghcr.io"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         let hosts = config.upstream_hostnames();

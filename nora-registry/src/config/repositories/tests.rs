@@ -35,6 +35,7 @@ fn removed_singletons_cannot_reenable_defaults_but_curation_and_format_selection
     for source in [
         "[npm]",
         "[pypi]",
+        "[docker]",
         "[npm]\nproxy='https://registry.example'",
         "[pypi]\nproxies=['https://registry.example']",
     ] {
@@ -46,6 +47,7 @@ fn removed_singletons_cannot_reenable_defaults_but_curation_and_format_selection
         default.repositories.is_empty()
             && default.npm.upstream_urls().is_empty()
             && default.pypi.upstreams().is_empty()
+            && default.docker.upstreams.is_empty()
     );
     let config=parse("[registries]\nenable=['npm','pypi']\n[curation.npm]\nquarantine='observe'\n[curation.pypi]\nquarantine='enforce'");
     assert!(config.curation.npm.quarantine.is_some() && config.curation.pypi.quarantine.is_some());
@@ -192,18 +194,18 @@ fn flat_fields_and_applicability_are_always_strict() {
 }
 
 #[test]
-fn explicit_supported_formats_and_legacy_docker() {
+fn explicit_supported_formats_and_removed_docker_singleton() {
     let _lock = crate::test_env::env_lock();
-    for format in ["docker", "maven", "NPM", "unknown"] {
+    for format in ["maven", "NPM", "unknown"] {
         for kind in ["local", "proxy", "group"] {
             let source =
                 format!("[repositories.test]\nformat='{format}'\nkind='{kind}'\npaths=['/test/']");
             assert!(toml::from_str::<Config>(&source).is_err());
         }
     }
-    let config = parse("[docker]\nenabled=true\nproxy_timeout=42\n[[docker.upstreams]]\nurl='https://registry-1.docker.io'\n");
-    assert_eq!(config.docker.proxy_timeout, 42);
-    assert_eq!(config.docker.upstreams.len(), 1);
+    let config = parse("[repositories.docker]\nformat='docker'\nkind='local'\n");
+    assert!(errors(&config).is_empty());
+    assert!(toml::from_str::<Config>("[docker]\nenabled=true\n").is_err());
 }
 
 #[test]

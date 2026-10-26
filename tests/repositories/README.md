@@ -1,5 +1,40 @@
 # Named-repository acceptance
 
+Docker listener, upstream-auth/cache isolation, restart/offline and retained-data
+checks use only Python's standard library and local fake upstreams:
+
+```sh
+cargo build --locked -p nora-registry
+python3 tests/repositories/docker_acceptance.py --binary target/debug/nora
+```
+
+The fixture uses isolated ports, storage and environment, stops its processes,
+and retains logs plus `result.json` in the printed temporary evidence directory.
+No Docker daemon, external registry or user daemon configuration is needed.
+
+The real Docker CLI smoke is separate and explicitly opt-in:
+
+```sh
+python3 tests/repositories/docker_client_smoke.py --binary target/debug/nora
+```
+
+It prints `SKIP` when the CLI or a local daemon is unavailable. It checks
+credentialed login, a fresh local image pull, push/pull on another local port,
+proxy pull and rejected proxy writes. Only temporary client configuration and
+unique fixture tags are used; its processes, tags and containers are cleaned up.
+No external registry or daemon/user configuration changes are needed.
+
+If Docker Desktop's VM cannot reach host-loopback listeners, use an
+already-cached Python 3 image for a temporary, loopback-published relay:
+
+```sh
+python3 tests/repositories/docker_client_smoke.py --binary target/debug/nora \
+  --relay-image python:3.15.1-alpine3.24
+```
+
+The relay image is never pulled. Logs and `result.json` remain in the printed
+temporary evidence directory.
+
 Build Nora, then run the self-contained localhost fixtures:
 
 ```sh

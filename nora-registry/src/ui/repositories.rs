@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt::Write, sync::Arc};
 
 mod artifacts;
+mod docker;
 
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,10 @@ struct Summary {
     format: &'static str,
     kind: &'static str,
     paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_url: Option<String>,
     members: Vec<String>,
     save_files: Option<bool>,
     stored_packages: Option<usize>,
@@ -103,7 +108,7 @@ struct PackageQuery {
 }
 
 pub(super) fn selection_required() -> Response {
-    (StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"repository_required","message":"Choose a named repository; npm and PyPI have no default repository","repositories":"/api/ui/repositories"}))).into_response()
+    (StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":"repository_required","message":"Choose a named repository; npm, PyPI and Docker have no default repository","repositories":"/api/ui/repositories"}))).into_response()
 }
 
 pub(super) fn routes() -> Router<AppState> {
@@ -127,10 +132,7 @@ pub(super) fn routes() -> Router<AppState> {
 }
 
 fn registry(format: RepositoryFormat) -> RegistryType {
-    match format {
-        RepositoryFormat::Npm => RegistryType::Npm,
-        RepositoryFormat::Pypi => RegistryType::PyPI,
-    }
+    format.registry_type()
 }
 
 async fn summary(root: &AppState, name: &str) -> Option<Summary> {
@@ -160,6 +162,9 @@ async fn summary(root: &AppState, name: &str) -> Option<Summary> {
         format: format.as_str(),
         kind,
         paths: definition.paths().to_vec(),
+        port: (format == RegistryType::Docker).then(|| definition.port(&root.config.server)),
+        public_url: (format == RegistryType::Docker)
+            .then(|| definition.docker_public_url(&root.config.server)),
         members,
         save_files,
         stored_packages: inventory
@@ -178,7 +183,7 @@ async fn summaries(root: &AppState, query: &BrowseQuery) -> Result<Vec<Summary>,
     if query
         .format
         .as_deref()
-        .is_some_and(|format| !matches!(format, "npm" | "pypi"))
+        .is_some_and(|format| !matches!(format, "npm" | "pypi" | "docker"))
     {
         return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
     }
@@ -203,6 +208,25 @@ async fn member_names(
 ) -> Result<Vec<String>, Box<Response>> {
     let state = member.state(root);
     match member.definition.format() {
+        RepositoryFormat::Docker => {
+            let keys = state
+                .storage
+                .list("docker/")
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE);
+            keys.map(|keys| {
+                keys.into_iter()
+                    .filter_map(|key| {
+                        let rest = key.strip_prefix("docker/")?;
+                        let (name, file) = rest.rsplit_once("/manifests/")?;
+                        crate::registry::docker::tag_from_manifest_file(file)
+                            .map(|_| name.to_owned())
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+        }
         RepositoryFormat::Npm => crate::registry::npm::known_packages(&state).await,
         RepositoryFormat::Pypi => crate::registry::known_pypi_packages(&state).await,
     }
@@ -269,6 +293,7 @@ async fn selected(
         let state = member.state(root);
         async move {
             let presence = match format {
+                RepositoryFormat::Docker => unreachable!("Docker groups are rejected"),
                 RepositoryFormat::Npm => {
                     crate::registry::npm::stored_package_presence(&state, name).await
                 }
@@ -296,6 +321,16 @@ fn shell_arg(value: &str) -> String {
 }
 
 fn commands(root: &AppState, repository: &Summary, name: &str) -> Vec<Commands> {
+    if repository.format == "docker" {
+        let endpoint = repository.public_url.as_ref().expect("Docker endpoint");
+        let authority = endpoint.split_once("://").expect("validated public URL").1;
+        let reference = shell_arg(&format!("{authority}/{name}:latest"));
+        return vec![Commands {
+            endpoint: endpoint.clone(),
+            install: format!("docker pull {reference}"),
+            publish: (repository.kind == "local").then(|| format!("docker push {reference}")),
+        }];
+    }
     repository
         .paths
         .iter()
@@ -421,6 +456,12 @@ async fn api_package(
     Path((repository, name)): Path<(String, String)>,
     Query(query): Query<PackageQuery>,
 ) -> Response {
+    if docker::is_docker(&root, &repository) {
+        return match docker::data(&root, &repository, &name).await {
+            Ok(data) => Json(data).into_response(),
+            Err(status) => status.into_response(),
+        };
+    }
     match package_data(&root, &repository, &name, &query).await {
         Ok(package) => Json(package).into_response(),
         Err(response) => *response,
@@ -441,6 +482,14 @@ fn command_block(command: &str) -> String {
 fn identity(repository: &Summary, card: bool) -> String {
     let heading = if card { "h2" } else { "h1" };
     let mut body=format!("<div class=\"repository-heading flex items-center gap-3 mb-4\"><{heading} class=\"text-2xl font-bold text-white\">{}</{heading}>{}<span class=\"text-slate-400\">{}</span></div>",components::html_escape(&repository.name),badge(repository.kind),repository.format);
+    if let Some(endpoint) = &repository.public_url {
+        let _ = write!(
+            body,
+            "<p class=\"text-sm text-slate-400 mb-4\">{} · listen port {}</p>",
+            components::html_escape(endpoint),
+            repository.port.unwrap_or(0)
+        );
+    }
     if repository.kind == "group" {
         let _=write!(body,"<p class=\"text-slate-400 mb-4\">First matching package wins. Member order: {}. Group totals are not added to stored inventory.</p>",components::html_escape(&repository.members.join(" → ")));
     }
@@ -497,13 +546,13 @@ async fn index(
         Ok(entries) => entries,
         Err(response) => return *response,
     };
-    let mut body=String::from("<h1 class=\"text-2xl font-bold text-white mb-2\">Repositories</h1><p class=\"text-slate-400 mb-6\">Explicit npm and PyPI endpoints. Browse stored inventory or copy a configured client URL.</p><div class=\"repository-grid\">");
+    let mut body=String::from("<h1 class=\"text-2xl font-bold text-white mb-2\">Repositories</h1><p class=\"text-slate-400 mb-6\">Explicit npm, PyPI and Docker endpoints. Browse stored inventory or copy a configured client URL.</p><div class=\"repository-grid\">");
     for repository in entries {
         let _=write!(body,"<a class=\"block bg-slate-800/50 border border-slate-700/50 rounded-xl p-5 hover:border-sky-500\" href=\"/ui/repositories/{}\">{}<p class=\"text-sm text-slate-400\">{}</p></a>",encode_uri_component(&repository.name),identity(&repository,true),repository.stored_artifacts.map(|count|format!("{count} stored artifacts · {}",components::format_size(repository.stored_bytes.unwrap_or(0)))).unwrap_or_else(||"Read-only member view · no separate cache".into()));
     }
     body.push_str("</div>");
     if root.config.repositories.is_empty() {
-        body.push_str("<p class=\"text-slate-400 mt-6\">No named repositories are configured. Add [repositories.&lt;name&gt;] in the server configuration. No default npm or PyPI repository is created.</p>");
+        body.push_str("<p class=\"text-slate-400 mt-6\">No named repositories are configured. Add [repositories.&lt;name&gt;] in the server configuration. No default npm, PyPI or Docker repository is created.</p>");
     }
     page(&root, &headers, "Repositories", &body)
 }
@@ -979,6 +1028,9 @@ async fn package(
     authority: Option<Extension<crate::auth::NamespaceAuthority>>,
     headers: HeaderMap,
 ) -> Response {
+    if docker::is_docker(&root, &repository) {
+        return docker::render(&root, &repository, &name, &headers).await;
+    }
     let package = match package_data(&root, &repository, &name, &query).await {
         Ok(package) => package,
         Err(response) => return *response,

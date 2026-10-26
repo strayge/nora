@@ -10,7 +10,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 
 | Format | Pull (proxy/cache) | Push/Publish | Default Upstream | Notes |
 |--------|:---:|:---:|---|---|
-| Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
+| Docker Registry v2 | ✅ | ✅ | Explicit per proxy | Named local/proxy repositories on distinct ports; no implicit upstream ([guide](docs/docker-repositories.md)) |
 | Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
 | npm | ✅ | ✅ | none | explicit named local/proxy/group repositories; local-only publishing |
 | Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
@@ -60,16 +60,15 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 - Digest references (`sha256:…`) are content-addressed: cached forever, never
   revalidated.
 - Tag references on **proxied** images are revalidated against the upstream on
-  every pull by default (`docker.metadata_ttl = -1`). A positive
+  every pull by default (per-repository `metadata_ttl = 0`). A positive
   `metadata_ttl` (seconds) is the staleness bound: within the window the
   cached tag is served without an upstream round trip; after it, the next pull
   revalidates. `0` or negative always revalidates.
-- If every configured upstream fails and `docker.serve_stale = true`
-  (default), the last cached manifest is served with `x-nora-stale: true`.
-- Locally **pushed** (hosted) images are authoritative: a pushed tag is served
-  as-is and never revalidated against an upstream. Pushing to a name that
-  would otherwise proxy pins that tag to the pushed copy — to keep a tag
-  tracking the upstream, do not push to it.
+- If a proxy repository's upstream fails, the last cached manifest is served
+  with `x-nora-stale: true`.
+- Local repositories serve published images without upstream revalidation.
+  Proxy repositories reject pushes (405); publishing the same image name into
+  a local repository does not pin or change a proxy's cache.
 
 ### Known Limitations
 - Max 2-level image path: `org/image:tag` works, `org/sub/path/image:tag` returns 404

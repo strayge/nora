@@ -6,7 +6,7 @@
 pub(crate) mod groups;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Bytes;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,9 @@ pub(crate) struct Repository {
     index: Arc<RepoIndex>,
     locks: PublishLocks,
     coalesce: InflightMap<Bytes>,
+    docker_auth: OnceLock<Arc<crate::registry::DockerAuth>>,
+    blob_flights: InflightMap<crate::registry::docker::SpoolShare>,
+    pull_stats: Arc<crate::registry::docker::PullStatsAccumulator>,
     pub npm_refreshes: InflightMap<crate::registry::npm::MetadataRefresh>,
     pub pypi_refreshes: InflightMap<tokio::sync::watch::Receiver<crate::registry::PypiRefresh>>,
     pub pypi_transfers: InflightMap<Arc<crate::registry::PypiTransfer>>,
@@ -57,6 +60,13 @@ impl RepositoryCatalogue {
 
     /// An advisory inventory scan must neither delay startup nor invalidate good identities.
     pub(crate) async fn warn_retained(&self, root: &Storage) {
+        match root.list("docker/").await {
+            Ok(keys) if !keys.is_empty() => tracing::warn!(
+                "Legacy Docker data retained; republish into a named local repository"
+            ),
+            Err(error) => tracing::warn!(%error, "Retained Docker inventory unavailable"),
+            _ => {}
+        }
         match self.retained_namespaces(root).await {
             Ok(namespaces) => {
                 for namespace in namespaces {
@@ -138,43 +148,34 @@ impl RepositoryCatalogue {
                 );
                 continue;
             }
-            let source_id =
-                source_id(definition).map_err(|error| format!("repository {name}: {error}"))?;
-            let storage = root
-                .scoped(&format!("{prefix}/sources/{source_id}"))
-                .map_err(|_| format!("repository {name}: invalid namespace"))?;
-            let transport = match definition {
-                RepositoryConfig::Proxy(policy) => {
-                    if !policy.tls_verify {
-                        tracing::warn!(repository = %name, "TLS certificate verification disabled for configured upstream origin");
-                    }
-                    Some(
-                        crate::registry::transport::RepositoryTransport::new(policy, &config.tls)
-                            .map_err(|error| format!("repository {name}: {error}"))?,
-                    )
-                }
-                _ => None,
-            };
             members.insert(
                 name.clone(),
-                Arc::new(Repository {
-                    name: name.clone(),
-                    definition: definition.clone(),
-                    source_id,
-                    storage,
-                    transport,
-                    pypi_snapshots: parking_lot::RwLock::default(),
-                    config: Arc::new(protocol_config(config, definition)),
-                    index: Arc::new(RepoIndex::new()),
-                    locks: Arc::default(),
-                    coalesce: InflightMap::new(),
-                    npm_refreshes: InflightMap::new(),
-                    pypi_refreshes: InflightMap::new(),
-                    pypi_transfers: InflightMap::new(),
-                }),
+                Repository::new(config, name, definition, root)?,
             );
         }
         Ok(Self { members, groups })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_fixture(config: &Config, root: &Storage) -> Self {
+        let members = config
+            .repositories
+            .iter()
+            .map(|(name, definition)| {
+                assert!(
+                    !matches!(definition, RepositoryConfig::Group(_)),
+                    "group fixtures must open real identities"
+                );
+                (
+                    name.clone(),
+                    Repository::new(config, name, definition, root).expect("protocol fixture"),
+                )
+            })
+            .collect();
+        Self {
+            members,
+            groups: BTreeMap::new(),
+        }
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<Repository>> {
@@ -256,12 +257,19 @@ impl RepositoryCatalogue {
     pub(crate) fn routes(&self, root: &AppState) -> axum::Router<AppState> {
         let mut routes = axum::Router::new();
         for member in self.mounted_members(&root.enabled_registries) {
+            if member.definition.format() == RepositoryFormat::Docker {
+                if member.definition.port(&root.config.server) == root.config.server.port {
+                    routes = routes.merge(member.docker_routes(root));
+                }
+                continue;
+            }
             let mut aliases = axum::Router::new();
             for prefix in member.definition.paths() {
                 let publish = matches!(member.definition, RepositoryConfig::Local(_));
                 aliases = aliases.merge(match member.definition.format() {
                     RepositoryFormat::Pypi => crate::registry::pypi_routes_at(prefix, publish),
                     RepositoryFormat::Npm => crate::registry::npm::routes_at(prefix, publish),
+                    RepositoryFormat::Docker => unreachable!("Docker uses port mounts"),
                 });
             }
             routes = routes.merge(aliases.with_state(member.state(root)));
@@ -273,6 +281,7 @@ impl RepositoryCatalogue {
             for prefix in &group.definition.paths {
                 routes = routes.merge(
                     match group.definition.format {
+                        RepositoryFormat::Docker => unreachable!("Docker groups are rejected"),
                         RepositoryFormat::Pypi => {
                             crate::registry::pypi_group_routes_at(prefix, group.clone())
                         }
@@ -346,6 +355,7 @@ impl RepositoryCatalogue {
             .instrument(tracing::info_span!("repository_gc", repository = %member.name))
             .await;
             let changed = result.removed_anything();
+            total.docker_mark_failed |= result.docker_mark_failed;
             total.total_candidates += result.total_candidates;
             total.orphaned += result.orphaned;
             total.deleted += result.deleted;
@@ -414,6 +424,9 @@ impl RepositoryCatalogue {
             if !root.config.gc.dry_run && result.removed_anything() {
                 member.index.invalidate_all();
             }
+            if result.docker_mark_failed {
+                tracing::error!(repository = %member.name, "Docker GC incomplete: manifest marking failed");
+            }
             tracing::info!(repository = %member.name, source = %member.source_id,
                 deleted = result.deleted, "Named repository GC finished");
         }
@@ -467,6 +480,7 @@ impl RepositoryCatalogue {
         for registry in [
             crate::registry_type::RegistryType::Npm,
             crate::registry_type::RegistryType::PyPI,
+            crate::registry_type::RegistryType::Docker,
         ] {
             let (mut packages, mut bytes) = (0, 0);
             for member in self
@@ -517,16 +531,68 @@ impl RepositoryCatalogue {
 }
 
 impl Repository {
+    fn new(
+        config: &Config,
+        name: &str,
+        definition: &RepositoryConfig,
+        root: &Storage,
+    ) -> Result<Arc<Self>, String> {
+        let source_id =
+            source_id(definition).map_err(|error| format!("repository {name}: {error}"))?;
+        let storage = root
+            .scoped(&format!("repositories/{name}/sources/{source_id}"))
+            .map_err(|_| format!("repository {name}: invalid namespace"))?;
+        let transport = match definition {
+            RepositoryConfig::Proxy(policy) if policy.format != RepositoryFormat::Docker => {
+                if !policy.tls_verify {
+                    tracing::warn!(
+                        repository = name,
+                        "TLS certificate verification disabled for configured upstream origin"
+                    );
+                }
+                Some(
+                    crate::registry::transport::RepositoryTransport::new(policy, &config.tls)
+                        .map_err(|error| format!("repository {name}: {error}"))?,
+                )
+            }
+            _ => None,
+        };
+        Ok(Arc::new(Self {
+            name: name.into(),
+            definition: definition.clone(),
+            source_id,
+            storage,
+            transport,
+            pypi_snapshots: parking_lot::RwLock::default(),
+            config: Arc::new(protocol_config(config, definition)),
+            index: Arc::new(RepoIndex::new()),
+            locks: Arc::default(),
+            coalesce: InflightMap::new(),
+            docker_auth: OnceLock::new(),
+            blob_flights: InflightMap::new(),
+            pull_stats: Arc::default(),
+            npm_refreshes: InflightMap::new(),
+            pypi_refreshes: InflightMap::new(),
+            pypi_transfers: InflightMap::new(),
+        }))
+    }
+
     pub(crate) fn registry_type(&self) -> crate::registry_type::RegistryType {
-        match self.definition.format() {
-            RepositoryFormat::Npm => crate::registry_type::RegistryType::Npm,
-            RepositoryFormat::Pypi => crate::registry_type::RegistryType::PyPI,
-        }
+        self.definition.format().registry_type()
     }
 
     /// Shared security and shutdown services remain attached to the running server.
     pub(crate) fn breaker_key(&self) -> String {
         crate::circuit_breaker::repository_key(self.registry_type(), &self.name, &self.source_id)
+    }
+
+    pub(crate) fn docker_routes(self: &Arc<Self>, root: &AppState) -> axum::Router<AppState> {
+        crate::registry::docker::routes()
+            .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                axum::http::HeaderValue::from_static("sandbox"),
+            ))
+            .with_state(self.state(root))
     }
 
     pub(crate) fn state(self: &Arc<Self>, root: &AppState) -> AppState {
@@ -543,6 +609,16 @@ impl Repository {
         view.repo_index = Arc::clone(&self.index);
         view.publish_locks = Arc::clone(&self.locks);
         view.proxy_coalesce = self.coalesce.clone();
+        if self.definition.format() == RepositoryFormat::Docker {
+            view.docker_auth = Arc::clone(self.docker_auth.get_or_init(|| {
+                Arc::new(crate::registry::DockerAuth::new(
+                    root.http_client.clone(),
+                    self.config.docker.proxy_timeout,
+                ))
+            }));
+            view.blob_flights = self.blob_flights.clone();
+            view.pull_stats = Arc::clone(&self.pull_stats);
+        }
         view
     }
 }
@@ -562,6 +638,24 @@ pub(crate) fn source_id(definition: &RepositoryConfig) -> Result<String, &'stati
 fn protocol_config(root: &Config, definition: &RepositoryConfig) -> Config {
     let mut config = root.clone();
     match definition.format() {
+        RepositoryFormat::Docker => {
+            let mut docker = crate::config::DockerConfig {
+                upstreams: Vec::new(),
+                ..crate::config::DockerConfig::default()
+            };
+            if let RepositoryConfig::Proxy(proxy) = definition {
+                docker.upstreams.push(crate::config::DockerUpstream {
+                    url: proxy.upstream.clone(),
+                    auth: proxy.auth.clone(),
+                    namespace: None,
+                    prefix: None,
+                });
+                docker.metadata_ttl = i64::try_from(proxy.metadata_ttl).unwrap_or(i64::MAX);
+                docker.read_timeout = proxy.read_timeout;
+                docker.proxy_timeout = proxy.proxy_timeout.unwrap_or(300);
+            }
+            config.docker = docker;
+        }
         RepositoryFormat::Npm => {
             let mut npm = NpmConfig {
                 proxy: None,

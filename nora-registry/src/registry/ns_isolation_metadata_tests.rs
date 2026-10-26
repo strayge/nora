@@ -590,7 +590,9 @@ async fn conan_internal_recipe_file_served_local() {
 
 #[tokio::test]
 async fn docker_internal_manifest_miss_get_404_not_403() {
+    let _lock = crate::test_env::env_lock();
     use crate::config::DockerUpstream;
+    use crate::test_helpers::docker::create_test_context_with_config;
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
@@ -623,7 +625,9 @@ async fn docker_internal_manifest_miss_get_404_not_403() {
 
 #[tokio::test]
 async fn docker_internal_manifest_miss_head_404_not_403() {
+    let _lock = crate::test_env::env_lock();
     use crate::config::DockerUpstream;
+    use crate::test_helpers::docker::create_test_context_with_config;
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
@@ -650,7 +654,9 @@ async fn docker_internal_manifest_miss_head_404_not_403() {
 
 #[tokio::test]
 async fn docker_internal_referrers_tag_miss_head_404() {
+    let _lock = crate::test_env::env_lock();
     use crate::config::DockerUpstream;
+    use crate::test_helpers::docker::create_test_context_with_config;
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
@@ -678,7 +684,9 @@ async fn docker_internal_referrers_tag_miss_head_404() {
 
 #[tokio::test]
 async fn docker_internal_blob_miss_get_404_and_head_agrees() {
+    let _lock = crate::test_env::env_lock();
     use crate::config::DockerUpstream;
+    use crate::test_helpers::docker::create_test_context_with_config;
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
         c.docker.upstreams = vec![DockerUpstream {
@@ -711,6 +719,8 @@ async fn docker_internal_blob_miss_get_404_and_head_agrees() {
 
 #[tokio::test]
 async fn docker_internal_manifest_served_local_still_ok() {
+    let _lock = crate::test_env::env_lock();
+    use crate::test_helpers::docker::create_test_context_with_config;
     // Regression guard: the #821 fix touches only the MISS branch; a locally-hosted internal
     // manifest must still be served 200 (serve-local, #733), never namespace-blocked.
     let ctx = create_test_context_with_config(|c| {
@@ -726,7 +736,7 @@ async fn docker_internal_manifest_served_local_still_ok() {
         },
         "layers": []
     });
-    // No upstream configured → canonicalize namespace is None → key docker/<name>/manifests/<ref>.json.
+    // The fixture storage is already scoped to the local repository.
     ctx.state
         .storage
         .put(
@@ -758,6 +768,8 @@ async fn docker_internal_manifest_served_local_still_ok() {
 
 #[tokio::test]
 async fn docker_internal_miss_increments_isolation_refused_metric() {
+    let _lock = crate::test_env::env_lock();
+    use crate::test_helpers::docker::create_test_context_with_config;
     let ctx = create_test_context_with_config(|c| {
         c.curation.internal_namespaces = vec!["internal/**".to_string()];
     });
@@ -866,6 +878,7 @@ fn public_twin(path: &str) -> String {
 
 #[tokio::test]
 async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
+    let _lock = crate::test_env::env_lock();
     use wiremock::matchers::any;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -876,7 +889,7 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
         .await;
     let uri = upstream.uri();
     let seed_uri = uri.clone();
-    let ctx = create_test_context_with_config(move |c| {
+    let mut ctx = crate::test_helpers::docker::create_test_context_with_config(move |c| {
         c.server.trust_upstream_dates = true;
         c.curation.internal_namespaces = vec!["internal*".to_string()];
         c.npm.proxy = Some(uri.clone());
@@ -905,6 +918,7 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
             prefix: None,
         }];
     });
+    ctx.state = ctx.root.take().unwrap();
     // Terraform metadata cached before the namespace became internal still names an upstream
     // URL for a provider's files and a module's archive; the public twin's names the same
     // upstream.

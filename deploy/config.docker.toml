@@ -24,6 +24,10 @@ path = "/data/storage"               # backed by the /data volume
 [auth]
 token_storage = "/data/tokens"
 
+[repositories.docker-local]
+format = "docker"
+kind = "local"
+
 # npm/PyPI have no implicit repositories. Add explicit local/proxy/group entries
 # and aliases in your mounted config; see docs/repositories.md. Singleton [npm],
 # [pypi] and their old environment settings are rejected.

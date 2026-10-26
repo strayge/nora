@@ -1538,8 +1538,16 @@ fn swagger_ui_file(name: &str) -> Response {
 fn configured_spec(state: &AppState) -> utoipa::openapi::OpenApi {
     let mut spec = ApiDoc::openapi();
     let templates = spec.paths.paths.clone();
+    let main_docker = state.repositories.members().find(|member| {
+        member.registry_type() == crate::registry_type::RegistryType::Docker
+            && state
+                .enabled_registries
+                .contains(&crate::registry_type::RegistryType::Docker)
+            && member.definition.port(&state.config.server) == state.config.server.port
+    });
     spec.paths.paths.retain(|path, item| {
-        !path.starts_with("/npm/")
+        (!path.starts_with("/v2/") || main_docker.is_some())
+            && !path.starts_with("/npm/")
             && !path.starts_with("/simple/")
             && ![
                 item.get.as_ref(),
@@ -1562,8 +1570,24 @@ fn configured_spec(state: &AppState) -> utoipa::openapi::OpenApi {
                     .any(|format| !state.enabled_registries.contains(&format))
             })
     });
+    if main_docker.is_some_and(|member| {
+        matches!(
+            member.definition,
+            crate::config::repositories::RepositoryConfig::Proxy(_)
+        )
+    }) {
+        for (path, item) in &mut spec.paths.paths {
+            if path.starts_with("/v2/") {
+                item.put = None;
+                item.post = None;
+                item.patch = None;
+                item.delete = None;
+            }
+        }
+    }
     for (repository, definition) in &state.config.repositories {
         let (prefix, format) = match definition.format() {
+            crate::config::repositories::RepositoryFormat::Docker => continue,
             crate::config::repositories::RepositoryFormat::Npm => {
                 ("/npm", crate::registry_type::RegistryType::Npm)
             }
@@ -1657,7 +1681,46 @@ mod tests {
             paths["/all/{name}"]["get"].is_object() && paths["/all/{name}"].get("put").is_none()
         );
         assert!(paths["/python/"]["get"].is_object() && paths["/python/"].get("post").is_none());
-        assert!(paths["/v2/"]["get"].is_object());
+        assert!(paths.get("/v2/").is_none(), "no implicit Docker repository");
+    }
+
+    #[tokio::test]
+    async fn docker_spec_matches_the_main_port_repository_and_its_write_policy() {
+        let _lock = crate::test_env::env_lock();
+        for (definition, visible, writable) in [
+            ("kind='local'", true, true),
+            ("kind='proxy'\nupstream='http://127.0.0.1:1'", true, false),
+            ("kind='local'\nport=4101", false, false),
+        ] {
+            let context = crate::test_helpers::with_named_repositories(
+                crate::test_helpers::create_test_context_with_config(|config| {
+                    config.server.port = 4100;
+                    config.repositories = toml::from_str::<crate::config::Config>(&format!(
+                        "[repositories.images]\nformat='docker'\n{definition}\n"
+                    ))
+                    .unwrap()
+                    .repositories;
+                }),
+            )
+            .await;
+            let spec = serde_json::to_value(super::configured_spec(&context.state)).unwrap();
+            let paths = &spec["paths"];
+            assert_eq!(paths["/v2/"]["get"].is_object(), visible, "{definition}");
+            let manifest = &paths["/v2/{name}/manifests/{reference}"];
+            assert_eq!(manifest["get"].is_object(), visible, "{definition}");
+            assert_eq!(manifest["put"].is_object(), writable, "{definition}");
+            assert_eq!(manifest["delete"].is_object(), writable, "{definition}");
+            assert_eq!(
+                paths["/v2/{name}/blobs/uploads/"]["post"].is_object(),
+                writable,
+                "{definition}"
+            );
+            assert_eq!(
+                paths["/v2/{name}/blobs/uploads/{uuid}"]["patch"].is_object(),
+                writable,
+                "{definition}"
+            );
+        }
     }
 
     #[tokio::test]

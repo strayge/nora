@@ -159,13 +159,16 @@ pub struct MountPoint {
 pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
     // Trigger index rebuild if needed, then get counts
     for reg in state.enabled_registries.iter() {
-        if !matches!(reg, RegistryType::Npm | RegistryType::PyPI) {
+        if !matches!(
+            reg,
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+        ) {
             let _ = state.repo_index.get(reg.as_str(), &state.storage).await;
         }
     }
 
     let mut counts = state.repo_index.counts();
-    for reg in [RegistryType::Npm, RegistryType::PyPI] {
+    for reg in [RegistryType::Docker, RegistryType::Npm, RegistryType::PyPI] {
         let total = if state.enabled_registries.contains(&reg) {
             state.repositories.stored_totals(reg).await.0
         } else {
@@ -219,7 +222,10 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
         }
 
         let name = reg.as_str();
-        let (versions, size) = if matches!(reg, RegistryType::Npm | RegistryType::PyPI) {
+        let (versions, size) = if matches!(
+            reg,
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+        ) {
             let (_, artifacts, bytes) = state.repositories.stored_totals(*reg).await;
             (artifacts, bytes)
         } else {
@@ -241,13 +247,29 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             size_bytes: size,
         });
 
-        if matches!(reg, RegistryType::Npm | RegistryType::PyPI) {
+        if matches!(
+            reg,
+            RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI
+        ) {
             for (repository, definition) in &state.config.repositories {
-                let format = match definition.format() {
-                    crate::config::repositories::RepositoryFormat::Npm => RegistryType::Npm,
-                    crate::config::repositories::RepositoryFormat::Pypi => RegistryType::PyPI,
-                };
+                let format = definition.format().registry_type();
                 if format == *reg {
+                    if format == RegistryType::Docker {
+                        mount_points.push(MountPoint {
+                            registry: format!("{repository} ({name})"),
+                            mount_path: definition.docker_public_url(&state.config.server),
+                            proxy_upstreams: if authenticated {
+                                match definition {
+                                    crate::config::repositories::RepositoryConfig::Proxy(proxy) => {
+                                        vec![proxy.upstream.clone()]
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            } else {
+                                Vec::new()
+                            },
+                        });
+                    }
                     for path in definition.paths() {
                         mount_points.push(MountPoint {
                             registry: format!("{repository} ({name})"),
@@ -343,7 +365,7 @@ pub async fn api_list(
 ) -> Response {
     if matches!(
         RegistryType::from_str_opt(&registry_type),
-        Some(RegistryType::Npm | RegistryType::PyPI)
+        Some(RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI)
     ) {
         return super::repositories::selection_required();
     }
@@ -357,13 +379,16 @@ pub async fn api_detail(
 ) -> Response {
     if matches!(
         RegistryType::from_str_opt(&registry_type),
-        Some(RegistryType::Npm | RegistryType::PyPI)
+        Some(RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI)
     ) {
         return super::repositories::selection_required();
     }
     let result = match RegistryType::from_str_opt(&registry_type) {
         Some(RegistryType::Docker) => {
-            let detail = get_docker_detail(&state, &name).await;
+            let detail = match get_docker_detail(&state, &name).await {
+                Ok(detail) => detail,
+                Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         Some(RegistryType::Npm) => {
@@ -386,7 +411,7 @@ pub async fn api_search(
 ) -> Response {
     if matches!(
         RegistryType::from_str_opt(&registry_type),
-        Some(RegistryType::Npm | RegistryType::PyPI)
+        Some(RegistryType::Docker | RegistryType::Npm | RegistryType::PyPI)
     ) {
         return super::repositories::selection_required();
     }
@@ -444,45 +469,36 @@ pub async fn api_search(
     axum::response::Html(html).into_response()
 }
 
-pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
-    // List the bare-name manifests plus, for each configured upstream namespace,
-    // this image's namespaced copy (docker/{ns}/{name}/manifests/). That is a
-    // bounded number of listings — one per upstream — instead of scanning every
-    // key under docker/, whose cost grew with the whole registry, not the
-    // repository being viewed (#986).
-    let mut keys = state
-        .storage
-        .list(&format!("docker/{}/manifests/", name))
-        .await
-        .unwrap_or_default();
+pub async fn get_docker_detail(
+    state: &AppState,
+    name: &str,
+) -> Result<DockerDetail, crate::storage::StorageError> {
+    let prefix = format!("docker/{name}/manifests/");
+    let mut keys = state.storage.list(&prefix).await?;
 
-    for upstream in &state.config.docker.upstreams {
-        let ns = upstream.resolved_namespace();
-        if ns.is_empty() {
-            continue;
-        }
-        keys.extend(
-            state
-                .storage
-                .list(&format!("docker/{}/{}/manifests/", ns, name))
-                .await
-                .unwrap_or_default(),
-        );
-    }
     keys.sort();
     keys.dedup();
 
     // Scheme-less host authority for `docker pull` commands.
-    let registry_host = state.config.server.public_host();
+    let registry_host = if let Some(repository) = &state.repository {
+        let endpoint = repository
+            .definition
+            .docker_public_url(&state.config.server);
+        endpoint
+            .split_once("://")
+            .expect("validated Docker public URL")
+            .1
+            .to_owned()
+    } else {
+        state.config.server.public_host()
+    };
 
     let mut tags = Vec::new();
     for key in &keys {
-        // The tag is the segment after `/manifests/`, whatever the namespace
-        // prefix (docker/{name}/... or docker/{ns}/{name}/...); sidecars and
-        // digest copies are not tags.
+        // Recursive listings can include another image with a literal `manifests` component.
         let tag_name = key
-            .find("/manifests/")
-            .map(|idx| &key[idx + "/manifests/".len()..])
+            .strip_prefix(&prefix)
+            .filter(|file| !file.contains('/'))
             .and_then(crate::registry::docker::tag_from_manifest_file);
 
         if let Some(tag_name) = tag_name {
@@ -573,7 +589,7 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
         }
     }
 
-    DockerDetail { tags }
+    Ok(DockerDetail { tags })
 }
 
 /// List immediate children of a Maven namespace path for hierarchical browsing.
@@ -2389,7 +2405,7 @@ mod docker_detail_tests {
         )
         .await
         .unwrap();
-        let d = super::get_docker_detail(&ctx.state, "img").await;
+        let d = super::get_docker_detail(&ctx.state, "img").await.unwrap();
         let names: Vec<_> = d.tags.iter().map(|t| t.name.clone()).collect();
         assert_eq!(names, vec!["v1".to_string()]);
         assert_eq!(d.tags[0].downloads, 4);

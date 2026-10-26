@@ -39,7 +39,6 @@ pub use cargo_registry::routes as cargo_routes;
 pub use conan::routes as conan_routes;
 pub use cpan::routes as cpan_routes;
 pub use deb::routes as deb_routes;
-pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
 pub use gems::routes as gems_routes;
 pub use go::routes as go_routes;
@@ -1822,11 +1821,19 @@ mod first_download_integrity {
         .unwrap();
         let allowlist = allowlist.to_string_lossy().into_owned();
         // The allowlist is read when the context is built; the directory may go after that.
-        let ctx = create_test_context_with_config(move |cfg| {
+        let docker = entries
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry["registry"] == "docker"));
+        let configure_context = move |cfg: &mut Config| {
             configure(cfg, url);
             cfg.curation.mode = CurationMode::Enforce;
             cfg.curation.allowlist_path = Some(allowlist);
-        });
+        };
+        let ctx = if docker {
+            crate::test_helpers::docker::create_test_context_with_config(configure_context)
+        } else {
+            create_test_context_with_config(configure_context)
+        };
         drop(dir);
         ctx
     }
@@ -3119,7 +3126,12 @@ mod upstream_failure_matrix {
                 urls.push(url);
                 servers.push(server);
             }
-            let ctx = create_test_context_with_config(move |cfg| configure(cfg, urls));
+            let setup = move |cfg: &mut Config| configure(cfg, urls);
+            let ctx = if path.starts_with("/v2/") {
+                crate::test_helpers::docker::create_test_context_with_config(setup)
+            } else {
+                create_test_context_with_config(setup)
+            };
             let resp = send(&ctx.app, Method::GET, path, Body::empty()).await;
             assert_eq!(resp.status(), expected(shapes), "{path} {shapes:?}");
             drop(servers);
@@ -3183,13 +3195,13 @@ mod upstream_failure_matrix {
 
     #[tokio::test]
     async fn docker_manifest() {
-        run("/v2/myorg/app/manifests/1.0", docker, true).await;
+        run("/v2/myorg/app/manifests/1.0", docker, false).await;
     }
 
     #[tokio::test]
     async fn docker_blob() {
         let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
-        run(&format!("/v2/myorg/app/blobs/{blob}"), docker, true).await;
+        run(&format!("/v2/myorg/app/blobs/{blob}"), docker, false).await;
     }
 
     #[tokio::test]

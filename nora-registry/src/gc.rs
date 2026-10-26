@@ -212,8 +212,15 @@ async fn run_gc_inner(
     let mut all_orphans: Vec<String> = Vec::new();
     let mut total_candidates = 0usize;
 
-    // Docker orphan detection (existing logic)
-    let docker_result = detect_docker_orphans(storage).await;
+    let docker_result = if include_package_roots {
+        detect_docker_orphans(storage).await
+    } else {
+        DockerDetectionResult {
+            total: 0,
+            orphans: Vec::new(),
+            failed: false,
+        }
+    };
     total_candidates += docker_result.total;
     let docker_mark_failed = docker_result.failed;
     all_orphans.extend(docker_result.orphans);
@@ -3890,39 +3897,6 @@ mod docker_gc_reachability {
             storage.get("docker/b/blobs/sha256:shared").await.is_ok(),
             "a mounted blob was deleted before its manifest landed: {:?}",
             result.orphan_keys
-        );
-    }
-
-    // A namespaced manifest can reference a blob stranded at the legacy
-    // (un-namespaced) key — a partial key migration, or a flat blob still served
-    // through the ns→legacy read fallback (storage_get_reader_with_fallback). The server
-    // serves it; GC must keep it, mirroring the fallback the serve path honors.
-    #[tokio::test]
-    async fn a_namespaced_manifest_keeps_its_legacy_keyed_blobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
-        put(&storage, "docker/library/nginx/blobs/sha256:cfg", b"cfg").await;
-        put(
-            &storage,
-            "docker/library/nginx/blobs/sha256:layer",
-            b"layer",
-        )
-        .await;
-        manifest(
-            &storage,
-            "docker.io/library/nginx",
-            Some("latest"),
-            image("sha256:cfg", &["sha256:layer"]),
-        )
-        .await;
-
-        let deleted = would_delete(&storage).await;
-        kept(
-            &deleted,
-            &[
-                "docker/library/nginx/blobs/sha256:cfg".to_string(),
-                "docker/library/nginx/blobs/sha256:layer".to_string(),
-            ],
         );
     }
 }

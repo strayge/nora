@@ -1,7 +1,9 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, PackageMetadata};
+#[cfg(test)]
+use super::api::DockerDetail;
+use super::api::{DashboardResponse, MavenDetail, PackageDetail, PackageMetadata};
 use super::components::*;
 use super::i18n::{get_translations, Lang};
 use crate::registry_type::RegistryType;
@@ -449,6 +451,7 @@ pub fn render_registry_list_paginated(
 }
 
 /// Renders Docker image detail page
+#[cfg(test)]
 pub fn render_docker_detail(
     name: &str,
     detail: &DockerDetail,

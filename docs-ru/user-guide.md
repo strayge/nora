@@ -40,11 +40,16 @@ registry=http://nora.example.com:4000/npm
 
 ### 2.2. Docker
 
+Адрес выбирает именованный репозиторий: `local` принимает публикации, `proxy` кэширует один upstream и отклоняет запись. В примере администратор настроил local на `:4000`, proxy Docker Hub на `:5001`. Адреса и команды доступны в `/ui/repositories?format=docker`.
+
 ```bash
 docker login nora.example.com:4000
-docker pull nora.example.com:4000/library/nginx:latest
+docker login nora.example.com:5001
+docker pull nora.example.com:5001/library/nginx:latest
 docker push nora.example.com:4000/myteam/myapp:1.0.0
 ```
+
+Для прямого HTTP-подключения настройте Docker `insecure-registries` для выбранных адресов либо используйте reverse proxy с TLS. Номер порта сам по себе не включает TLS. См. [Docker-репозитории и порты](../docs/docker-repositories.md).
 
 ### 2.3. Maven
 
@@ -109,6 +114,8 @@ npm publish --registry http://nora.example.com:4000/npm-local/
 - Каждая версия публикуется однократно. Повторная публикация той же версии запрещена.
 
 ### 3.2. Docker
+
+Публикуйте только в local-репозиторий; ниже используется его адрес `:4000`. Proxy на другом порту остаётся независимым и не принимает push.
 
 ```bash
 docker tag myapp:latest nora.example.com:4000/myteam/myapp:1.0.0
@@ -202,8 +209,9 @@ curl -u admin:password http://nora.example.com:4000/auth/token
 npm config set //nora.example.com:4000/npm/:_authToken TOKEN
 npm config set //nora.example.com:4000/npm-local/:_authToken TOKEN
 
-# Docker
+# Docker: отдельно для каждого используемого endpoint
 docker login nora.example.com:4000
+docker login nora.example.com:5001
 
 # curl
 curl -H "Authorization: Bearer TOKEN" http://nora.example.com:4000/npm/my-package

@@ -15,14 +15,7 @@ pub(crate) struct Group {
 }
 impl Group {
     pub fn registry_type(&self) -> crate::registry_type::RegistryType {
-        match self.definition.format {
-            crate::config::repositories::RepositoryFormat::Npm => {
-                crate::registry_type::RegistryType::Npm
-            }
-            crate::config::repositories::RepositoryFormat::Pypi => {
-                crate::registry_type::RegistryType::PyPI
-            }
-        }
+        self.definition.format.registry_type()
     }
 }
 
@@ -51,10 +44,14 @@ pub(crate) fn binding(repository: &Repository) -> String {
     hash.update([0]);
     hash.update(repository.source_id.as_bytes());
     hash.update([0]);
-    hash.update(match repository.definition.format() {
-        crate::config::repositories::RepositoryFormat::Npm => b"npm".as_slice(),
-        crate::config::repositories::RepositoryFormat::Pypi => b"pypi".as_slice(),
-    });
+    hash.update(
+        repository
+            .definition
+            .format()
+            .registry_type()
+            .as_str()
+            .as_bytes(),
+    );
     hex::encode(hash.finalize())
 }
 

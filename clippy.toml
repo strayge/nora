@@ -6,7 +6,7 @@ type-complexity-threshold = 300
 # Module boundaries the compiler resolves. Each list is denied only where its module turns the
 # lint on (`#![cfg_attr(not(test), deny(...))]`), and allowed at the crate roots:
 #   * ui/ calls no Storage write: the methods of `impl Storage` that are not reads
-#     (get, get_verified, get_reader, get_range, list, list_internal, list_with_meta, stat,
+#     (get, get_verified, get_reader, get_range, exists, list, list_internal, list_with_meta, stat,
 #     total_size, backend_name, pin). A new Storage method that writes goes on this list;
 #     tests/storage_boundary_list.rs fails until every method is on one side;
 #   * registry/ names no concrete backend: a handler reaches storage through Storage (ADR-3).
@@ -21,6 +21,7 @@ disallowed-methods = [
   { path = "nora::storage::Storage::prepare", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::health_check", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::refresh_total_size_cache", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::scoped", reason = "the UI obtains repository-selected storage; it does not construct scopes" },
   { path = "nora::storage::Storage::new_local", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::new_s3", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::new_gcs", reason = "the UI is read-only browse" },

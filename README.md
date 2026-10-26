@@ -2,7 +2,7 @@
 
 **One binary, seventeen package formats, no database.** NORA is a self-hosted artifact registry and pull-through cache for Docker, Maven, npm, PyPI, Cargo, Go and more, with supply-chain controls built in.
 
-> **Fork notice:** npm/PyPI repositories and proxy behavior differ from upstream.
+> **Fork notice:** npm/PyPI/Docker repositories and proxy behavior differ from upstream.
 > See [FORK.md](FORK.md) for the changes, migration notes and build guidance.
 
 [![Release](https://img.shields.io/github/v/release/getnora-io/nora)](https://github.com/getnora-io/nora/releases)
@@ -31,7 +31,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/): the registry is rea
 - **Seventeen formats, hosted and proxied.** One registry for containers, language packages, OS packages and Hugging Face models, on local disk, S3-compatible storage or Google Cloud Storage.
 - **What you publish stays yours.** A package, crate or image published to NORA is never replaced by an upstream package of the same name. Curation — allowlist, blocklist, minimum release age, quarantine of new versions, internal namespaces — decides what reaches your builds.
 - **Ready to operate.** A web UI in English, Russian and Chinese, API tokens with read, write and admin roles, keyless publishing from GitHub Actions and GitLab CI with OIDC, rate limits, an audit log and Prometheus metrics.
-- **Works without the internet.** Retained caches serve offline; `nora mirror` and `nora import` support eligible formats, and `nora backup` / `nora restore` keep a copy. npm/PyPI use explicit client endpoints ([repository guide](docs/repositories.md)).
+- **Works without the internet.** Retained caches serve offline; `nora mirror` and `nora import` support eligible formats, and `nora backup` / `nora restore` keep a copy. Docker/npm/PyPI use explicit client endpoints ([repository guide](docs/repositories.md)).
 
 ## Supported formats
 
@@ -69,7 +69,7 @@ Upgrading: [upgrade guide](https://getnora.dev/deployment/upgrade-guide/).
 
 ## Use
 
-The npm/PyPI commands below assume `/npm/` and `/simple/` were explicitly configured as aliases. Use `/ui/repositories` to choose a repository and copy its commands; publish directly to a local repository, not a group or proxy.
+The container configuration defines a local Docker repository on the main port. Extra Docker repositories use distinct ports ([Docker guide](docs/docker-repositories.md)). npm/PyPI commands assume `/npm/` and `/simple/` were explicitly configured as aliases. Use `/ui/repositories` to copy client commands; publish directly to a local repository.
 
 ```bash
 # Docker
@@ -95,7 +95,7 @@ NORA_CURATION_QUARANTINE=enforce \
   docker run -d -p 4000:4000 -v nora-data:/data getnora/nora:latest
 ```
 
-Named npm/PyPI configuration, groups, TLS/timeouts, cache readiness and singleton conversion: [repository guide](docs/repositories.md).
+Named npm/PyPI configuration, groups, TLS/timeouts and cache readiness: [repository guide](docs/repositories.md). Docker ports, proxy settings and singleton migration: [Docker guide](docs/docker-repositories.md).
 
 All settings: [configuration reference](https://getnora.dev/configuration/settings/), [curation](https://getnora.dev/configuration/curation/), [authentication](https://getnora.dev/configuration/authentication/), [S3 storage](https://getnora.dev/configuration/s3-storage/). Metrics and dashboards: [MONITORING.md](MONITORING.md).
 

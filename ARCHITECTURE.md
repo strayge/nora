@@ -182,7 +182,6 @@ nora/
 │   ├── circuit_breaker.rs   # Per-registry circuit breaker for upstream proxy calls
 │   ├── proxy_coalesce.rs    # Single-flight coalescing on the proxy cache-miss path
 │   ├── cache_ttl.rs         # Unified cache TTL logic for proxy registries
-│   ├── docker_key_migration.rs # Migrate legacy flat Docker keys to namespaced form
 │   │
 │   ├── gc.rs                # Garbage collection (orphan blob cleanup)
 │   ├── retention.rs         # Retention policies (keep-N, max-age)
@@ -382,8 +381,9 @@ formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, CPAN, RPM, Debian,
 Hugging Face) default to disabled; Hugging Face is not part of `all` either —
 only named (`NORA_HF_ENABLED=true`). Any combination is valid — you can run
 NORA with only Docker and PyPI using `NORA_REGISTRIES_ENABLE=docker,pypi`.
-npm/PyPI additionally require explicit named repository definitions; enabling their
-format does not create a default repository or HTTP alias. The `RegistryType::all()` iterator and `enabled_registries()` method
+Docker/npm/PyPI additionally require explicit named repository definitions; enabling
+these formats does not create default repositories. Docker selects repositories by
+port; npm/PyPI use explicit HTTP aliases. The `RegistryType::all()` iterator and `enabled_registries()` method
 let subsystems (health, metrics, UI) auto-discover which formats are
 active.
 

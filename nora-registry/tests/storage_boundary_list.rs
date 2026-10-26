@@ -12,6 +12,7 @@ const READS: &[&str] = &[
     "get_verified",
     "get_reader",
     "get_range",
+    "exists",
     "list",
     "list_internal",
     "list_with_meta",

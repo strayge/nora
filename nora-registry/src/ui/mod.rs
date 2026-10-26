@@ -265,51 +265,12 @@ async fn dashboard(
 }
 
 // Docker pages
-async fn docker_list(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
-    let auth_enabled = state.auth.is_some();
-
-    let all_repos = state.repo_index.get("docker", &state.storage).await;
-    let (repos, total) = paginate(&all_repos, page, limit);
-
-    Html(render_registry_list_paginated(
-        "docker",
-        "Docker Registry",
-        &repos,
-        page,
-        limit,
-        total,
-        lang,
-        auth_enabled,
-    ))
+async fn docker_list() -> Redirect {
+    Redirect::to("/ui/repositories?format=docker")
 }
 
-async fn docker_detail(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
-    let base_url = resolve_base_url(&state);
-    let auth_enabled = state.auth.is_some();
-    let detail = get_docker_detail(&state, &name).await;
-    Html(render_docker_detail(
-        &name,
-        &detail,
-        lang,
-        &base_url,
-        auth_enabled,
-    ))
+async fn docker_detail() -> Redirect {
+    Redirect::to("/ui/repositories?format=docker")
 }
 
 // Maven pages

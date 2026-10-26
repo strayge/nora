@@ -302,11 +302,13 @@ pub(super) async fn read(
         )
     });
     let prefix = match format {
+        RepositoryFormat::Docker => return Err(StatusCode::BAD_REQUEST),
         RepositoryFormat::Npm => format!("npm/{name}/tarballs/"),
         RepositoryFormat::Pypi => format!("pypi/{name}/"),
     };
     let metadata = async {
         match format {
+            RepositoryFormat::Docker => unreachable!("Docker has no distribution inventory"),
             RepositoryFormat::Npm => crate::registry::npm::saved::read(state, name).await,
             RepositoryFormat::Pypi => crate::registry::pypi::saved::read(state, name).await,
         }
@@ -355,6 +357,7 @@ pub(super) async fn read(
             continue;
         };
         let body = match format {
+            RepositoryFormat::Docker => false,
             RepositoryFormat::Npm => filename.ends_with(".tgz"),
             RepositoryFormat::Pypi => {
                 !filename.contains('/')
@@ -365,6 +368,7 @@ pub(super) async fn read(
             continue;
         }
         let raw_version = match format {
+            RepositoryFormat::Docker => None,
             RepositoryFormat::Npm => crate::curation::parse_npm_tarball_version(name, filename),
             RepositoryFormat::Pypi => nora_registry::pypi_files::parse_pypi_version(name, filename),
         };

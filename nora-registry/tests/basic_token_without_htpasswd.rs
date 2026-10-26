@@ -25,6 +25,12 @@ impl Drop for Server {
 
 /// `nora serve` with auth enabled, the token store and storage in `dir`, plus `env`.
 fn serve(dir: &Path, env: &[(&str, &Path)]) -> Server {
+    let config = dir.join("docker.toml");
+    std::fs::write(
+        &config,
+        "[repositories.images]\nformat='docker'\nkind='local'\n",
+    )
+    .unwrap();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -34,7 +40,7 @@ fn serve(dir: &Path, env: &[(&str, &Path)]) -> Server {
     command
         .arg("serve")
         .current_dir(dir)
-        .env_remove("NORA_CONFIG_PATH")
+        .env("NORA_CONFIG_PATH", &config)
         .env("NORA_HOST", "127.0.0.1")
         .env("NORA_PORT", port.to_string())
         .env("NORA_STORAGE_PATH", dir.join("data"))
@@ -139,7 +145,8 @@ fn an_api_token_as_the_basic_password_works_without_htpasswd() {
     let oidc = dir.path().join("oidc.toml");
     std::fs::write(
         &oidc,
-        "[auth.oidc]\nenabled = true\n[[auth.oidc.providers]]\nname = \"ci\"\n\
+        "[repositories.images]\nformat='docker'\nkind='local'\n\
+         [auth.oidc]\nenabled = true\n[[auth.oidc.providers]]\nname = \"ci\"\n\
          issuer = \"https://issuer.invalid\"\naudience = \"nora\"\n",
     )
     .unwrap();

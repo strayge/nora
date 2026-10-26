@@ -23,6 +23,10 @@ curl http://localhost:4000/health
 
 ### Push Docker Images
 
+These commands use the image's shipped `docker-local` repository on the main port.
+A mounted configuration must declare its own local Docker repository; see the
+[named Docker guide](../docs/docker-repositories.md).
+
 ```bash
 # Tag your image
 docker tag myapp:v1 localhost:4000/myapp:v1
@@ -148,6 +152,10 @@ curl http://localhost:4000/health
 ```
 
 ### Загрузка Docker образов
+
+Команды используют `docker-local` из конфигурации образа на основном порту.
+В монтируемой конфигурации определите свой local Docker-репозиторий; см.
+[руководство по Docker-репозиториям](../docs/docker-repositories.md).
 
 ```bash
 # Тегируем образ

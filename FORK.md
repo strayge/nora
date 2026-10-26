@@ -5,6 +5,10 @@ npm/PyPI repositories and more reliable proxy, metadata and offline behavior.
 
 ## Main changes
 
+- **Named Docker repositories.** Local and single-upstream proxy repositories use
+  unique ports; an omitted port shares the main listener. Extra ports expose only
+  the Docker API, with isolated images, caches and runtime state. See the
+  [Docker guide](docs/docker-repositories.md).
 - **Named npm and PyPI repositories.** Configure separate local, proxy and group
   repositories with explicit URL aliases. Contents and caches are isolated, even
   when repositories contain the same package/version or use the same upstream.
@@ -30,16 +34,16 @@ npm/PyPI repositories and more reliable proxy, metadata and offline behavior.
 
 ## Compatibility and migration
 
-The repository model changes apply to **npm and PyPI**; other formats retain their
-existing repository configuration and storage backends.
+The repository model changes apply to **npm, PyPI and Docker**; other formats
+retain their existing repository configuration and storage backends.
 
-- `[npm]`, `[pypi]` and their retired singleton environment controls are rejected.
+- `[npm]`, `[pypi]`, `[docker]` and their retired singleton environment controls are rejected.
   There is no default npm/PyPI upstream or implicit endpoint. `/npm/` and `/simple/`
   work only when explicitly configured as aliases.
 - Publish directly to a **local** repository. Proxies and groups are read-only;
   npm audit through a group returns an explicit unsupported response, not a clean
   audit result.
-- Existing unscoped npm/PyPI bytes are not automatically adopted. Legacy and
+- Existing unscoped npm/PyPI/Docker bytes are not automatically adopted. Legacy and
   inactive namespaces remain available for operator-managed backup and cleanup,
   but are excluded from current repository inventory and destructive maintenance.
 - `nora import` and the old npm/yarn/pip `nora mirror` targets do not provide a named

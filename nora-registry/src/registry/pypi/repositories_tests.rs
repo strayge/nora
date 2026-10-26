@@ -316,6 +316,10 @@ async fn disabled_named_formats_do_not_mount_or_suppress_other_formats() {
     let _lock = crate::test_env::env_lock();
     let context = with_named_repositories(create_test_context_with_config(|cfg| {
         local_config(cfg);
+        cfg.repositories.insert(
+            "images".into(),
+            toml::from_str("format='docker'\nkind='local'\n").unwrap(),
+        );
         cfg.pypi.enabled = false;
         let crate::config::repositories::RepositoryConfig::Local(local) =
             cfg.repositories.get_mut("first").unwrap()
